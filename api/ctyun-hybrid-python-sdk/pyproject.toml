@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "ctyun_hybrid_sdk"
+version = "0.0.12"
+dependencies = [
+  "requests",
+  "urllib3",
+]
+requires-python = ">= 3.8"
+readme = "README.md"
+license = {file = "LICENSE"}
+

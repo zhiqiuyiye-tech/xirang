@@ -1,0 +1,75 @@
+# coding=utf8
+
+# Copyright 2023 CTYUN.CN
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from ctyun_hybrid_sdk.core.request import CTYunRequest
+
+
+class CreateSaleRelationStrategysRequest(CTYunRequest):
+    """
+    销售品批量关联计价策略
+    """
+
+    def __init__(self, request_param):
+        super(CreateSaleRelationStrategysRequest, self).__init__("/v1/billing/createSaleRelationStrategys", "POST", "billing", "application/json")
+        if request_param is None:
+            raise Exception("request_param can not None")
+        self.parameters = request_param
+        self.parameters.check_param()
+        self.header = dict()
+
+    def get_body_param(self):
+        """
+        http body param get
+        """
+        body_param = dict()
+        if self.parameters.charge_strategy_ids is not None:
+            body_param["chargeStrategyIDs"] = self.parameters.charge_strategy_ids
+        if self.parameters.sale_ids is not None:
+            body_param["saleIDs"] = self.parameters.sale_ids
+        return body_param
+
+    def get_query_param(self):
+        """
+        http query param get
+        """
+        return dict()
+
+    def get_path_param(self):
+        """
+        http path param get
+        """
+        return dict()
+
+
+class CreateSaleRelationStrategysRequestParam(object):
+
+    def __init__(self, charge_strategy_ids, sale_ids, ):
+        """
+        :param charge_strategy_ids: 计价策略ID 注意:此参数为数组
+        :param sale_ids:  注意:此参数为数组
+        """
+        self.charge_strategy_ids = charge_strategy_ids
+        self.sale_ids = sale_ids
+
+    def check_param(self):
+        """
+        the param required check
+        """
+        if self.charge_strategy_ids is None:
+            raise Exception("charge_strategy_ids can not None")
+        if self.sale_ids is None:
+            raise Exception("sale_ids can not None")
+
