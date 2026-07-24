@@ -1,0 +1,90 @@
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"xirang/control_panel/internal/api"
+	"xirang/control_panel/internal/auth"
+	"xirang/control_panel/internal/config"
+	"xirang/control_panel/internal/crypto"
+	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/ssh"
+	"xirang/control_panel/internal/tasks"
+	"xirang/control_panel/internal/workers"
+)
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	store, err := db.Open(cfg.DBPath)
+	if err != nil {
+		log.Fatalf("db: %v", err)
+	}
+	defer store.Close()
+
+	cipher, err := crypto.New(cfg.AESKey)
+	if err != nil {
+		log.Fatalf("crypto: %v", err)
+	}
+
+	// 启动恢复：中断的任务标记 failed
+	if err := recoverInterrupted(context.Background(), store); err != nil {
+		log.Printf("warn: recovery: %v", err)
+	}
+
+	// 首次启动种管理员
+	if err := seedAdmin(context.Background(), store, cfg.AdminInitPassword); err != nil {
+		log.Fatalf("seed admin: %v", err)
+	}
+
+	tk := auth.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
+	eng := tasks.NewEngine(store)
+	sshm := ssh.NewManager(cipher, cfg.SSHPoolSize, cfg.SSHIdleTimeout)
+	ws := workers.NewService(store, cipher, sshm, eng)
+
+	gin.SetMode(gin.ReleaseMode)
+	r := api.NewRouter(tk, ws, store, eng)
+
+	srv := &http.Server{Addr: cfg.ListenAddr, Handler: r}
+	go func() {
+		log.Printf("listening on %s", cfg.ListenAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+}
+
+func recoverInterrupted(ctx context.Context, store *db.Store) error {
+	return tasks.NewEngine(store).Recover(ctx)
+}
+
+func seedAdmin(ctx context.Context, store *db.Store, initPw string) error {
+	seeded, err := store.IsAdminSeeded(ctx)
+	if err != nil {
+		return err
+	}
+	if seeded {
+		return nil
+	}
+	hash, err := auth.HashPassword(initPw)
+	if err != nil {
+		return err
+	}
+	return store.UpsertAdminPassword(ctx, "admin", hash)
+}
