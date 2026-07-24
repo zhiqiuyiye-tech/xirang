@@ -17,6 +17,7 @@ import (
 func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store) {
 	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store})
 	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store})
+	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
 }
 
 // --- provisionHandler ---
@@ -128,6 +129,104 @@ func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Report
 		}
 		sh.Done("succeeded", out, stderr, "")
 	}
+	r.Succeed()
+	return nil
+}
+
+// --- installDepsHandler ---
+
+// installDepsHandler installs lvm2 and nfs on a worker via SSH. It probes the
+// package manager (yum/dnf/apt), checks if deps are already installed
+// (idempotent skip), installs if missing, and verifies after install.
+type installDepsHandler struct {
+	runner ssh.Runner
+	store  *db.Store
+}
+
+func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		WorkerID int64 `json:"worker_id"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("parse params: %v", err))
+		return err
+	}
+	w, err := h.store.GetWorker(ctx, p.WorkerID)
+	if err != nil {
+		r.Fail(err.Error())
+		return err
+	}
+
+	// 1. detect package manager
+	st, err := r.Step("detect_pm")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	out, stderr, code, _ := h.runner.Run(ctx, *w, DetectPMOutput())
+	if code != 0 {
+		st.Done("failed", out, stderr, "detect_pm failed")
+		r.Fail("detect_pm failed")
+		return fmt.Errorf("detect_pm failed")
+	}
+	pm, err := ParsePM(out)
+	if err != nil {
+		st.Done("failed", out, stderr, err.Error())
+		r.Fail(err.Error())
+		return err
+	}
+	st.Done("succeeded", out, stderr, "")
+
+	// 2. check if deps already installed
+	st2, err := r.Step("check_deps")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	out2, _, _, _ := h.runner.Run(ctx, *w, CheckDepsCmd())
+	lvm2, nfs := ParseDepsCheck(out2)
+	if lvm2 && nfs {
+		// Idempotent: already installed, skip install + verify
+		st2.Done("succeeded", out2, "", "already installed, skipping")
+		r.Succeed()
+		return nil
+	}
+	st2.Done("succeeded", out2, "", fmt.Sprintf("lvm2=%v nfs=%v, will install", lvm2, nfs))
+
+	// 3. install
+	st3, err := r.Step("install")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	cmd, err := InstallDepsCmd(pm)
+	if err != nil {
+		st3.Done("failed", "", "", err.Error())
+		r.Fail(err.Error())
+		return err
+	}
+	out3, stderr3, code3, _ := h.runner.Run(ctx, *w, cmd)
+	if code3 != 0 {
+		st3.Done("failed", out3, stderr3, fmt.Sprintf("install failed code=%d", code3))
+		r.Fail(fmt.Sprintf("install failed: %s", stderr3))
+		return fmt.Errorf("install failed")
+	}
+	st3.Done("succeeded", out3, stderr3, "")
+
+	// 4. verify
+	st4, err := r.Step("verify")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	out4, _, _, _ := h.runner.Run(ctx, *w, CheckDepsCmd())
+	lvm22, nfs2 := ParseDepsCheck(out4)
+	if !lvm22 || !nfs2 {
+		st4.Done("failed", out4, "", "deps still missing after install")
+		r.Fail("install reported success but deps still missing")
+		return fmt.Errorf("verify failed")
+	}
+	st4.Done("succeeded", out4, "", "deps installed and verified")
 	r.Succeed()
 	return nil
 }
