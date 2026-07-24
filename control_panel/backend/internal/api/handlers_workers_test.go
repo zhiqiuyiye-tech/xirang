@@ -143,3 +143,28 @@ func TestListWorkersNoCredentials(t *testing.T) {
 		t.Fatalf("API response leaks enc_private_key: %s", body)
 	}
 }
+
+// TestInstallDepsViaAPI verifies POST /api/v1/workers/:id/install-deps returns
+// 202 + {task_id}. The install_deps handler is registered by
+// storage.RegisterStorageHandlers (called in newRouter); the task will fail
+// asynchronously (no real SSH target) but the 202 response is synchronous.
+func TestInstallDepsViaAPI(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	id, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	req := httptest.NewRequest("POST", "/api/v1/workers/"+strconv.Itoa(int(id))+"/install-deps", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		TaskID int64 `json:"task_id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.TaskID <= 0 {
+		t.Fatalf("expected positive task_id, got %d", resp.TaskID)
+	}
+}

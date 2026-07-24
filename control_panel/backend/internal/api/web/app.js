@@ -189,6 +189,7 @@
                     '<button class="btn btn-sm btn-primary" data-action="edit" data-id="' + w.id + '">Edit</button> ' +
                     '<button class="btn btn-sm btn-success" data-action="test" data-id="' + w.id + '">Test</button> ' +
                     '<button class="btn btn-sm btn-primary" data-action="creds" data-id="' + w.id + '">Creds</button> ' +
+                    '<button class="btn btn-sm btn-primary" data-action="install-deps" data-id="' + w.id + '">安装依赖</button> ' +
                     '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + w.id + '">Delete</button>' +
                     '</td></tr>';
             }).join('');
@@ -201,6 +202,7 @@
                     if (action === 'edit') showWorkerForm(content, id);
                     else if (action === 'test') doTestWorker(content, id);
                     else if (action === 'creds') showCredentialsForm(content, id);
+                    else if (action === 'install-deps') doInstallDeps(content, id);
                     else if (action === 'delete') doDeleteWorker(content, id);
                 });
             });
@@ -361,6 +363,18 @@
                 window.location.hash = '#/tasks/' + taskID;
             } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
         });
+    }
+
+    // install-deps: confirm -> POST -> navigate to task page (same pattern as
+    // changeRootPassword but no form needed - just worker_id in params).
+    async function doInstallDeps(content, id) {
+        if (!confirm('Install lvm2/nfs-utils on worker #' + id + ' via SSH?')) return;
+        try {
+            var r = await apiJSON('/workers/' + id + '/install-deps', { method: 'POST' });
+            if (!r.resp.ok) { alert('Error: ' + (r.data && r.data.error)); return; }
+            var taskID = r.data && r.data.task_id;
+            window.location.hash = '#/tasks/' + taskID;
+        } catch (err) { alert('Error: ' + err.message); }
     }
 
     // ====================================================================

@@ -32,7 +32,7 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 	authed := api.Group("")
 	authed.Use(auth.BearerMiddleware(tk))
 	{
-		h := &workerHandlers{ws: ws, store: store}
+		h := &workerHandlers{ws: ws, store: store, eng: eng}
 		authed.GET("/workers", h.list)
 		authed.POST("/workers", h.create)
 		authed.GET("/workers/:id", h.get)
@@ -42,6 +42,7 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/workers/:id/credentials/private-key", h.setPrivateKey)
 		authed.POST("/workers/:id/credentials/password", h.setPanelPassword)
 		authed.POST("/workers/:id/root-password", h.changeRootPassword)
+		authed.POST("/workers/:id/install-deps", h.installDeps)
 
 		authed.GET("/tasks", th.list)
 		authed.GET("/tasks/:id", th.get)

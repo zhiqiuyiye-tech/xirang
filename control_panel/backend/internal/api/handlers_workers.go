@@ -7,12 +7,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 )
 
 type workerHandlers struct {
 	ws    *workers.Service
 	store *db.Store
+	eng   *tasks.Engine
 }
 
 func (h *workerHandlers) list(c *gin.Context) {
@@ -133,6 +135,20 @@ func (h *workerHandlers) changeRootPassword(c *gin.Context) {
 		return
 	}
 	h.audit(c, "worker.change_root_password", c.Param("id"), "success")
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
+// installDeps: POST /api/v1/workers/:id/install-deps
+// Submits an async "install_deps" task that SSHes to the worker and installs
+// lvm2 + nfs-utils. Responds 202 + {task_id}. No request body needed.
+func (h *workerHandlers) installDeps(c *gin.Context) {
+	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	taskID, err := h.eng.Submit(c, "install_deps", "worker", id, map[string]any{"worker_id": id})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "worker.install_deps", c.Param("id"), "submitted")
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
