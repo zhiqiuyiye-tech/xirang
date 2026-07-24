@@ -14,19 +14,101 @@ import (
 	xssh "golang.org/x/crypto/ssh"
 )
 
+// pooledConn wraps an SSH client with the time it was released back to the
+// pool. The releasedAt timestamp lets the idle-eviction goroutine close
+// connections that haven't been reused within idleTimeout (spec §5: "idle
+// connections closed after 5 min").
+type pooledConn struct {
+	client     *xssh.Client
+	releasedAt time.Time
+}
+
 type Manager struct {
 	cipher      *crypto.Cipher
 	poolSize    int
 	idleTimeout time.Duration
 	mu          sync.Mutex
-	pools       map[int64][]*xssh.Client // workerID -> idle connections
+	pools       map[int64][]pooledConn // workerID -> idle connections (LIFO: tail = most recent)
+	stopCh      chan struct{}
+	closeOnce   sync.Once
 }
 
 func NewManager(c *crypto.Cipher, poolSize int, idle time.Duration) *Manager {
 	if poolSize < 1 {
 		poolSize = 1
 	}
-	return &Manager{cipher: c, poolSize: poolSize, idleTimeout: idle, pools: map[int64][]*xssh.Client{}}
+	m := &Manager{
+		cipher:      c,
+		poolSize:    poolSize,
+		idleTimeout: idle,
+		pools:       map[int64][]pooledConn{},
+		stopCh:      make(chan struct{}),
+	}
+	// Spec §5: idle connections are closed after idleTimeout. The eviction
+	// goroutine ticks every idleTimeout/2 (capped at 1 minute) so eviction
+	// lag stays within one idleTimeout. When idleTimeout <= 0 (useful for
+	// tests), no goroutine is started.
+	if idle > 0 {
+		go m.idleEvictLoop()
+	}
+	return m
+}
+
+// idleEvictLoop periodically closes pooled connections that have been idle
+// (released but not re-acquired) for longer than idleTimeout. It exits when
+// stopCh is closed (Manager.Close).
+func (m *Manager) idleEvictLoop() {
+	tick := m.idleTimeout / 2
+	if tick > time.Minute {
+		tick = time.Minute
+	}
+	if tick <= 0 {
+		tick = time.Minute
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-t.C:
+			m.evictIdle()
+		}
+	}
+}
+
+// evictIdle closes pooled clients whose time since release exceeds
+// idleTimeout. Closing an SSH client closes the underlying TCP connection (a
+// fast syscall), so it is safe to do under the mutex.
+func (m *Manager) evictIdle() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for wID, pool := range m.pools {
+		kept := pool[:0]
+		for _, pc := range pool {
+			if now.Sub(pc.releasedAt) > m.idleTimeout {
+				pc.client.Close()
+				continue
+			}
+			kept = append(kept, pc)
+		}
+		m.pools[wID] = kept
+	}
+}
+
+// Close stops the idle-eviction goroutine (if running) and closes all pooled
+// SSH clients, clearing the pools. It is safe to call multiple times.
+func (m *Manager) Close() {
+	m.closeOnce.Do(func() { close(m.stopCh) })
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for wID, pool := range m.pools {
+		for _, pc := range pool {
+			pc.client.Close()
+		}
+		delete(m.pools, wID)
+	}
 }
 
 // buildAuth constructs auth methods in priority order: private key first

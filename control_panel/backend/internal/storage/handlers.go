@@ -55,7 +55,11 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 	steps := ProvisionSteps(req)
 	var done []string
 	for _, st := range steps {
-		sh, _ := r.Step(st.Name)
+		sh, err := r.Step(st.Name)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
 		out, stderr, code, err := h.runner.Run(ctx, *w, st.Cmd)
 		if err != nil || code != 0 {
 			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", st.Name, code))
@@ -78,7 +82,10 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 func (h *provisionHandler) rollback(ctx context.Context, w db.WorkerNode, r *tasks.Reporter, req ProvisionReq, done []string) {
 	rb := RollbackFor(req, done)
 	for _, st := range rb {
-		sh, _ := r.Step(st.Name)
+		sh, err := r.Step(st.Name)
+		if err != nil {
+			continue // best-effort: skip steps that can't be recorded
+		}
 		out, stderr, _, _ := h.runner.Run(ctx, w, st.Cmd)
 		sh.Done("succeeded", out, stderr, "") // best-effort: always record
 	}
@@ -108,7 +115,11 @@ func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Report
 		return err
 	}
 	for _, st := range ReclaimSteps(ReclaimReq{p.VGName, p.LVName, p.MountPoint}) {
-		sh, _ := r.Step(st.Name)
+		sh, err := r.Step(st.Name)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
 		out, stderr, code, err := h.runner.Run(ctx, *w, st.Cmd)
 		if err != nil || code != 0 {
 			sh.Done("failed", out, stderr, fmt.Sprintf("code=%d", code))

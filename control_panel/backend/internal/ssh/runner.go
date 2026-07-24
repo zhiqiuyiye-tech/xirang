@@ -23,10 +23,21 @@ func (m *Manager) acquire(ctx context.Context, w db.WorkerNode) (*xssh.Client, e
 	m.mu.Lock()
 	pool := m.pools[w.ID]
 	if len(pool) > 0 {
-		c := pool[len(pool)-1]
+		// Pop the most-recently released connection (tail) - prefer fresh
+		// connections whose underlying TCP is least likely to have been
+		// reaped by an intermediary NAT/firewall.
+		pc := pool[len(pool)-1]
 		m.pools[w.ID] = pool[:len(pool)-1]
 		m.mu.Unlock()
-		return c, nil
+		// Spec §5: ping before use, evict and rebuild broken connections.
+		// A keepalive global request verifies the underlying connection is
+		// still alive; if it errors the connection is dead - close it and
+		// dial a new one. Only retry once (don't loop forever on a bad pool).
+		if _, _, err := pc.client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			pc.client.Close()
+			return m.dial(ctx, w)
+		}
+		return pc.client, nil
 	}
 	m.mu.Unlock()
 	return m.dial(ctx, w)
@@ -40,7 +51,7 @@ func (m *Manager) release(wID int64, c *xssh.Client) {
 		c.Close()
 		return
 	}
-	m.pools[wID] = append(pool, c)
+	m.pools[wID] = append(pool, pooledConn{client: c, releasedAt: time.Now()})
 }
 
 // Run executes cmd on w and returns stdout, stderr, exit code. It is a

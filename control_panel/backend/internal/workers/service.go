@@ -152,7 +152,11 @@ func (h *rootPasswordHandler) Run(ctx context.Context, task *db.Task, r *tasks.R
 		r.Fail(err.Error())
 		return err
 	}
-	st, _ := r.Step("chpasswd")
+	st, err := r.Step("chpasswd")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
 	// C3: feed credentials via stdin instead of interpolating into the command
 	// string. This prevents shell injection (a single quote in the password could
 	// break out of the echo pipe) and hides the password from ps.

@@ -51,6 +51,7 @@ func main() {
 	tk := auth.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
 	eng := tasks.NewEngine(store)
 	sshm := ssh.NewManager(cipher, cfg.SSHPoolSize, cfg.SSHIdleTimeout)
+	defer sshm.Close() // stop idle-eviction goroutine + close pooled conns on exit
 	ws := workers.NewService(store, cipher, sshm, eng)
 
 	// K8s client: in-cluster only. Failure is non-fatal - the control panel
