@@ -1,0 +1,247 @@
+package k8s
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/tasks"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+)
+
+// RegisterK8sHandlers registers the four K8s task handlers (k8s_create_svc,
+// k8s_delete_svc, k8s_create_np, k8s_delete_np) on the engine. Each handler
+// parses task.ParamsJSON, invokes the corresponding k8s operation, and records
+// a step via the reporter before succeeding or failing.
+func RegisterK8sHandlers(eng *tasks.Engine, client kubernetes.Interface) {
+	eng.Register("k8s_create_svc", &createSvcHandler{client: client})
+	eng.Register("k8s_delete_svc", &deleteSvcHandler{client: client})
+	eng.Register("k8s_create_np", &createNPHandler{client: client})
+	eng.Register("k8s_delete_np", &deleteNPHandler{client: client})
+}
+
+// --- createSvcHandler ---
+
+type createSvcHandler struct{ client kubernetes.Interface }
+
+func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		Namespace string                       `json:"namespace"`
+		PodName   string                       `json:"pod_name"`
+		PodUID    string                       `json:"pod_uid"`
+		Selector  map[string]string            `json:"selector"`
+		Type      string                       `json:"type"`
+		Ports     []map[string]any             `json:"ports"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("k8s_create_svc: parse params: %v", err))
+		return err
+	}
+	ports := make([]PortSpec, 0, len(p.Ports))
+	for _, pp := range p.Ports {
+		port, err := numField(pp, "port")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
+			return err
+		}
+		targetPort, err := numField(pp, "target_port")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
+			return err
+		}
+		nodePort, err := numField(pp, "node_port")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
+			return err
+		}
+		protocol, err := strField(pp, "protocol")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
+			return err
+		}
+		ports = append(ports, PortSpec{
+			Port:       int32(port),
+			TargetPort: int32(targetPort),
+			NodePort:   int32(nodePort),
+			Protocol:   corev1.Protocol(protocol),
+		})
+	}
+
+	st, err := r.Step("create_service")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_create_svc: create step: %v", err))
+		return err
+	}
+	svc, err := CreateService(ctx, h.client, CreateServiceReq{
+		Namespace: p.Namespace, PodName: p.PodName, PodUID: p.PodUID,
+		Selector: p.Selector, Type: p.Type, Ports: ports,
+	})
+	if err != nil {
+		st.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
+		return err
+	}
+	st.Done("succeeded", svc.Name, "", "")
+	r.Succeed()
+	return nil
+}
+
+// --- deleteSvcHandler ---
+
+type deleteSvcHandler struct{ client kubernetes.Interface }
+
+func (h *deleteSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		Namespace string `json:"namespace"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("k8s_delete_svc: parse params: %v", err))
+		return err
+	}
+
+	st, err := r.Step("delete_service")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_delete_svc: create step: %v", err))
+		return err
+	}
+	if err := DeleteService(ctx, h.client, p.Namespace, p.Name); err != nil {
+		st.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_delete_svc: %v", err))
+		return err
+	}
+	st.Done("succeeded", p.Name, "", "")
+	r.Succeed()
+	return nil
+}
+
+// --- createNPHandler ---
+
+type createNPHandler struct{ client kubernetes.Interface }
+
+func (h *createNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		Namespace    string                       `json:"namespace"`
+		PodName      string                       `json:"pod_name"`
+		PodUID       string                       `json:"pod_uid"`
+		PodSelector  map[string]string            `json:"pod_selector"`
+		IngressPorts []map[string]any             `json:"ingress_ports"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("k8s_create_np: parse params: %v", err))
+		return err
+	}
+	ingressPorts := make([]IngressPortSpec, 0, len(p.IngressPorts))
+	for _, pp := range p.IngressPorts {
+		protocol, err := strField(pp, "protocol")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_create_np: %v", err))
+			return err
+		}
+		port, err := numField(pp, "port")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_create_np: %v", err))
+			return err
+		}
+		ingressPorts = append(ingressPorts, IngressPortSpec{
+			Protocol: protocol,
+			Port:     int32(port),
+		})
+	}
+
+	st, err := r.Step("create_network_policy")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_create_np: create step: %v", err))
+		return err
+	}
+	np, err := CreateNetworkPolicy(ctx, h.client, CreateNetworkPolicyReq{
+		Namespace:    p.Namespace,
+		PodName:      p.PodName,
+		PodUID:       p.PodUID,
+		PodSelector:  p.PodSelector,
+		IngressPorts: ingressPorts,
+	})
+	if err != nil {
+		st.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_create_np: %v", err))
+		return err
+	}
+	st.Done("succeeded", np.Name, "", "")
+	r.Succeed()
+	return nil
+}
+
+// --- deleteNPHandler ---
+
+type deleteNPHandler struct{ client kubernetes.Interface }
+
+func (h *deleteNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		Namespace string `json:"namespace"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("k8s_delete_np: parse params: %v", err))
+		return err
+	}
+
+	st, err := r.Step("delete_network_policy")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_delete_np: create step: %v", err))
+		return err
+	}
+	if err := DeleteNetworkPolicy(ctx, h.client, p.Namespace, p.Name); err != nil {
+		st.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_delete_np: %v", err))
+		return err
+	}
+	st.Done("succeeded", p.Name, "", "")
+	r.Succeed()
+	return nil
+}
+
+// --- params helpers ---
+//
+// JSON unmarshals numeric values as float64. numField accepts float64 (and the
+// occasional int/int64/json.Number) so the handlers do not panic when a field
+// is missing or the wrong type. On a bad field the handler reports a clear
+// error via r.Fail and returns, rather than panicking.
+
+func numField(m map[string]any, key string) (float64, error) {
+	v, ok := m[key]
+	if !ok {
+		return 0, fmt.Errorf("port spec missing field %q", key)
+	}
+	switch n := v.(type) {
+	case float64:
+		return n, nil
+	case int:
+		return float64(n), nil
+	case int64:
+		return float64(n), nil
+	case int32:
+		return float64(n), nil
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("field %q: %v", key, err)
+		}
+		return f, nil
+	default:
+		return 0, fmt.Errorf("field %q: expected number, got %T", key, v)
+	}
+}
+
+func strField(m map[string]any, key string) (string, error) {
+	v, ok := m[key]
+	if !ok {
+		return "", fmt.Errorf("port spec missing field %q", key)
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("field %q: expected string, got %T", key, v)
+	}
+	return s, nil
+}
