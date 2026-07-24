@@ -1,0 +1,227 @@
+/* ===== Reset & Base ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f4f5f7;
+    color: #1a1a2e;
+    line-height: 1.5;
+}
+
+/* ===== Login View ===== */
+.login-view {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+}
+.login-card {
+    background: #fff;
+    padding: 2.5rem;
+    border-radius: 8px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    width: 100%;
+    max-width: 380px;
+}
+.login-card h1 {
+    font-size: 1.4rem;
+    margin-bottom: 1.5rem;
+    color: #1a1a2e;
+    text-align: center;
+}
+
+/* ===== Forms ===== */
+.form-field { margin-bottom: 1rem; }
+.form-field label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+    color: #444;
+}
+.form-field input, .form-field select, .form-field textarea {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    transition: border-color 0.15s;
+}
+.form-field input:focus, .form-field select:focus, .form-field textarea:focus {
+    outline: none;
+    border-color: #0f3460;
+    box-shadow: 0 0 0 2px rgba(15,52,96,0.1);
+}
+
+/* ===== Buttons ===== */
+.btn {
+    display: inline-block;
+    padding: 0.45rem 1rem;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.15s, opacity 0.15s;
+}
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background: #0f3460; color: #fff; }
+.btn-primary:hover { background: #1a4a7a; }
+.btn-danger { background: #c0392b; color: #fff; }
+.btn-danger:hover { background: #d43a3b; }
+.btn-success { background: #27ae60; color: #fff; }
+.btn-success:hover { background: #2ecc71; }
+.btn-link { background: transparent; color: #fff; }
+.btn-link:hover { text-decoration: underline; }
+.btn-sm { padding: 0.25rem 0.6rem; font-size: 0.8rem; }
+
+/* ===== Navbar ===== */
+.app-view { min-height: 100vh; }
+.navbar {
+    display: flex;
+    align-items: center;
+    background: #1a1a2e;
+    color: #fff;
+    padding: 0 1.5rem;
+    height: 52px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+.navbar-brand {
+    font-weight: 700;
+    font-size: 1.1rem;
+    margin-right: 2rem;
+}
+.navbar-links {
+    display: flex;
+    gap: 0.3rem;
+    align-items: center;
+    flex: 1;
+}
+.nav-link {
+    color: #aaa;
+    text-decoration: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    transition: color 0.15s, background 0.15s;
+}
+.nav-link:hover { color: #fff; background: rgba(255,255,255,0.1); }
+.nav-link.active { color: #fff; background: rgba(255,255,255,0.15); }
+#logout-btn { margin-left: auto; }
+
+/* ===== Page Content ===== */
+.page-content { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
+.page-title { font-size: 1.3rem; margin-bottom: 1rem; color: #1a1a2e; }
+
+/* ===== Tables ===== */
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+.data-table th, .data-table td {
+    padding: 0.6rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid #eee;
+    font-size: 0.85rem;
+}
+.data-table th {
+    background: #f8f9fa;
+    font-weight: 600;
+    color: #555;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.5px;
+}
+.data-table tr:hover { background: #f8f9fa; }
+
+/* ===== Cards & Sections ===== */
+.card {
+    background: #fff;
+    border-radius: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    padding: 1.2rem;
+    margin-bottom: 1rem;
+}
+.section-title {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.8rem;
+    color: #333;
+}
+
+/* ===== Messages ===== */
+.error-msg { color: #c0392b; font-size: 0.85rem; margin-top: 0.5rem; min-height: 1.2em; }
+.info-msg { color: #2980b9; font-size: 0.85rem; margin-top: 0.5rem; }
+.success-msg { color: #27ae60; font-size: 0.85rem; margin-top: 0.5rem; }
+
+/* ===== Badges ===== */
+.badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+.badge-success { background: #d4edda; color: #155724; }
+.badge-running { background: #cce5ff; color: #004085; }
+.badge-failed { background: #f8d7da; color: #721c24; }
+.badge-pending { background: #fff3cd; color: #856404; }
+.badge-key { background: #d1ecf1; color: #0c5460; }
+.badge-password { background: #d4edda; color: #155724; }
+.badge-both { background: #f8d7da; color: #721c24; }
+
+/* ===== Modal ===== */
+.modal-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 200;
+}
+.modal {
+    background: #fff;
+    border-radius: 8px;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 480px;
+    max-height: 85vh;
+    overflow-y: auto;
+}
+.modal-title { font-size: 1.1rem; margin-bottom: 1rem; }
+
+/* ===== Task Steps ===== */
+.step-item {
+    padding: 0.6rem;
+    border-left: 3px solid #ccc;
+    margin-bottom: 0.5rem;
+    background: #f8f9fa;
+    border-radius: 0 4px 4px 0;
+}
+.step-item.success { border-left-color: #27ae60; }
+.step-item.running { border-left-color: #2980b9; }
+.step-item.failed { border-left-color: #c0392b; }
+.step-name { font-weight: 600; font-size: 0.9rem; }
+.step-stdout, .step-stderr {
+    font-family: "Fira Code", "Consolas", monospace;
+    font-size: 0.8rem;
+    margin-top: 0.3rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+.step-stderr { color: #c0392b; }
+.step-stdout { color: #555; }
+
+/* ===== Utility ===== */
+.row { display: flex; gap: 1rem; flex-wrap: wrap; }
+.col { flex: 1; min-width: 250px; }
+.mt-1 { margin-top: 0.5rem; }
+.mt-2 { margin-top: 1rem; }
+.muted { color: #888; font-size: 0.8rem; }

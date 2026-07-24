@@ -69,5 +69,8 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/storage/reclaim", sh.reclaim)
 		authed.GET("/storage", sh.list)
 	}
+
+	// Static frontend: embedded SPA served at GET / and GET /static/*.
+	registerStaticRoutes(r)
 	return r
 }
