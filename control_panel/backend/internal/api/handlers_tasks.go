@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/auth"
@@ -37,21 +38,26 @@ func (h *taskHandlers) get(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": t.ID, "task": t, "steps": steps})
 }
 
-// stream: SSE. EventSource cannot set headers, so in addition to the Bearer
-// middleware it also accepts ?token=<jwt> as a fallback auth mechanism.
+// stream: SSE. EventSource cannot set headers, so in addition to a Bearer
+// header it also accepts ?token=<jwt> as a fallback auth mechanism. This route
+// is registered on the public group (not behind BearerMiddleware) so the
+// ?token= fallback is reachable; auth is done here instead.
 func (h *taskHandlers) stream(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	// token 认证（若没有 Bearer 头）
-	if _, ok := auth.ClaimsFrom(c); !ok {
-		if q := c.Query("token"); q != "" {
-			if _, err := h.tk.Parse(q); err != nil {
-				c.AbortWithStatus(http.StatusUnauthorized)
-				return
-			}
-		} else {
-			c.AbortWithStatus(http.StatusUnauthorized)
-			return
-		}
+	// Auth: prefer a Bearer header, fall back to ?token= query param, else 401.
+	tok := ""
+	if ah := c.GetHeader("Authorization"); strings.HasPrefix(ah, "Bearer ") {
+		tok = strings.TrimPrefix(ah, "Bearer ")
+	} else if q := c.Query("token"); q != "" {
+		tok = q
+	}
+	if tok == "" {
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+	if _, err := h.tk.Parse(tok); err != nil {
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
 	}
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")

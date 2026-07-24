@@ -15,6 +15,15 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 	api := r.Group("/api/v1")
 	api.POST("/auth/login", loginHandler(store, tk))
 
+	// SSE stream is registered on the public group (not behind
+	// BearerMiddleware) because EventSource clients cannot set Authorization
+	// headers - the entire reason the ?token= query fallback exists. Behind
+	// the middleware the handler would get a 401 before it runs, making that
+	// fallback unreachable. The handler performs its own auth (Bearer header
+	// OR ?token= query).
+	th := &taskHandlers{store: store, eng: eng, tk: tk}
+	api.GET("/tasks/:id/stream", th.stream)
+
 	authed := api.Group("")
 	authed.Use(auth.BearerMiddleware(tk))
 	{
@@ -29,10 +38,8 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/workers/:id/credentials/password", h.setPanelPassword)
 		authed.POST("/workers/:id/root-password", h.changeRootPassword)
 
-		th := &taskHandlers{store: store, eng: eng, tk: tk}
 		authed.GET("/tasks", th.list)
 		authed.GET("/tasks/:id", th.get)
-		authed.GET("/tasks/:id/stream", th.stream) // 内部也接受 ?token=
 
 		authed.GET("/audit-log", auditHandler(store))
 	}
