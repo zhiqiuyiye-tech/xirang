@@ -45,9 +45,12 @@ func (h *taskHandlers) get(c *gin.Context) {
 func (h *taskHandlers) stream(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	// Auth: prefer a Bearer header, fall back to ?token= query param, else 401.
+	// The auth scheme is case-insensitive per RFC 7235 (and matches the
+	// BearerMiddleware on other routes); slice the ORIGINAL header value to
+	// preserve the token's exact casing.
 	tok := ""
-	if ah := c.GetHeader("Authorization"); strings.HasPrefix(ah, "Bearer ") {
-		tok = strings.TrimPrefix(ah, "Bearer ")
+	if ah := c.GetHeader("Authorization"); strings.HasPrefix(strings.ToLower(ah), "bearer ") {
+		tok = ah[7:]
 	} else if q := c.Query("token"); q != "" {
 		tok = q
 	}
