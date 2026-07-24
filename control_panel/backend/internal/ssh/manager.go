@@ -77,6 +77,7 @@ func (m *Manager) dial(ctx context.Context, w db.WorkerNode) (*xssh.Client, erro
 	}
 	ncc, chans, reqs, err := xssh.NewClientConn(conn, addr, cfg)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	// NewClient wraps the Conn into a *Client and internally handles

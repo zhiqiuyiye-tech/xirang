@@ -2,6 +2,7 @@ package workers
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -78,5 +79,42 @@ func TestChangeRootPasswordSubmitsTask(t *testing.T) {
 	}
 	if taskID <= 0 {
 		t.Fatal("expected task id")
+	}
+}
+
+// TestChangeRootPasswordEncryptsParams verifies C1: the password stored in
+// tasks.params_json is AES-encrypted, not plaintext. After ChangeRootPassword
+// returns, the task row's params_json should contain a base64 ciphertext that
+// decrypts back to the original password.
+func TestChangeRootPasswordEncryptsParams(t *testing.T) {
+	svc := setup(t)
+	id, _ := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	plaintext := "s3cr3t'with\"quotes"
+	taskID, err := svc.ChangeRootPassword(context.Background(), id, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := svc.store.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p struct {
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Password == "" {
+		t.Fatal("params_json password is empty")
+	}
+	if p.Password == plaintext {
+		t.Fatal("params_json contains plaintext password")
+	}
+	dec, err := svc.c.Decrypt(p.Password)
+	if err != nil {
+		t.Fatalf("decrypt failed: %v", err)
+	}
+	if string(dec) != plaintext {
+		t.Fatalf("decrypted=%q want=%q", string(dec), plaintext)
 	}
 }

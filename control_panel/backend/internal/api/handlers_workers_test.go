@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,5 +81,56 @@ func TestSetPanelPasswordViaAPI(t *testing.T) {
 	got, _ := store.GetWorker(context.Background(), id)
 	if got.EncPassword == nil {
 		t.Fatal("password not set")
+	}
+}
+
+// TestGetWorkerNoCredentials verifies I1: the workers API must not return
+// encrypted credential ciphertext (enc_password, enc_private_key). These
+// fields have json:"-" so even though they're in the DB row, they never
+// appear in the HTTP response.
+func TestGetWorkerNoCredentials(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	id, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	ws.SetPanelPassword(context.Background(), id, "secret-pw")
+	ws.SetPrivateKey(context.Background(), id, "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----")
+
+	req := httptest.NewRequest("GET", "/api/v1/workers/"+strconv.Itoa(int(id)), nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "enc_password") {
+		t.Fatalf("API response leaks enc_password: %s", body)
+	}
+	if strings.Contains(body, "enc_private_key") {
+		t.Fatalf("API response leaks enc_private_key: %s", body)
+	}
+	if strings.Contains(body, "secret-pw") {
+		t.Fatalf("API response leaks password value: %s", body)
+	}
+}
+
+// TestListWorkersNoCredentials verifies I1 on the list endpoint.
+func TestListWorkersNoCredentials(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	id, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	ws.SetPanelPassword(context.Background(), id, "secret-pw")
+
+	req := httptest.NewRequest("GET", "/api/v1/workers", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "enc_password") {
+		t.Fatalf("API response leaks enc_password: %s", body)
+	}
+	if strings.Contains(body, "enc_private_key") {
+		t.Fatalf("API response leaks enc_private_key: %s", body)
 	}
 }

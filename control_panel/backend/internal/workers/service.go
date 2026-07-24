@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -114,10 +115,16 @@ func (s *Service) SetPanelPassword(ctx context.Context, id int64, password strin
 	return s.store.SetWorkerCredentials(ctx, id, &enc, w.EncPrivateKey, mode)
 }
 
-// ChangeRootPassword 提交任务：SSH 到 worker 执行 chpasswd，成功后同步密码入库
+// ChangeRootPassword 提交任务：SSH 到 worker 执行 chpasswd，成功后同步密码入库。
+// The password is AES-encrypted before being stored in params_json so the
+// tasks table never holds plaintext credentials (spec: DB 只存 AES 密文).
 func (s *Service) ChangeRootPassword(ctx context.Context, id int64, password string) (int64, error) {
+	enc, err := s.c.Encrypt([]byte(password))
+	if err != nil {
+		return 0, fmt.Errorf("encrypt password: %w", err)
+	}
 	return s.eng.Submit(ctx, "set_root_password", "worker", id, map[string]any{
-		"password": password,
+		"password": enc,
 	})
 }
 
@@ -134,14 +141,24 @@ func (h *rootPasswordHandler) Run(ctx context.Context, task *db.Task, r *tasks.R
 		r.Fail(err.Error())
 		return err
 	}
+	// C1: params_json stores AES ciphertext, not plaintext. Decrypt before use.
+	plain, err := h.service.c.Decrypt(p.Password)
+	if err != nil {
+		r.Fail(fmt.Sprintf("decrypt password: %v", err))
+		return err
+	}
 	w, err := h.service.store.GetWorker(ctx, task.TargetID)
 	if err != nil {
 		r.Fail(err.Error())
 		return err
 	}
 	st, _ := r.Step("chpasswd")
-	cmd := fmt.Sprintf("echo '%s:%s' | chpasswd", w.Username, p.Password)
-	_, stderr, code, err := h.service.sshm.Run(ctx, *w, cmd)
+	// C3: feed credentials via stdin instead of interpolating into the command
+	// string. This prevents shell injection (a single quote in the password could
+	// break out of the echo pipe) and hides the password from ps.
+	cmd := "chpasswd"
+	stdin := strings.NewReader(w.Username + ":" + string(plain) + "\n")
+	_, stderr, code, err := h.service.sshm.RunWithStdin(ctx, *w, cmd, stdin)
 	if err != nil || code != 0 {
 		st.Done("failed", "", stderr, fmt.Sprintf("chpasswd failed code=%d err=%v", code, err))
 		r.Fail(fmt.Sprintf("chpasswd failed: %s", stderr))
@@ -149,7 +166,7 @@ func (h *rootPasswordHandler) Run(ctx context.Context, task *db.Task, r *tasks.R
 	}
 	st.Done("succeeded", "ok", "", "")
 	// 成功后同步密码入库（等价于执行了 SetPanelPassword）
-	enc, _ := h.service.c.Encrypt([]byte(p.Password))
+	enc, _ := h.service.c.Encrypt(plain)
 	mode := "password"
 	if w.EncPrivateKey != nil {
 		mode = "both"

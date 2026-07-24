@@ -32,6 +32,30 @@ func TestGetTaskByID(t *testing.T) {
 	}
 }
 
+// TestGetTaskByIDNoParamsJSON verifies C2: the task's params_json field is
+// never returned by the API. After C1, params_json holds AES ciphertext, but
+// it should still not be exfiltrable via the tasks endpoint (json:"-").
+func TestGetTaskByIDNoParamsJSON(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	id, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	taskID, _ := ws.ChangeRootPassword(context.Background(), id, "secret-pw")
+	time.Sleep(100 * time.Millisecond)
+	req := httptest.NewRequest("GET", "/api/v1/tasks/"+strconv.Itoa(int(taskID)), nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "params_json") {
+		t.Fatalf("API response leaks params_json: %s", body)
+	}
+	if strings.Contains(body, "secret-pw") {
+		t.Fatalf("API response leaks password: %s", body)
+	}
+}
+
 func TestListTasks(t *testing.T) {
 	r, _, _, tk := newRouter(t)
 	req := httptest.NewRequest("GET", "/api/v1/tasks", nil)

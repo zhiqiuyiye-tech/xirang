@@ -3,6 +3,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"io"
 	"time"
 
 	xssh "golang.org/x/crypto/ssh"
@@ -34,7 +35,16 @@ func (m *Manager) release(wID int64, c *xssh.Client) {
 	m.pools[wID] = append(pool, c)
 }
 
+// Run executes cmd on w and returns stdout, stderr, exit code. It is a
+// convenience wrapper around RunWithStdin for commands that don't need stdin.
 func (m *Manager) Run(ctx context.Context, w db.WorkerNode, cmd string) (stdout, stderr string, exitCode int, err error) {
+	return m.RunWithStdin(ctx, w, cmd, nil)
+}
+
+// RunWithStdin executes cmd on w, feeding stdin (if non-nil) to the process's
+// stdin. Using stdin instead of interpolating values into the command string
+// prevents shell injection and keeps secrets out of the process table (ps).
+func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string, stdin io.Reader) (stdout, stderr string, exitCode int, err error) {
 	client, err := m.acquire(ctx, w)
 	if err != nil {
 		return "", "", -1, err
@@ -48,6 +58,9 @@ func (m *Manager) Run(ctx context.Context, w db.WorkerNode, cmd string) (stdout,
 	var outB, errB bytes.Buffer
 	sess.Stdout = &outB
 	sess.Stderr = &errB
+	if stdin != nil {
+		sess.Stdin = stdin
+	}
 	if err := sess.Start(cmd); err != nil {
 		return "", "", -1, err
 	}

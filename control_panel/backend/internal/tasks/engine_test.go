@@ -71,6 +71,42 @@ func TestEngineSubmitFailure(t *testing.T) {
 	}
 }
 
+// TestEngineFailDoesNotOverwrite locks in I3: when a handler calls r.Fail()
+// with a detailed message and then returns an error, the engine's fallback
+// r.Fail(err.Error()) must NOT overwrite the handler's richer detail. The
+// first terminal call wins (idempotent Fail).
+func TestEngineFailDoesNotOverwrite(t *testing.T) {
+	s, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer s.Close()
+	e := NewEngine(s)
+	e.Register("double-fail", &doubleFailHandler{})
+	id, _ := e.Submit(context.Background(), "double-fail", "worker", 1, nil)
+	waitFor(t, e, id, "failed", 2*time.Second)
+	got, _ := s.GetTask(context.Background(), id)
+	if got.Status != "failed" || got.Error == nil {
+		t.Fatalf("task=%+v", got)
+	}
+	// The handler's detailed message must survive, not the engine's generic
+	// "handler returned error" fallback.
+	if *got.Error != "detailed handler error" {
+		t.Fatalf("error=%q, want %q", *got.Error, "detailed handler error")
+	}
+}
+
+// doubleFailHandler calls r.Fail with a detailed message and then returns an
+// error. The engine will call r.Fail(err.Error()) again - that second call
+// must be a no-op (I3).
+type doubleFailHandler struct{}
+
+func (*doubleFailHandler) Run(_ context.Context, _ *db.Task, r *Reporter) error {
+	r.Fail("detailed handler error")
+	return errGeneric
+}
+
+var errGeneric = &genericErr{}
+type genericErr struct{}
+func (*genericErr) Error() string { return "generic engine fallback" }
+
 func TestEngineUnknownType(t *testing.T) {
 	s, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer s.Close()

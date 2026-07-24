@@ -9,11 +9,17 @@ import (
 // Reporter persists task progress to the store and emits StepEvents through
 // the engine so SSE subscribers observe updates. It holds a *Engine reference
 // (not just a store) so Done/Succeed/Fail can reach subscribers.
+//
+// The finalized field makes Succeed/Fail idempotent: the first terminal call
+// wins and subsequent calls are no-ops. This prevents the engine's
+// post-handler r.Fail(err.Error()) from overwriting richer error detail that
+// the handler already recorded via its own r.Fail(...).
 type Reporter struct {
-	store  *db.Store
-	engine *Engine
-	taskID int64
-	seq    int
+	store     *db.Store
+	engine    *Engine
+	taskID    int64
+	seq       int
+	finalized bool
 }
 
 // StepHandle represents an in-flight step created via Reporter.Step.
@@ -47,14 +53,26 @@ func (s *StepHandle) Done(status, stdout, stderr, errMsg string) {
 }
 
 // Succeed marks the task succeeded (finished) and emits a terminal StepEvent.
+// No-op if the task is already finalized (Fail or Succeed was called earlier).
 func (r *Reporter) Succeed() {
+	if r.finalized {
+		return
+	}
+	r.finalized = true
 	_ = r.store.SetTaskStatus(context.Background(), r.taskID, "succeeded", true)
 	r.engine.emit(StepEvent{TaskID: r.taskID, Status: "succeeded"})
 }
 
 // Fail records the error message, marks the task failed (finished), and emits
-// a terminal StepEvent.
+// a terminal StepEvent. No-op if the task is already finalized, so the first
+// terminal call (typically from the handler with rich detail) is preserved
+// and the engine's fallback r.Fail(err.Error()) after a handler error is a
+// safe no-op.
 func (r *Reporter) Fail(errMsg string) {
+	if r.finalized {
+		return
+	}
+	r.finalized = true
 	_ = r.store.SetTaskError(context.Background(), r.taskID, errMsg)
 	r.engine.emit(StepEvent{TaskID: r.taskID, Status: "failed"})
 }

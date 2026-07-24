@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,5 +170,49 @@ func TestRun_AllFail(t *testing.T) {
 	m := newTestManager(t)
 	if _, _, _, err := m.Run(context.Background(), w, "true"); err == nil {
 		t.Fatal("expected error when all auth fails")
+	}
+}
+
+// TestRunWithStdin verifies C3: RunWithStdin can execute a command while
+// feeding stdin to the remote process. The test SSH server accepts any exec
+// command and replies with stdout "hello" + exit-status 0; the stdin written
+// by the client is buffered by the channel and discarded. This confirms the
+// plumbing (sess.Stdin + sess.Start + sess.Wait) works end-to-end without
+// hanging or error.
+func TestRunWithStdin(t *testing.T) {
+	addr, _ := startTestSSHd(t, "pw123")
+	host, port, _ := net.SplitHostPort(addr)
+	p := 0
+	fmt.Sscanf(port, "%d", &p)
+	encPw := mustEncrypt(t, "pw123")
+	w := db.WorkerNode{ID: 5, Host: host, Port: p, Username: "root", AuthMode: "password", EncPassword: &encPw}
+	m := newTestManager(t)
+	stdin := strings.NewReader("root:newpass\n")
+	out, _, code, err := m.RunWithStdin(context.Background(), w, "chpasswd", stdin)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code=%d out=%q", code, out)
+	}
+}
+
+// TestRunWithStdin_NilStdin verifies that RunWithStdin with a nil stdin
+// reader behaves identically to Run (the existing callers that don't need
+// stdin are unaffected).
+func TestRunWithStdin_NilStdin(t *testing.T) {
+	addr, _ := startTestSSHd(t, "pw123")
+	host, port, _ := net.SplitHostPort(addr)
+	p := 0
+	fmt.Sscanf(port, "%d", &p)
+	encPw := mustEncrypt(t, "pw123")
+	w := db.WorkerNode{ID: 6, Host: host, Port: p, Username: "root", AuthMode: "password", EncPassword: &encPw}
+	m := newTestManager(t)
+	out, _, code, err := m.RunWithStdin(context.Background(), w, "true", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if code != 0 || out == "" {
+		t.Fatalf("code=%d out=%q", code, out)
 	}
 }
