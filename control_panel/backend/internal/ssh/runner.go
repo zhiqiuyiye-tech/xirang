@@ -11,6 +11,14 @@ import (
 	"xirang/control_panel/internal/db"
 )
 
+// Runner is the SSH command-execution interface. *Manager implements it.
+// Handlers depend on the interface (not the concrete *Manager) so tests can
+// inject a mock runner.
+type Runner interface {
+	Run(ctx context.Context, w db.WorkerNode, cmd string) (stdout, stderr string, exitCode int, err error)
+	RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string, stdin io.Reader) (stdout, stderr string, exitCode int, err error)
+}
+
 func (m *Manager) acquire(ctx context.Context, w db.WorkerNode) (*xssh.Client, error) {
 	m.mu.Lock()
 	pool := m.pools[w.ID]
