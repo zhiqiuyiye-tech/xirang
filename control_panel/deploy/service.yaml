@@ -1,0 +1,26 @@
+# Service exposing the control panel web UI on :8080 via NodePort 30080.
+# The NodePort is intended for internal-network access only; restrict it at the
+# cluster/network level (NetworkPolicy, firewall, or load balancer) as needed.
+#
+# To use an Ingress with TLS instead of a NodePort, comment out type: NodePort
+# and the nodePort field, and add an Ingress resource (see README.md).
+#
+# Apply with: kubectl apply -f service.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-panel
+  namespace: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: control-panel
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+      nodePort: 30080

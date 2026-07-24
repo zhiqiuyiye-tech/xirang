@@ -1,0 +1,58 @@
+# Control panel RBAC: Namespace + ServiceAccount + ClusterRole + ClusterRoleBinding.
+# Apply with: kubectl apply -f rbac.yaml
+#
+# Least-privilege: the control panel only manages Services and NetworkPolicies
+# (full CRUD) plus read-only Pod access (for ownerReferences UID lookup). It
+# does NOT touch Secrets/ConfigMaps - the AES/JWT/admin-password Secret is
+# consumed only via env var secretKeyRef on the Deployment, which is resolved
+# by the kubelet, not by the application's service account.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-panel
+  namespace: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel
+rules:
+  # Services: full CRUD (create/list/get/watch/update/delete).
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # NetworkPolicies: full CRUD.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # Pods: read-only (used to look up Pod UID for ownerReferences).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: control-panel
+subjects:
+  - kind: ServiceAccount
+    name: control-panel
+    namespace: control-panel

@@ -1,0 +1,20 @@
+# PersistentVolumeClaim for the control panel SQLite database.
+# The control panel stores its SQLite DB at DB_PATH (default /data/control_panel.db).
+# A default storage class is assumed; adjust storageClassName if your cluster
+# requires a specific provisioner.
+#
+# Apply with: kubectl apply -f pvc.yaml
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: control-panel-data
+  namespace: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
