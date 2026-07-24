@@ -3,10 +3,10 @@ package db
 import "time"
 
 type Admin struct {
-	ID           int64
-	Username     string
-	PasswordHash string
-	CreatedAt    time.Time
+	ID           int64     `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type WorkerNode struct {
@@ -51,11 +51,11 @@ type TaskStep struct {
 }
 
 type AuditLog struct {
-	ID         int64
-	Actor      string
-	Action     string
-	Target     *string
-	ParamsJSON *string
-	Result     string
-	At         time.Time
+	ID         int64      `json:"id"`
+	Actor      string     `json:"actor"`
+	Action     string     `json:"action"`
+	Target     *string    `json:"target"`
+	ParamsJSON *string    `json:"-"`
+	Result     string     `json:"result"`
+	At         time.Time  `json:"at"`
 }

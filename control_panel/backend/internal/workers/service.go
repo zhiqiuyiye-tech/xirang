@@ -166,7 +166,11 @@ func (h *rootPasswordHandler) Run(ctx context.Context, task *db.Task, r *tasks.R
 	}
 	st.Done("succeeded", "ok", "", "")
 	// 成功后同步密码入库（等价于执行了 SetPanelPassword）
-	enc, _ := h.service.c.Encrypt(plain)
+	enc, err := h.service.c.Encrypt(plain)
+	if err != nil {
+		r.Fail(fmt.Sprintf("encrypt password: %v", err))
+		return err
+	}
 	mode := "password"
 	if w.EncPrivateKey != nil {
 		mode = "both"
