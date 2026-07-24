@@ -15,6 +15,7 @@ import (
 	"xirang/control_panel/internal/config"
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/k8s"
 	"xirang/control_panel/internal/ssh"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
@@ -51,8 +52,20 @@ func main() {
 	sshm := ssh.NewManager(cipher, cfg.SSHPoolSize, cfg.SSHIdleTimeout)
 	ws := workers.NewService(store, cipher, sshm, eng)
 
+	// K8s client: in-cluster only. Failure is non-fatal - the control panel
+	// can run outside a cluster (local dev) with the k8s endpoints returning
+	// 503 Service Unavailable. The task handlers are still registered so the
+	// engine knows the type names (and would surface a clear error if a k8s
+	// task were somehow submitted with a nil client).
+	k8sClient, err := k8s.NewClient()
+	if err != nil {
+		log.Printf("warn: k8s client: %v (k8s endpoints disabled)", err)
+		k8sClient = nil
+	}
+	k8s.RegisterK8sHandlers(eng, k8sClient)
+
 	gin.SetMode(gin.ReleaseMode)
-	r := api.NewRouter(tk, ws, store, eng)
+	r := api.NewRouter(tk, ws, store, eng, k8sClient)
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: r}
 	go func() {

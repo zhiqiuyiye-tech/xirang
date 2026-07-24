@@ -2,13 +2,18 @@ package api
 
 import (
 	"github.com/gin-gonic/gin"
+	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 )
 
-func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks.Engine) *gin.Engine {
+// NewRouter wires every HTTP route for the control panel. k8sClient may be nil
+// (non-cluster / local dev) - in that case the k8s endpoints return 503
+// Service Unavailable instead of panicking. The k8s task handlers are
+// registered separately by k8s.RegisterK8sHandlers (called from main.go).
+func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks.Engine, k8sClient kubernetes.Interface) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
@@ -42,6 +47,18 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.GET("/tasks/:id", th.get)
 
 		authed.GET("/audit-log", auditHandler(store))
+
+		// K8s endpoints: all Bearer-protected. When k8sClient is nil the sync
+		// list endpoints return 503; async create/delete also return 503 so a
+		// misconfigured panel surfaces the error synchronously rather than
+		// queueing a task that would fail.
+		kh := &k8sHandlers{eng: eng, store: store, client: k8sClient}
+		authed.POST("/k8s/services", kh.createService)
+		authed.GET("/k8s/services", kh.listServices)
+		authed.DELETE("/k8s/services/:name", kh.deleteService)
+		authed.POST("/k8s/network-policies", kh.createNetworkPolicy)
+		authed.GET("/k8s/network-policies", kh.listNetworkPolicies)
+		authed.DELETE("/k8s/network-policies/:name", kh.deleteNetworkPolicy)
 	}
 	return r
 }

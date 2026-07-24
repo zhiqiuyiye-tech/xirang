@@ -16,9 +16,11 @@ import (
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/k8s"
 	"xirang/control_panel/internal/ssh"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.Tokens) {
@@ -31,7 +33,12 @@ func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.To
 	eng := tasks.NewEngine(s)
 	ws := workers.NewService(s, c, sshm, eng)
 	tk := auth.NewTokens("secret", time.Hour)
-	return NewRouter(tk, ws, s, eng), ws, s, tk
+	// Inject a fake k8s clientset and register the k8s task handlers so the
+	// router has the k8s routes wired (existing tests don't hit them, but
+	// NewRouter now requires a k8s client parameter).
+	cs := fake.NewSimpleClientset()
+	k8s.RegisterK8sHandlers(eng, cs)
+	return NewRouter(tk, ws, s, eng, cs), ws, s, tk
 }
 
 func authHeader(t *testing.T, tk *auth.Tokens) string {
