@@ -59,6 +59,15 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/k8s/network-policies", kh.createNetworkPolicy)
 		authed.GET("/k8s/network-policies", kh.listNetworkPolicies)
 		authed.DELETE("/k8s/network-policies/:name", kh.deleteNetworkPolicy)
+
+		// Storage endpoints: provision and reclaim are async (submit a task
+		// and respond 202 + task_id); list is synchronous. The task handlers
+		// are registered separately by storage.RegisterStorageHandlers
+		// (called from main.go).
+		sh := &storageHandlers{eng: eng, store: store}
+		authed.POST("/storage/provision", sh.provision)
+		authed.POST("/storage/reclaim", sh.reclaim)
+		authed.GET("/storage", sh.list)
 	}
 	return r
 }

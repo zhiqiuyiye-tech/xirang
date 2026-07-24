@@ -17,6 +17,7 @@ import (
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/k8s"
 	"xirang/control_panel/internal/ssh"
+	"xirang/control_panel/internal/storage"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 )
@@ -63,6 +64,11 @@ func main() {
 		k8sClient = nil
 	}
 	k8s.RegisterK8sHandlers(eng, k8sClient)
+
+	// Storage task handlers: sshm implements ssh.Runner. Registered after the
+	// engine is created so the engine knows the type names before any storage
+	// API endpoint submits a task.
+	storage.RegisterStorageHandlers(eng, sshm, store)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := api.NewRouter(tk, ws, store, eng, k8sClient)

@@ -18,6 +18,7 @@ import (
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/k8s"
 	"xirang/control_panel/internal/ssh"
+	"xirang/control_panel/internal/storage"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 	"k8s.io/client-go/kubernetes/fake"
@@ -38,6 +39,7 @@ func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.To
 	// NewRouter now requires a k8s client parameter).
 	cs := fake.NewSimpleClientset()
 	k8s.RegisterK8sHandlers(eng, cs)
+	storage.RegisterStorageHandlers(eng, sshm, s)
 	return NewRouter(tk, ws, s, eng, cs), ws, s, tk
 }
 
