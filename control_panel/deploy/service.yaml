@@ -1,4 +1,4 @@
-# Service exposing the control panel web UI on :8080 via NodePort 30080.
+# Service exposing the control panel web UI on :8080 via NodePort 30180.
 # The NodePort is intended for internal-network access only; restrict it at the
 # cluster/network level (NetworkPolicy, firewall, or load balancer) as needed.
 #
@@ -23,4 +23,4 @@ spec:
       port: 8080
       targetPort: 8080
       protocol: TCP
-      nodePort: 30080
+      nodePort: 30180

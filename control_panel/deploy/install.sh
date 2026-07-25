@@ -18,7 +18,11 @@
 #
 # Prerequisites:
 #   - kubectl installed and configured to talk to the target cluster.
-#   - The control panel image built and pushed (see README.md).
+#   - The control panel image built and pushed to the private registry:
+#       docker build -t registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest control_panel/backend
+#       docker push registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
+#     The cluster nodes must be able to pull from that registry (imagePullPolicy: Always).
+#     See README.md for self-signed/insecure-registry handling.
 
 set -euo pipefail
 
@@ -137,8 +141,8 @@ echo
 echo "Wait for the pod to become Ready:"
 echo "  kubectl -n ${NAMESPACE} rollout status deployment/control-panel"
 echo
-echo "Access the web UI via NodePort (30080):"
-echo "  http://<any-node-ip>:30080/"
+echo "Access the web UI via NodePort (30180):"
+echo "  http://<any-node-ip>:30180/"
 echo
 echo "Default admin username: admin"
 echo "Login with the password you just set."
@@ -148,4 +152,4 @@ echo "  - Namespace, ServiceAccount, ClusterRole, ClusterRoleBinding (rbac.yaml)
 echo "  - PersistentVolumeClaim control-panel-data (pvc.yaml)"
 echo "  - Secret control-panel-secrets (secret.yaml, generated)"
 echo "  - Deployment control-panel (deployment.yaml)"
-echo "  - Service control-panel NodePort 30080 (service.yaml)"
+echo "  - Service control-panel NodePort 30180 (service.yaml)"

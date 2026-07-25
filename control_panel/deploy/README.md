@@ -10,7 +10,7 @@ the control panel into a cluster.
 | `rbac.yaml` | Namespace, ServiceAccount, ClusterRole (least privilege), ClusterRoleBinding |
 | `pvc.yaml` | PersistentVolumeClaim (1Gi) for the SQLite database |
 | `deployment.yaml` | Deployment: single pod, env from Secret, PVC mount, probes, resources |
-| `service.yaml` | Service: NodePort 30080 exposing :8080 |
+| `service.yaml` | Service: NodePort 30180 exposing :8080 |
 | `secret.yaml.template` | Placeholder Secret template (real `secret.yaml` is git-ignored) |
 | `install.sh` | Interactive installer: generates secrets, applies all manifests |
 | `README.md` | This file |
@@ -19,10 +19,13 @@ the control panel into a cluster.
 
 1. **Target Kubernetes cluster** with:
    - A default `StorageClass` that can provision a 1Gi PVC (or edit `pvc.yaml`).
-   - Nodes reachable on the NodePort range (default 30080).
+   - Nodes reachable on the NodePort range (default 30180).
 
 2. **Worker nodes** where storage/LVM operations run must have:
-   - `lvm2` and `nfs-utils` (or `nfs-common`) installed.
+   - `lvm2` and `nfs-utils` (or `nfs-common`) installed. These can be installed
+     automatically from the control panel UI: add the worker, set its SSH
+     credentials, then click "安装依赖" (Install Deps) to auto-detect the distro
+     (yum/dnf/apt) and install `lvm2` + `nfs-utils`.
    - A volume group (VG) configured for LVM provisioning. The control panel's
      storage task handlers run `lvcreate`/`lvremove` and mount NFS exports on the
      target pods' nodes via SSH + the per-worker private key.
@@ -31,20 +34,37 @@ the control panel into a cluster.
 
 4. **Docker** (or compatible builder) to build and push the control panel image.
 
-5. **Container image registry** reachable from the cluster, or use
-   `imagePullPolicy: IfNotPresent` + `docker load` on each node for a local
-   build.
+5. **Private container registry** (`registry-xirang.jxslpt.cn:30443`) reachable
+   from the cluster. If the registry uses a self-signed or HTTP-only cert, the
+   cluster nodes must trust it (configure `insecure-registries` or install the
+   CA on each node), or create an `imagePullSecret` and reference it in
+   `deployment.yaml`.
 
-## Build the Image
+## Build and Push the Image
+
+The deployment pulls `registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest`
+from the private registry. On a host with docker, build and push it once
+(repeat after any backend change):
 
 ```bash
 # From the repo root:
-docker build -t control-panel:latest ./control_panel/backend
-# Push to your registry and update image: in deployment.yaml, e.g.:
-#   docker tag control-panel:latest registry.example.com/control-panel:latest
-#   docker push registry.example.com/control-panel:latest
-# Then edit deployment.yaml: image: registry.example.com/control-panel:latest
+docker build -t registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest ./control_panel/backend
+docker push registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
 ```
+
+If `docker push` fails with a certificate error, log in first and/or configure
+the registry as a trusted (insecure) registry on the build host:
+
+```bash
+docker login registry-xirang.jxslpt.cn:30443
+# or add "registry-xirang.jxslpt.cn:30443" to /etc/docker/daemon.json insecure-registries
+# and restart docker, then retry the push.
+```
+
+`deployment.yaml` uses `imagePullPolicy: Always`, so each pod restart pulls the
+latest pushed image. The cluster nodes must be able to reach the registry
+(`registry-xirang.jxslpt.cn:30443`) - if they need credentials, create an
+`imagePullSecret` and add `imagePullSecrets:` to the deployment spec.
 
 ## Install
 
@@ -77,10 +97,10 @@ Once the pod is `Ready`:
 kubectl -n control-panel rollout status deployment/control-panel
 ```
 
-The web UI is exposed on **NodePort 30080**:
+The web UI is exposed on **NodePort 30180**:
 
 ```
-http://<any-node-ip>:30080/
+http://<any-node-ip>:30180/
 ```
 
 Default admin username: `admin`. Log in with the password you set during
@@ -124,7 +144,7 @@ preserve it.
   `/app/ssh_keys/id_rsa` volume mount in the Deployment - the original spec's
   SSH-key Secret mount was omitted because the backend does not read from the
   filesystem. See `internal/ssh` for the decryption path.
-- **Internal-only exposure**: NodePort 30080 is intended for internal-network
+- **Internal-only exposure**: NodePort 30180 is intended for internal-network
   access. Use an Ingress with TLS for any production exposure.
 - **Pod security**: the Deployment sets `seccompProfile: RuntimeDefault`. The
   container currently runs as root (required to write to the PVC-mounted
@@ -154,5 +174,5 @@ granted.
   `kubectl -n control-panel describe serviceaccount control-panel`.
 - **PVC stuck Pending**: no StorageClass can provision a volume, or the node is
   out of space. Check: `kubectl -n control-panel describe pvc control-panel-data`.
-- **NodePort 30080 not reachable**: check node firewalls and that the port
-  range allows 30080 (default NodePort range is 30000-32767).
+- **NodePort 30180 not reachable**: check node firewalls and that the port
+  range allows 30180 (default NodePort range is 30000-32767).
