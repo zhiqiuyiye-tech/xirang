@@ -1,5 +1,17 @@
 # Control Panel - Kubernetes Deployment
 
+> **One-command install (recommended):** use the Helm chart at
+> `control_panel/charts/control-panel/`. It auto-generates all secrets
+> (AES_KEY/JWT_SECRET/admin password) so a single `helm install` brings up a
+> working pod with zero manual steps:
+> ```bash
+> helm install control-panel ./control_panel/charts/control-panel --create-namespace -n control-panel
+> ```
+> See `control_panel/charts/control-panel/README.md` for details.
+>
+> This `deploy/` directory holds the raw kubectl manifests + `install.sh` as an
+> alternative (non-Helm) path.
+
 This directory contains Kubernetes manifests and an install script for deploying
 the control panel into a cluster.
 

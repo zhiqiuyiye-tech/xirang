@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-panel
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "control-panel.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "control-panel.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "control-panel.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: control-panel
+      {{- with .Values.image.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: false
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control-panel
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          env:
+            - name: AES_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: control-panel-secrets
+                  key: AES_KEY
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: control-panel-secrets
+                  key: JWT_SECRET
+            - name: ADMIN_INIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: control-panel-secrets
+                  key: ADMIN_INIT_PASSWORD
+            - name: DB_PATH
+              value: /data/control_panel.db
+            - name: LISTEN_ADDR
+              value: ":{{ .Values.service.port }}"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: false
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: control-panel-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

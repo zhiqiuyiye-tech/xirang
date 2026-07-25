@@ -1,0 +1,7 @@
+# Patterns to ignore when packaging the chart.
+README.md
+values.yaml
+NOTES.txt
+*.tpl
+.git/
+.gitignore

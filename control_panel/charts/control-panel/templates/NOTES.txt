@@ -1,0 +1,34 @@
+Control panel is deploying to namespace '{{ .Values.namespace }}'.
+
+1. Wait for the pod to become Ready:
+
+   kubectl -n {{ .Values.namespace }} rollout status deployment/control-panel
+
+2. Retrieve the auto-generated initial admin password (username: admin):
+
+   kubectl -n {{ .Values.namespace }} get secret control-panel-secrets \
+     -o jsonpath='{.data.ADMIN_INIT_PASSWORD}' | base64 -d ; echo
+
+{{- if eq .Values.service.type "NodePort" }}
+3. Access the web UI via NodePort ({{ .Values.service.nodePort }}):
+
+   http://<any-node-ip>:{{ .Values.service.nodePort }}/
+
+{{- else }}
+3. Access the web UI via the Service ClusterIP:
+
+   kubectl -n {{ .Values.namespace }} port-forward svc/control-panel 8080:{{ .Values.service.port }}
+   then open http://localhost:8080/
+
+{{- end }}
+
+First-time setup: add Worker nodes (host/port/username), set their SSH private key
+or panel-side password via the UI, click "安装依赖" to auto-install lvm2/nfs-utils,
+then manage K8s SVC/NetworkPolicy and NFS storage from the UI.
+
+Notes:
+- AES_KEY/JWT_SECRET were auto-generated. To pin them (preserve encrypted worker
+  credentials across upgrades), set secrets.aesKey / secrets.jwtSecret in values.
+- The pod pulls {{ .Values.image.repository }}:{{ .Values.image.tag }} with
+  imagePullPolicy: {{ .Values.image.pullPolicy }}. Ensure cluster nodes can reach
+  the registry; if it needs auth, set image.imagePullSecrets in values.
