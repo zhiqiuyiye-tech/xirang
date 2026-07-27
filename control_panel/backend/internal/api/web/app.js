@@ -227,11 +227,12 @@
             (isEdit ? '' :
             '<div class="form-field"><label>从集群节点选择(可选)</label>' +
             '<select id="worker-node-select"><option value="">-- 手动填写或选择集群节点 --</option></select>' +
-            '<p class="muted" style="font-size:12px;">选中后自动填入名称/主机,只需再设 SSH 凭据(建后点"凭证")。</p></div>') +
+            '<p class="muted" style="font-size:12px;">选中后自动填入名称/主机。</p></div>') +
             '<div class="form-field"><label>名称</label><input type="text" name="name" value="' + esc(worker ? worker.name : '') + '" required></div>' +
             '<div class="form-field"><label>主机</label><input type="text" name="host" value="' + esc(worker ? worker.host : '') + '" required></div>' +
             '<div class="form-field"><label>端口</label><input type="number" name="port" value="' + esc(worker ? worker.port : 22) + '"></div>' +
             '<div class="form-field"><label>用户名</label><input type="text" name="username" value="' + esc(worker ? worker.username : 'root') + '"></div>' +
+            '<div class="form-field"><label>SSH 密码' + (isEdit ? '(留空不修改)' : '(可选,与用户名一起用于密码登录)') + '</label><input type="password" name="password" placeholder="留空则后续在凭证中设置"></div>' +
             '<div class="row mt-2"><button type="submit" class="btn btn-primary">保存</button> ' +
             '<button type="button" class="btn btn-link" id="worker-cancel" style="color:#555;">取消</button></div>' +
             '<div id="worker-form-msg" class="error-msg"></div>' +
@@ -282,6 +283,16 @@
                     r = await apiJSON('/workers', { method: 'POST', body: JSON.stringify(body) });
                 }
                 if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                // If a password was entered, store it as the panel-side SSH
+                // password (encrypted at rest) via the credentials endpoint.
+                var pw = form.password.value;
+                if (pw) {
+                    var wid = isEdit ? id : (r.data && r.data.id);
+                    if (wid) {
+                        var pr = await apiJSON('/workers/' + wid + '/credentials/password', { method: 'POST', body: JSON.stringify({ password: pw }) });
+                        if (!pr.resp.ok) { setMsg(msgEl, 'Worker 已保存,但密码设置失败: ' + (pr.data && pr.data.error), 'error'); return; }
+                    }
+                }
                 modal.remove();
                 handleRoute();
             } catch (err) {
@@ -420,16 +431,14 @@
             '</div>' +
             '<div class="card mt-2">' +
             '<div class="section-title">已创建的端口映射 (Service)</div>' +
-            '<div class="form-field"><label>命名空间</label><input type="text" id="svc-list-ns" value="" placeholder="留空查全部"></div>' +
-            '<button class="btn btn-primary btn-sm" id="btn-list-svc">查询</button>' +
             '<div id="svc-msg" class="info-msg"></div>' +
-            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>ClusterIP</th><th>端口</th><th>操作</th></tr></thead>' +
-            '<tbody id="svc-tbody"><tr><td colspan="6" class="muted">点击查询加载。</td></tr></tbody></table>' +
+            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>外部端口(NodePort)</th><th>内部端口(Port->Target)</th><th>操作</th></tr></thead>' +
+            '<tbody id="svc-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table>' +
             '</div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
-        document.getElementById('btn-list-svc').addEventListener('click', function () { listSvcs(content); });
         loadPods(content);
+        listSvcs(content);
     });
 
     async function loadPods(content) {
@@ -499,24 +508,29 @@
     }
 
     async function listSvcs(content) {
-        var ns = document.getElementById('svc-list-ns').value || '';
         var tbody = document.getElementById('svc-tbody');
         var msgEl = document.getElementById('svc-msg');
         tbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
         try {
-            var r = await apiJSON('/k8s/services?namespace=' + encodeURIComponent(ns));
+            var r = await apiJSON('/k8s/services?namespace=');
             if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
             var svcs = r.data || [];
             if (svcs.items) svcs = svcs.items;
-            if (!Array.isArray(svcs) || svcs.length === 0) { tbody.innerHTML = '<tr><td colspan="6" class="muted">未找到 Service。</td></tr>'; return; }
+            if (!Array.isArray(svcs) || svcs.length === 0) { tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无端口映射。</td></tr>'; return; }
             tbody.innerHTML = svcs.map(function (s) {
                 var name = s.metadata ? s.metadata.name : s.name || '?';
-                var namespace = s.metadata ? s.metadata.namespace : s.namespace || ns;
+                var namespace = s.metadata ? s.metadata.namespace : s.namespace || '';
                 var type = s.spec ? s.spec.type : s.type || '-';
-                var clusterIP = s.spec ? s.spec.clusterIP : s.clusterIP || '-';
-                var ports = '-';
-                if (s.spec && s.spec.ports) { ports = s.spec.ports.map(function (p) { return p.port + '/' + (p.protocol || 'TCP'); }).join(', '); }
-                return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(type) + '</td><td>' + esc(clusterIP) + '</td><td>' + esc(ports) + '</td>' +
+                var extPorts = '-', intPorts = '-';
+                if (s.spec && s.spec.ports) {
+                    extPorts = s.spec.ports.map(function (p) { return (p.nodePort || '-') + '/' + (p.protocol || 'TCP'); }).join(', ');
+                    intPorts = s.spec.ports.map(function (p) {
+                        var tp = p.targetPort;
+                        if (tp && typeof tp === 'object') tp = tp.IntVal || tp.StrVal || '?';
+                        return p.port + '->' + (tp || p.port);
+                    }).join(', ');
+                }
+                return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(type) + '</td><td>' + esc(extPorts) + '</td><td>' + esc(intPorts) + '</td>' +
                     '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">删除</button></td></tr>';
             }).join('');
             tbody.querySelectorAll('button[data-name]').forEach(function (btn) {
