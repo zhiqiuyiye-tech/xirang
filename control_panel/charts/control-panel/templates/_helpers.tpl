@@ -17,24 +17,25 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
-AES_KEY: 32 random bytes base64. Pinned if .Values.secrets.aesKey set.
+AES_KEY: 32 random bytes, base64-encoded (decodes to exactly 32 bytes for
+AES-256). Pinned if .Values.secrets.aesKey set.
 */}}
 {{- define "control-panel.aesKey" -}}
 {{- if .Values.secrets.aesKey -}}
 {{- .Values.secrets.aesKey -}}
 {{- else -}}
-{{- randAlphaNum 44 | b64enc -}}
+{{- randBytes 32 | b64enc -}}
 {{- end -}}
 {{- end -}}
 
 {{/*
-JWT_SECRET: random base64. Pinned if .Values.secrets.jwtSecret set.
+JWT_SECRET: 32 random bytes, base64-encoded. Pinned if .Values.secrets.jwtSecret set.
 */}}
 {{- define "control-panel.jwtSecret" -}}
 {{- if .Values.secrets.jwtSecret -}}
 {{- .Values.secrets.jwtSecret -}}
 {{- else -}}
-{{- randAlphaNum 44 | b64enc -}}
+{{- randBytes 32 | b64enc -}}
 {{- end -}}
 {{- end -}}
 
