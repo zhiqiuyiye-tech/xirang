@@ -3,6 +3,7 @@ WORKDIR /src
 # golang:alpine tracks the latest stable Go. GOTOOLCHAIN=auto lets the build
 # fetch the exact version go.mod requires if the image's Go is older.
 ENV GOTOOLCHAIN=auto
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
