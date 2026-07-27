@@ -23,7 +23,7 @@
         if (resp.status === 401) {
             clearToken();
             showLogin();
-            throw new Error('Unauthorized');
+            throw new Error('未授权');
         }
         return resp;
     }
@@ -65,14 +65,14 @@
             });
             if (!resp.ok) {
                 var d = await resp.json();
-                errEl.textContent = d.error || 'Login failed';
+                errEl.textContent = d.error || '登录失败';
                 return;
             }
             var data = await resp.json();
             setToken(data.token);
             showApp();
         } catch (err) {
-            errEl.textContent = 'Network error: ' + err.message;
+            errEl.textContent = '网络错误: ' + err.message;
         }
     }
 
@@ -146,7 +146,7 @@
         if (handler) {
             handler(content, hash);
         } else {
-            content.innerHTML = '<h2 class="page-title">Page not found</h2><p>Unknown route: ' + esc(hash) + '</p>';
+            content.innerHTML = '<h2 class="page-title">页面未找到</h2><p>未知路由: ' + esc(hash) + '</p>';
         }
     }
 
@@ -155,12 +155,12 @@
     // ====================================================================
 
     registerRoute('/workers', async function (content) {
-        content.innerHTML = '<h2 class="page-title">Workers</h2>' +
-            '<button class="btn btn-primary btn-sm" id="btn-new-worker">+ New Worker</button>' +
+        content.innerHTML = '<h2 class="page-title">Worker 节点</h2>' +
+            '<button class="btn btn-primary btn-sm" id="btn-new-worker">+ 新建 Worker</button>' +
             '<div id="workers-msg" class="info-msg"></div>' +
             '<table class="data-table mt-2" id="workers-table"><thead><tr>' +
-            '<th>ID</th><th>Name</th><th>Host</th><th>Port</th><th>Username</th><th>Auth</th><th>Status</th><th>Last Seen</th><th>Actions</th>' +
-            '</tr></thead><tbody id="workers-tbody"><tr><td colspan="9" class="muted">Loading...</td></tr></tbody></table>';
+            '<th>ID</th><th>名称</th><th>主机</th><th>端口</th><th>用户名</th><th>认证</th><th>状态</th><th>最近在线</th><th>操作</th>' +
+            '</tr></thead><tbody id="workers-tbody"><tr><td colspan="9" class="muted">加载中...</td></tr></tbody></table>';
 
         document.getElementById('btn-new-worker').addEventListener('click', function () {
             showWorkerForm(content, null);
@@ -168,11 +168,11 @@
 
         try {
             var r = await apiJSON('/workers');
-            if (!r.resp.ok) { setMsg(document.getElementById('workers-msg'), 'Error: ' + (r.data && r.data.error), 'error'); return; }
+            if (!r.resp.ok) { setMsg(document.getElementById('workers-msg'), '错误: ' + (r.data && r.data.error), 'error'); return; }
             var workers = r.data || [];
             var tbody = document.getElementById('workers-tbody');
             if (workers.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="muted">No workers yet.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="muted">暂无 Worker。</td></tr>';
                 return;
             }
             tbody.innerHTML = workers.map(function (w) {
@@ -186,11 +186,11 @@
                     '<td>' + statusBadge(w.status) + '</td>' +
                     '<td>' + esc(fmtTime(w.last_seen_at)) + '</td>' +
                     '<td>' +
-                    '<button class="btn btn-sm btn-primary" data-action="edit" data-id="' + w.id + '">Edit</button> ' +
-                    '<button class="btn btn-sm btn-success" data-action="test" data-id="' + w.id + '">Test</button> ' +
-                    '<button class="btn btn-sm btn-primary" data-action="creds" data-id="' + w.id + '">Creds</button> ' +
+                    '<button class="btn btn-sm btn-primary" data-action="edit" data-id="' + w.id + '">编辑</button> ' +
+                    '<button class="btn btn-sm btn-success" data-action="test" data-id="' + w.id + '">测试</button> ' +
+                    '<button class="btn btn-sm btn-primary" data-action="creds" data-id="' + w.id + '">凭证</button> ' +
                     '<button class="btn btn-sm btn-primary" data-action="install-deps" data-id="' + w.id + '">安装依赖</button> ' +
-                    '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + w.id + '">Delete</button>' +
+                    '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + w.id + '">删除</button>' +
                     '</td></tr>';
             }).join('');
 
@@ -207,7 +207,7 @@
                 });
             });
         } catch (err) {
-            setMsg(document.getElementById('workers-msg'), 'Error: ' + err.message, 'error');
+            setMsg(document.getElementById('workers-msg'), '错误: ' + err.message, 'error');
         }
     });
 
@@ -216,20 +216,20 @@
         var worker = null;
         if (isEdit) {
             var r = await apiJSON('/workers/' + id);
-            if (!r.resp.ok) { alert('Failed to load worker: ' + (r.data && r.data.error)); return; }
+            if (!r.resp.ok) { alert('加载 Worker 失败: ' + (r.data && r.data.error)); return; }
             worker = r.data;
         }
 
         var html = '<div class="modal-overlay" id="worker-modal">' +
             '<div class="modal">' +
-            '<h3 class="modal-title">' + (isEdit ? 'Edit Worker' : 'New Worker') + '</h3>' +
+            '<h3 class="modal-title">' + (isEdit ? '编辑 Worker' : '新建 Worker') + '</h3>' +
             '<form id="worker-form">' +
-            '<div class="form-field"><label>Name</label><input type="text" name="name" value="' + esc(worker ? worker.name : '') + '" required></div>' +
-            '<div class="form-field"><label>Host</label><input type="text" name="host" value="' + esc(worker ? worker.host : '') + '" required></div>' +
-            '<div class="form-field"><label>Port</label><input type="number" name="port" value="' + esc(worker ? worker.port : 22) + '"></div>' +
-            '<div class="form-field"><label>Username</label><input type="text" name="username" value="' + esc(worker ? worker.username : 'root') + '"></div>' +
-            '<div class="row mt-2"><button type="submit" class="btn btn-primary">Save</button> ' +
-            '<button type="button" class="btn btn-link" id="worker-cancel" style="color:#555;">Cancel</button></div>' +
+            '<div class="form-field"><label>名称</label><input type="text" name="name" value="' + esc(worker ? worker.name : '') + '" required></div>' +
+            '<div class="form-field"><label>主机</label><input type="text" name="host" value="' + esc(worker ? worker.host : '') + '" required></div>' +
+            '<div class="form-field"><label>端口</label><input type="number" name="port" value="' + esc(worker ? worker.port : 22) + '"></div>' +
+            '<div class="form-field"><label>用户名</label><input type="text" name="username" value="' + esc(worker ? worker.username : 'root') + '"></div>' +
+            '<div class="row mt-2"><button type="submit" class="btn btn-primary">保存</button> ' +
+            '<button type="button" class="btn btn-link" id="worker-cancel" style="color:#555;">取消</button></div>' +
             '<div id="worker-form-msg" class="error-msg"></div>' +
             '</form></div></div>';
         content.insertAdjacentHTML('beforeend', html);
@@ -253,11 +253,11 @@
                 } else {
                     r = await apiJSON('/workers', { method: 'POST', body: JSON.stringify(body) });
                 }
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 modal.remove();
                 handleRoute();
             } catch (err) {
-                setMsg(msgEl, 'Error: ' + err.message, 'error');
+                setMsg(msgEl, '错误: ' + err.message, 'error');
             }
         });
     }
@@ -266,21 +266,21 @@
         try {
             var r = await apiJSON('/workers/' + id + '/test', { method: 'POST' });
             if (r.data && r.data.ok) {
-                alert('Connection OK');
+                alert('连接正常');
             } else {
-                alert('Connection failed: ' + (r.data && r.data.error || 'unknown'));
+                alert('连接失败: ' + (r.data && r.data.error || '未知'));
             }
             handleRoute();
-        } catch (err) { alert('Error: ' + err.message); }
+        } catch (err) { alert('错误: ' + err.message); }
     }
 
     async function doDeleteWorker(content, id) {
-        if (!confirm('Delete worker ' + id + '?')) return;
+        if (!confirm('确认删除 Worker ' + id + '?')) return;
         try {
             var r = await apiJSON('/workers/' + id, { method: 'DELETE' });
-            if (!r.resp.ok) { alert('Error: ' + (r.data && r.data.error)); return; }
+            if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
             handleRoute();
-        } catch (err) { alert('Error: ' + err.message); }
+        } catch (err) { alert('错误: ' + err.message); }
     }
 
     // Credentials form: set private key, set panel password, change root password
@@ -295,29 +295,29 @@
         var html = '<div class="modal-overlay" id="creds-modal">' +
             '<div class="modal">' +
             '<h3 class="modal-title">Worker #' + esc(id) + ' Credentials' +
-            (worker ? ' <span class="muted">(auth: ' + esc(worker.auth_mode) + ')</span>' : '') + '</h3>' +
+            (worker ? ' <span class="muted">(认证: ' + esc(worker.auth_mode) + ')</span>' : '') + '</h3>' +
             '<p class="muted mb-1">Credential values are encrypted at rest and never returned by the API.</p>' +
 
             '<div class="card"><div class="section-title">Set Private Key (Interface 1: panel-side)</div>' +
             '<form id="set-key-form">' +
-            '<div class="form-field"><label>Private Key (PEM)</label><textarea name="private_key" rows="4" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----"></textarea></div>' +
-            '<button type="submit" class="btn btn-primary btn-sm">Set Key</button>' +
+            '<div class="form-field"><label>私钥 (PEM)</label><textarea name="private_key" rows="4" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----"></textarea></div>' +
+            '<button type="submit" class="btn btn-primary btn-sm">设置私钥</button>' +
             '<div id="set-key-msg" class="error-msg"></div></form></div>' +
 
             '<div class="card"><div class="section-title">Set Panel Password (Interface 1: panel-side)</div>' +
             '<form id="set-pw-form">' +
-            '<div class="form-field"><label>Password</label><input type="password" name="password"></div>' +
-            '<button type="submit" class="btn btn-primary btn-sm">Set Password</button>' +
+            '<div class="form-field"><label>密码</label><input type="password" name="password"></div>' +
+            '<button type="submit" class="btn btn-primary btn-sm">设置密码</button>' +
             '<div id="set-pw-msg" class="error-msg"></div></form></div>' +
 
             '<div class="card"><div class="section-title">Change Root Password (Interface 2: push to worker via SSH)</div>' +
             '<form id="root-pw-form">' +
-            '<div class="form-field"><label>New Root Password</label><input type="password" name="password"></div>' +
-            '<button type="submit" class="btn btn-danger btn-sm">Change Root Password</button>' +
+            '<div class="form-field"><label>新 root 密码</label><input type="password" name="password"></div>' +
+            '<button type="submit" class="btn btn-danger btn-sm">修改 root 密码</button>' +
             '<div id="root-pw-msg" class="error-msg"></div>' +
             '<p class="muted mt-1">This submits an async task (chpasswd via SSH). You will be redirected to the task page.</p></form></div>' +
 
-            '<button type="button" class="btn btn-link mt-2" id="creds-cancel" style="color:#555;">Close</button>' +
+            '<button type="button" class="btn btn-link mt-2" id="creds-cancel" style="color:#555;">关闭</button>' +
             '</div></div>';
         content.insertAdjacentHTML('beforeend', html);
 
@@ -331,10 +331,10 @@
             var msgEl = document.getElementById('set-key-msg');
             try {
                 var r = await apiJSON('/workers/' + id + '/credentials/private-key', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
-                setMsg(msgEl, 'Private key set.', 'success');
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                setMsg(msgEl, '私钥已设置。', 'success');
                 e.target.reset();
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
 
         // Set panel password
@@ -344,10 +344,10 @@
             var msgEl = document.getElementById('set-pw-msg');
             try {
                 var r = await apiJSON('/workers/' + id + '/credentials/password', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
-                setMsg(msgEl, 'Panel password set.', 'success');
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                setMsg(msgEl, '面板密码已设置。', 'success');
                 e.target.reset();
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
 
         // Change root password (async -> task)
@@ -357,24 +357,24 @@
             var msgEl = document.getElementById('root-pw-msg');
             try {
                 var r = await apiJSON('/workers/' + id + '/root-password', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 var taskID = r.data && r.data.task_id;
                 modal.remove();
                 window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
     }
 
     // install-deps: confirm -> POST -> navigate to task page (same pattern as
     // changeRootPassword but no form needed - just worker_id in params).
     async function doInstallDeps(content, id) {
-        if (!confirm('Install lvm2/nfs-utils on worker #' + id + ' via SSH?')) return;
+        if (!confirm('确认经 SSH 在 Worker #' + id + ' 上安装 lvm2/nfs-utils?')) return;
         try {
             var r = await apiJSON('/workers/' + id + '/install-deps', { method: 'POST' });
-            if (!r.resp.ok) { alert('Error: ' + (r.data && r.data.error)); return; }
+            if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
             var taskID = r.data && r.data.task_id;
             window.location.hash = '#/tasks/' + taskID;
-        } catch (err) { alert('Error: ' + err.message); }
+        } catch (err) { alert('错误: ' + err.message); }
     }
 
     // ====================================================================
@@ -382,26 +382,26 @@
     // ====================================================================
 
     registerRoute('/k8s', async function (content) {
-        content.innerHTML = '<h2 class="page-title">Kubernetes</h2>' +
+        content.innerHTML = '<h2 class="page-title">Kubernetes 资源</h2>' +
             '<div class="row">' +
             '<div class="col"><div class="card">' +
-            '<div class="section-title">Services</div>' +
-            '<div class="form-field"><label>Namespace</label><input type="text" id="k8s-svc-ns" placeholder="default" value="default"></div>' +
-            '<button class="btn btn-primary btn-sm" id="btn-list-svc">List</button> ' +
-            '<button class="btn btn-success btn-sm" id="btn-new-svc">+ Create Service</button>' +
+            '<div class="section-title">Service 列表</div>' +
+            '<div class="form-field"><label>命名空间</label><input type="text" id="k8s-svc-ns" placeholder="default" value="default"></div>' +
+            '<button class="btn btn-primary btn-sm" id="btn-list-svc">查询</button> ' +
+            '<button class="btn btn-success btn-sm" id="btn-new-svc">+ 创建 Service</button>' +
             '<div id="svc-msg" class="info-msg"></div>' +
-            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>Name</th><th>Namespace</th><th>Type</th><th>ClusterIP</th><th>Ports</th><th>Actions</th></tr></thead>' +
-            '<tbody id="svc-tbody"><tr><td colspan="6" class="muted">Click List to load.</td></tr></tbody></table>' +
+            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>ClusterIP</th><th>端口</th><th>操作</th></tr></thead>' +
+            '<tbody id="svc-tbody"><tr><td colspan="6" class="muted">点击查询加载。</td></tr></tbody></table>' +
             '</div></div>' +
 
             '<div class="col"><div class="card">' +
-            '<div class="section-title">Network Policies</div>' +
-            '<div class="form-field"><label>Namespace</label><input type="text" id="k8s-np-ns" placeholder="default" value="default"></div>' +
-            '<button class="btn btn-primary btn-sm" id="btn-list-np">List</button> ' +
-            '<button class="btn btn-success btn-sm" id="btn-new-np">+ Create Policy</button>' +
+            '<div class="section-title">NetworkPolicy 列表</div>' +
+            '<div class="form-field"><label>命名空间</label><input type="text" id="k8s-np-ns" placeholder="default" value="default"></div>' +
+            '<button class="btn btn-primary btn-sm" id="btn-list-np">查询</button> ' +
+            '<button class="btn btn-success btn-sm" id="btn-new-np">+ 创建策略</button>' +
             '<div id="np-msg" class="info-msg"></div>' +
-            '<table class="data-table mt-2" id="np-table"><thead><tr><th>Name</th><th>Namespace</th><th>Pod Selector</th><th>Actions</th></tr></thead>' +
-            '<tbody id="np-tbody"><tr><td colspan="4" class="muted">Click List to load.</td></tr></tbody></table>' +
+            '<table class="data-table mt-2" id="np-table"><thead><tr><th>名称</th><th>命名空间</th><th>Pod 选择器</th><th>操作</th></tr></thead>' +
+            '<tbody id="np-tbody"><tr><td colspan="4" class="muted">点击查询加载。</td></tr></tbody></table>' +
             '</div></div>' +
             '</div>';
 
@@ -415,14 +415,14 @@
         var ns = document.getElementById('k8s-svc-ns').value || 'default';
         var tbody = document.getElementById('svc-tbody');
         var msgEl = document.getElementById('svc-msg');
-        tbody.innerHTML = '<tr><td colspan="6" class="muted">Loading...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
         try {
             var r = await apiJSON('/k8s/services?namespace=' + encodeURIComponent(ns));
-            if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
+            if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
             var svcs = r.data || [];
             if (svcs.items) svcs = svcs.items; // handle k8s List format if returned
             if (!Array.isArray(svcs) || svcs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="muted">No services found.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="muted">未找到 Service。</td></tr>';
                 return;
             }
             tbody.innerHTML = svcs.map(function (s) {
@@ -437,36 +437,36 @@
                     ports = s.ports;
                 }
                 return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(type) + '</td><td>' + esc(clusterIP) + '</td><td>' + esc(ports) + '</td>' +
-                    '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">Delete</button></td></tr>';
+                    '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">删除</button></td></tr>';
             }).join('');
             tbody.querySelectorAll('button[data-name]').forEach(function (btn) {
                 btn.addEventListener('click', async function () {
-                    if (!confirm('Delete service ' + this.getAttribute('data-name') + '?')) return;
+                    if (!confirm('确认删除 Service ' + this.getAttribute('data-name') + '?')) return;
                     var name = this.getAttribute('data-name');
                     var ns2 = this.getAttribute('data-ns');
                     try {
                         var r = await apiJSON('/k8s/services/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
-                        if (!r.resp.ok) { alert('Error: ' + (r.data && r.data.error)); return; }
+                        if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
                         var taskID = r.data && r.data.task_id;
                         if (taskID) window.location.hash = '#/tasks/' + taskID;
                         else listK8sServices(content);
-                    } catch (err) { alert('Error: ' + err.message); }
+                    } catch (err) { alert('错误: ' + err.message); }
                 });
             });
-        } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+        } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
     }
 
     async function showCreateServiceForm(content) {
         var html = '<div class="modal-overlay" id="svc-modal"><div class="modal">' +
-            '<h3 class="modal-title">Create Service</h3>' +
+            '<h3 class="modal-title">创建 Service</h3>' +
             '<form id="svc-create-form">' +
-            '<div class="form-field"><label>Namespace</label><input type="text" name="namespace" value="default"></div>' +
-            '<div class="form-field"><label>Pod Name</label><input type="text" name="pod_name" required></div>' +
+            '<div class="form-field"><label>命名空间</label><input type="text" name="namespace" value="default"></div>' +
+            '<div class="form-field"><label>Pod 名称</label><input type="text" name="pod_name" required></div>' +
             '<div class="form-field"><label>Pod UID</label><input type="text" name="pod_uid" required></div>' +
-            '<div class="form-field"><label>Selector (key=value, comma-separated)</label><input type="text" name="selector" placeholder="app=web"></div>' +
-            '<div class="form-field"><label>Type</label><select name="type"><option value="ClusterIP">ClusterIP</option><option value="NodePort">NodePort</option></select></div>' +
-            '<div class="form-field"><label>Ports (port:target_port:protocol, comma-separated)</label><input type="text" name="ports" placeholder="80:8080:TCP"></div>' +
-            '<button type="submit" class="btn btn-primary">Create</button> <button type="button" class="btn btn-link" id="svc-cancel" style="color:#555;">Cancel</button>' +
+            '<div class="form-field"><label>选择器 (key=value,逗号分隔)</label><input type="text" name="selector" placeholder="app=web"></div>' +
+            '<div class="form-field"><label>类型</label><select name="type"><option value="ClusterIP">ClusterIP</option><option value="NodePort">NodePort</option></select></div>' +
+            '<div class="form-field"><label>端口 (port:target_port:protocol,逗号分隔)</label><input type="text" name="ports" placeholder="80:8080:TCP"></div>' +
+            '<button type="submit" class="btn btn-primary">创建</button> <button type="button" class="btn btn-link" id="svc-cancel" style="color:#555;">取消</button>' +
             '<div id="svc-form-msg" class="error-msg"></div></form></div></div>';
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('svc-modal');
@@ -496,11 +496,11 @@
             var msgEl = document.getElementById('svc-form-msg');
             try {
                 var r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 modal.remove();
                 var taskID = r.data && r.data.task_id;
                 if (taskID) window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
     }
 
@@ -508,14 +508,14 @@
         var ns = document.getElementById('k8s-np-ns').value || 'default';
         var tbody = document.getElementById('np-tbody');
         var msgEl = document.getElementById('np-msg');
-        tbody.innerHTML = '<tr><td colspan="4" class="muted">Loading...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4" class="muted">加载中...</td></tr>';
         try {
             var r = await apiJSON('/k8s/network-policies?namespace=' + encodeURIComponent(ns));
-            if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
+            if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
             var nps = r.data || [];
             if (nps.items) nps = nps.items;
             if (!Array.isArray(nps) || nps.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="muted">No network policies found.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="4" class="muted">未找到 NetworkPolicy。</td></tr>';
                 return;
             }
             tbody.innerHTML = nps.map(function (np) {
@@ -526,35 +526,35 @@
                     sel = Object.entries(np.spec.podSelector.matchLabels).map(function (kv) { return kv[0] + '=' + kv[1]; }).join(',');
                 }
                 return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(sel) + '</td>' +
-                    '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">Delete</button></td></tr>';
+                    '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">删除</button></td></tr>';
             }).join('');
             tbody.querySelectorAll('button[data-name]').forEach(function (btn) {
                 btn.addEventListener('click', async function () {
-                    if (!confirm('Delete network policy ' + this.getAttribute('data-name') + '?')) return;
+                    if (!confirm('确认删除 NetworkPolicy ' + this.getAttribute('data-name') + '?')) return;
                     var name = this.getAttribute('data-name');
                     var ns2 = this.getAttribute('data-ns');
                     try {
                         var r = await apiJSON('/k8s/network-policies/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
-                        if (!r.resp.ok) { alert('Error: ' + (r.data && r.data.error)); return; }
+                        if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
                         var taskID = r.data && r.data.task_id;
                         if (taskID) window.location.hash = '#/tasks/' + taskID;
                         else listK8sNetworkPolicies(content);
-                    } catch (err) { alert('Error: ' + err.message); }
+                    } catch (err) { alert('错误: ' + err.message); }
                 });
             });
-        } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+        } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
     }
 
     async function showCreateNetworkPolicyForm(content) {
         var html = '<div class="modal-overlay" id="np-modal"><div class="modal">' +
-            '<h3 class="modal-title">Create Network Policy</h3>' +
+            '<h3 class="modal-title">创建 NetworkPolicy</h3>' +
             '<form id="np-create-form">' +
-            '<div class="form-field"><label>Namespace</label><input type="text" name="namespace" value="default"></div>' +
-            '<div class="form-field"><label>Pod Name</label><input type="text" name="pod_name" required></div>' +
+            '<div class="form-field"><label>命名空间</label><input type="text" name="namespace" value="default"></div>' +
+            '<div class="form-field"><label>Pod 名称</label><input type="text" name="pod_name" required></div>' +
             '<div class="form-field"><label>Pod UID</label><input type="text" name="pod_uid" required></div>' +
-            '<div class="form-field"><label>Pod Selector (key=value, comma-separated)</label><input type="text" name="pod_selector" placeholder="app=web"></div>' +
-            '<div class="form-field"><label>Ingress Ports (protocol:port, comma-separated)</label><input type="text" name="ingress_ports" placeholder="TCP:80,TCP:443"></div>' +
-            '<button type="submit" class="btn btn-primary">Create</button> <button type="button" class="btn btn-link" id="np-cancel" style="color:#555;">Cancel</button>' +
+            '<div class="form-field"><label>Pod 选择器 (key=value,逗号分隔)</label><input type="text" name="pod_selector" placeholder="app=web"></div>' +
+            '<div class="form-field"><label>入站端口 (protocol:port,逗号分隔)</label><input type="text" name="ingress_ports" placeholder="TCP:80,TCP:443"></div>' +
+            '<button type="submit" class="btn btn-primary">创建</button> <button type="button" class="btn btn-link" id="np-cancel" style="color:#555;">取消</button>' +
             '<div id="np-form-msg" class="error-msg"></div></form></div></div>';
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('np-modal');
@@ -583,11 +583,11 @@
             var msgEl = document.getElementById('np-form-msg');
             try {
                 var r = await apiJSON('/k8s/network-policies', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 modal.remove();
                 var taskID = r.data && r.data.task_id;
                 if (taskID) window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
     }
 
@@ -596,38 +596,38 @@
     // ====================================================================
 
     registerRoute('/storage', async function (content) {
-        content.innerHTML = '<h2 class="page-title">Storage</h2>' +
+        content.innerHTML = '<h2 class="page-title">存储编排</h2>' +
             '<div class="row">' +
             '<div class="col"><div class="card">' +
-            '<div class="section-title">Provision NFS Storage</div>' +
+            '<div class="section-title">创建 NFS 存储</div>' +
             '<form id="provision-form">' +
             '<div class="form-field"><label>Worker ID</label><input type="number" name="worker_id" required></div>' +
-            '<div class="form-field"><label>Volume Group Name</label><input type="text" name="vg_name" placeholder="vg0" required></div>' +
-            '<div class="form-field"><label>LV Name</label><input type="text" name="lv_name" required></div>' +
-            '<div class="form-field"><label>Size (GB)</label><input type="number" name="size_gb" required></div>' +
-            '<div class="form-field"><label>Filesystem Type</label><input type="text" name="fs_type" value="ext4"></div>' +
-            '<div class="form-field"><label>Mount Point</label><input type="text" name="mount_point" placeholder="/mnt/nfs/export1" required></div>' +
-            '<div class="form-field"><label>Export Opts (optional)</label><input type="text" name="export_opts" placeholder="*(rw,sync,no_root_squash)"></div>' +
-            '<button type="submit" class="btn btn-primary">Provision</button>' +
+            '<div class="form-field"><label>Volume Group 名称</label><input type="text" name="vg_name" placeholder="vg0" required></div>' +
+            '<div class="form-field"><label>逻辑卷名称</label><input type="text" name="lv_name" required></div>' +
+            '<div class="form-field"><label>大小 (GB)</label><input type="number" name="size_gb" required></div>' +
+            '<div class="form-field"><label>文件系统类型</label><input type="text" name="fs_type" value="ext4"></div>' +
+            '<div class="form-field"><label>挂载点</label><input type="text" name="mount_point" placeholder="/mnt/nfs/export1" required></div>' +
+            '<div class="form-field"><label>导出选项(可选)</label><input type="text" name="export_opts" placeholder="*(rw,sync,no_root_squash)"></div>' +
+            '<button type="submit" class="btn btn-primary">创建</button>' +
             '<div id="provision-msg" class="error-msg"></div>' +
-            '<p class="muted mt-1">Async: submits a task and redirects to task page on success.</p>' +
+            '<p class="muted mt-1">异步: 提交任务,成功后跳转到任务页查看进度。</p>' +
             '</form></div>' +
 
             '<div class="col"><div class="card">' +
-            '<div class="section-title">Reclaim Storage</div>' +
+            '<div class="section-title">回收 NFS 存储</div>' +
             '<form id="reclaim-form">' +
             '<div class="form-field"><label>Worker ID</label><input type="number" name="worker_id" required></div>' +
-            '<div class="form-field"><label>Volume Group Name</label><input type="text" name="vg_name" required></div>' +
-            '<div class="form-field"><label>LV Name</label><input type="text" name="lv_name" required></div>' +
-            '<div class="form-field"><label>Mount Point</label><input type="text" name="mount_point" required></div>' +
-            '<button type="submit" class="btn btn-danger">Reclaim</button>' +
+            '<div class="form-field"><label>Volume Group 名称</label><input type="text" name="vg_name" required></div>' +
+            '<div class="form-field"><label>逻辑卷名称</label><input type="text" name="lv_name" required></div>' +
+            '<div class="form-field"><label>挂载点</label><input type="text" name="mount_point" required></div>' +
+            '<button type="submit" class="btn btn-danger">回收</button>' +
             '<div id="reclaim-msg" class="error-msg"></div>' +
-            '<p class="muted mt-1">Async: submits a task and redirects to task page on success.</p>' +
+            '<p class="muted mt-1">异步: 提交任务,成功后跳转到任务页查看进度。</p>' +
             '</form></div>' +
             '</div>' +
-            '<div class="card mt-2"><div class="section-title">Recent Storage Tasks</div>' +
-            '<table class="data-table" id="storage-table"><thead><tr><th>ID</th><th>Type</th><th>Worker</th><th>Status</th><th>Created</th><th>Finished</th></tr></thead>' +
-            '<tbody id="storage-tbody"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody></table></div>';
+            '<div class="card mt-2"><div class="section-title">最近存储任务</div>' +
+            '<table class="data-table" id="storage-table"><thead><tr><th>ID</th><th>类型</th><th>Worker</th><th>状态</th><th>创建时间</th><th>完成时间</th></tr></thead>' +
+            '<tbody id="storage-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table></div>';
 
         document.getElementById('provision-form').addEventListener('submit', async function (e) {
             e.preventDefault();
@@ -644,10 +644,10 @@
             var msgEl = document.getElementById('provision-msg');
             try {
                 var r = await apiJSON('/storage/provision', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 var taskID = r.data && r.data.task_id;
                 window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
 
         document.getElementById('reclaim-form').addEventListener('submit', async function (e) {
@@ -662,20 +662,20 @@
             var msgEl = document.getElementById('reclaim-msg');
             try {
                 var r = await apiJSON('/storage/reclaim', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, 'Error: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 var taskID = r.data && r.data.task_id;
                 window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, 'Error: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
 
         // Load storage tasks
         try {
             var r = await apiJSON('/storage');
             var tbody = document.getElementById('storage-tbody');
-            if (!r.resp.ok) { tbody.innerHTML = '<tr><td colspan="6" class="muted">Error loading.</td></tr>'; return; }
+            if (!r.resp.ok) { tbody.innerHTML = '<tr><td colspan="6" class="muted">加载失败。</td></tr>'; return; }
             var tasks = r.data || [];
             if (tasks.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="muted">No storage tasks.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无存储任务。</td></tr>';
                 return;
             }
             tbody.innerHTML = tasks.map(function (t) {
@@ -692,10 +692,10 @@
     // ====================================================================
 
     registerRoute('/tasks', async function (content) {
-        content.innerHTML = '<h2 class="page-title">Tasks</h2>' +
+        content.innerHTML = '<h2 class="page-title">任务列表</h2>' +
             '<table class="data-table" id="tasks-table"><thead><tr>' +
-            '<th>ID</th><th>Type</th><th>Target</th><th>Status</th><th>Error</th><th>Created</th><th>Finished</th>' +
-            '</tr></thead><tbody id="tasks-tbody"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody></table>';
+            '<th>ID</th><th>类型</th><th>目标</th><th>状态</th><th>错误</th><th>创建时间</th><th>完成时间</th>' +
+            '</tr></thead><tbody id="tasks-tbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody></table>';
 
         try {
             var r = await apiJSON('/tasks');
@@ -703,7 +703,7 @@
             var tasks = r.data || [];
             var tbody = document.getElementById('tasks-tbody');
             if (tasks.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="muted">No tasks.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无任务。</td></tr>';
                 return;
             }
             tbody.innerHTML = tasks.map(function (t) {
@@ -734,9 +734,9 @@
         var id = hash.split('/')[2];
         closeSSE();
 
-        content.innerHTML = '<h2 class="page-title">Task #' + esc(id) + '</h2>' +
-            '<div class="card" id="task-info"><p class="muted">Loading...</p></div>' +
-            '<div class="card"><div class="section-title">Steps (live SSE)</div>' +
+        content.innerHTML = '<h2 class="page-title">任务 #' + esc(id) + '</h2>' +
+            '<div class="card" id="task-info"><p class="muted">加载中...</p></div>' +
+            '<div class="card"><div class="section-title">执行步骤 (SSE 实时)</div>' +
             '<div id="steps-container"></div></div>' +
             '<div id="task-error" class="error-msg"></div>';
 
@@ -744,7 +744,7 @@
         try {
             var r = await apiJSON('/tasks/' + id);
             if (!r.resp.ok) {
-                document.getElementById('task-info').innerHTML = '<p class="error-msg">Task not found.</p>';
+                document.getElementById('task-info').innerHTML = '<p class="error-msg">任务未找到。</p>';
                 return;
             }
             var result = r.data;
@@ -759,7 +759,7 @@
                 subscribeSSE(id);
             }
         } catch (err) {
-            document.getElementById('task-error').textContent = 'Error: ' + err.message;
+            document.getElementById('task-error').textContent = '错误: ' + err.message;
         }
     });
 
@@ -768,13 +768,13 @@
         if (!el) return;
         el.innerHTML = '<div class="row">' +
             '<div class="col"><strong>ID:</strong> ' + esc(task.id) + '</div>' +
-            '<div class="col"><strong>Type:</strong> ' + esc(task.type) + '</div>' +
-            '<div class="col"><strong>Target:</strong> ' + esc(task.target_kind) + '/' + esc(task.target_id) + '</div>' +
+            '<div class="col"><strong>类型:</strong> ' + esc(task.type) + '</div>' +
+            '<div class="col"><strong>目标:</strong> ' + esc(task.target_kind) + '/' + esc(task.target_id) + '</div>' +
             '</div><div class="row mt-1">' +
-            '<div class="col"><strong>Status:</strong> ' + statusBadge(task.status) + '</div>' +
-            '<div class="col"><strong>Created:</strong> ' + esc(fmtTime(task.created_at)) + '</div>' +
-            '<div class="col"><strong>Started:</strong> ' + esc(fmtTime(task.started_at)) + '</div>' +
-            '<div class="col"><strong>Finished:</strong> ' + esc(fmtTime(task.finished_at)) + '</div>' +
+            '<div class="col"><strong>状态:</strong> ' + statusBadge(task.status) + '</div>' +
+            '<div class="col"><strong>创建:</strong> ' + esc(fmtTime(task.created_at)) + '</div>' +
+            '<div class="col"><strong>开始:</strong> ' + esc(fmtTime(task.started_at)) + '</div>' +
+            '<div class="col"><strong>完成:</strong> ' + esc(fmtTime(task.finished_at)) + '</div>' +
             '</div>' +
             (task.error ? '<div class="error-msg mt-1">' + esc(task.error) + '</div>' : '');
     }
@@ -783,7 +783,7 @@
         var el = document.getElementById('steps-container');
         if (!el) return;
         if (!steps || steps.length === 0) {
-            el.innerHTML = '<p class="muted">No steps yet.</p>';
+            el.innerHTML = '<p class="muted">暂无步骤。</p>';
             return;
         }
         el.innerHTML = steps.map(function (s) {
@@ -836,10 +836,10 @@
     // ====================================================================
 
     registerRoute('/audit', async function (content) {
-        content.innerHTML = '<h2 class="page-title">Audit Log</h2>' +
+        content.innerHTML = '<h2 class="page-title">审计日志</h2>' +
             '<table class="data-table" id="audit-table"><thead><tr>' +
-            '<th>ID</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th><th>Time</th>' +
-            '</tr></thead><tbody id="audit-tbody"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody></table>';
+            '<th>ID</th><th>操作者</th><th>动作</th><th>目标</th><th>结果</th><th>时间</th>' +
+            '</tr></thead><tbody id="audit-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table>';
 
         try {
             var r = await apiJSON('/audit-log');
@@ -847,7 +847,7 @@
             var logs = r.data || [];
             var tbody = document.getElementById('audit-tbody');
             if (logs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="muted">No audit entries.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无审计记录。</td></tr>';
                 return;
             }
             tbody.innerHTML = logs.map(function (a) {
