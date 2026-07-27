@@ -224,6 +224,10 @@
             '<div class="modal">' +
             '<h3 class="modal-title">' + (isEdit ? '编辑 Worker' : '新建 Worker') + '</h3>' +
             '<form id="worker-form">' +
+            (isEdit ? '' :
+            '<div class="form-field"><label>从集群节点选择(可选)</label>' +
+            '<select id="worker-node-select"><option value="">-- 手动填写或选择集群节点 --</option></select>' +
+            '<p class="muted" style="font-size:12px;">选中后自动填入名称/主机,只需再设 SSH 凭据(建后点"凭证")。</p></div>') +
             '<div class="form-field"><label>名称</label><input type="text" name="name" value="' + esc(worker ? worker.name : '') + '" required></div>' +
             '<div class="form-field"><label>主机</label><input type="text" name="host" value="' + esc(worker ? worker.host : '') + '" required></div>' +
             '<div class="form-field"><label>端口</label><input type="number" name="port" value="' + esc(worker ? worker.port : 22) + '"></div>' +
@@ -236,6 +240,30 @@
 
         var modal = document.getElementById('worker-modal');
         document.getElementById('worker-cancel').addEventListener('click', function () { modal.remove(); });
+
+        // New-worker mode: load cluster nodes into the dropdown; selecting one
+        // prefills name + host so the admin only needs SSH credentials.
+        if (!isEdit) {
+            var sel = document.getElementById('worker-node-select');
+            apiJSON('/k8s/nodes').then(function (r) {
+                if (!r.resp.ok || !Array.isArray(r.data)) return;
+                r.data.forEach(function (n) {
+                    var opt = document.createElement('option');
+                    opt.value = JSON.stringify(n);
+                    opt.textContent = n.name + (n.host ? ' (' + n.host + ')' : '') + ' [' + n.role + ']';
+                    sel.appendChild(opt);
+                });
+            }).catch(function () {});
+            sel.addEventListener('change', function () {
+                if (!sel.value) return;
+                try {
+                    var n = JSON.parse(sel.value);
+                    var f = document.getElementById('worker-form');
+                    if (n.name) f.name.value = n.name;
+                    if (n.host) f.host.value = n.host;
+                } catch (e) {}
+            });
+        }
         document.getElementById('worker-form').addEventListener('submit', async function (e) {
             e.preventDefault();
             var form = e.target;

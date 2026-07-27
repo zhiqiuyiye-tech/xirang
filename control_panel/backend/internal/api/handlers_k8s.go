@@ -150,6 +150,22 @@ func (h *k8sHandlers) deleteNetworkPolicy(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
+// listNodes: GET /api/v1/k8s/nodes
+// Returns discovered cluster nodes (name/internal IP/role). Used by the worker
+// form to prefill host/name so the admin only needs to supply SSH credentials.
+func (h *k8sHandlers) listNodes(c *gin.Context) {
+	if h.client == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
+		return
+	}
+	nodes, err := k8s.ListNodes(c, h.client)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, nodes)
+}
+
 // audit records an audit log entry. The actor is read from the JWT claims
 // (defaulting to "admin"). Mirrors the helper on workerHandlers so the k8s
 // endpoints record the same audit trail.
