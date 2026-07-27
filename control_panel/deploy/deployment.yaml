@@ -38,6 +38,15 @@ spec:
         runAsNonRoot: false
         seccompProfile:
           type: RuntimeDefault
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
       containers:
         - name: control-panel
           image: registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
