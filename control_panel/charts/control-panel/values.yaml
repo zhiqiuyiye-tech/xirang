@@ -24,7 +24,7 @@ service:
 persistence:
   enabled: true
   size: 1Gi
-  # storageClassName: ""   # unset = cluster default
+  storageClassName: "local-path"  # K3s default; set to "" for cluster default
 
 # Secrets auto-generated on install. To pin them (e.g. for upgrades preserving
 # encrypted data), set these - otherwise randAlphaNum generates fresh values.

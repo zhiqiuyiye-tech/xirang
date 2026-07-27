@@ -1,7 +1,7 @@
 # PersistentVolumeClaim for the control panel SQLite database.
 # The control panel stores its SQLite DB at DB_PATH (default /data/control_panel.db).
-# A default storage class is assumed; adjust storageClassName if your cluster
-# requires a specific provisioner.
+# storageClassName set to local-path (K3s default); adjust if your cluster uses
+# a different provisioner.
 #
 # Apply with: kubectl apply -f pvc.yaml
 
@@ -15,6 +15,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  storageClassName: local-path
   resources:
     requests:
       storage: 1Gi
