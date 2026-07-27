@@ -33,19 +33,15 @@ secrets:
   jwtSecret: ""      # leave empty to auto-generate (base64)
   adminPassword: ""  # leave empty to auto-generate (retrieve after install)
 
-# Scheduling: pin the pod to the master/control-plane node. The control panel
-# manages the cluster and SSHes to workers, so it should run on a master node.
-# Master nodes usually have a NoSchedule taint, so a toleration is included.
+# Scheduling: by default no constraints - the pod follows its PVC (local-path
+# binds the volume to whichever node first scheduled the pod, and the pod must
+# stay on that node). Pinning to a specific node (e.g. control-plane) conflicts
+# with a PVC already bound elsewhere and leaves the pod Pending. Set these only
+# if you use a ReadWriteMany / networked storageClass or accept re-creating the
+# PVC on the target node.
 scheduling:
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
-  tolerations:
-    - key: "node-role.kubernetes.io/control-plane"
-      operator: "Exists"
-      effect: "NoSchedule"
-    - key: "node-role.kubernetes.io/master"
-      operator: "Exists"
-      effect: "NoSchedule"
+  nodeSelector: {}
+  tolerations: []
 
 resources:
   requests:
