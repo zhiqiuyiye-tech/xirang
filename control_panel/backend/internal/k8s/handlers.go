@@ -84,6 +84,33 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return err
 	}
 	st.Done("succeeded", svc.Name, "", "")
+
+	// Auto-create a NetworkPolicy that allows ingress on the same ports as the
+	// Service. The NP uses the pod selector + ownerReferences so it is GC'd
+	// with the pod and stays in sync with the exposed ports - the admin only
+	// picks ports once, the firewall rule follows automatically.
+	ingressPorts := make([]IngressPortSpec, 0, len(ports))
+	for _, pp := range ports {
+		ingressPorts = append(ingressPorts, IngressPortSpec{
+			Protocol: string(pp.Protocol),
+			Port:     pp.Port,
+		})
+	}
+	st2, err := r.Step("create_network_policy")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_create_svc: create np step: %v", err))
+		return err
+	}
+	np, err := CreateNetworkPolicy(ctx, h.client, CreateNetworkPolicyReq{
+		Namespace: p.Namespace, PodName: p.PodName, PodUID: p.PodUID,
+		PodSelector: p.Selector, IngressPorts: ingressPorts,
+	})
+	if err != nil {
+		st2.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_create_svc: create network policy: %v", err))
+		return err
+	}
+	st2.Done("succeeded", np.Name, "", "")
 	r.Succeed()
 	return nil
 }

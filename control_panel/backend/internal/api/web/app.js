@@ -406,41 +406,100 @@
     }
 
     // ====================================================================
-    // K8S PAGE
-    // ====================================================================
-
+    // K8S PAGE (Pod-centric port mapping)
     registerRoute('/k8s', async function (content) {
-        content.innerHTML = '<h2 class="page-title">Kubernetes 资源</h2>' +
-            '<div class="row">' +
-            '<div class="col"><div class="card">' +
-            '<div class="section-title">Service 列表</div>' +
-            '<div class="form-field"><label>命名空间</label><input type="text" id="k8s-svc-ns" placeholder="default" value="default"></div>' +
-            '<button class="btn btn-primary btn-sm" id="btn-list-svc">查询</button> ' +
-            '<button class="btn btn-success btn-sm" id="btn-new-svc">+ 创建 Service</button>' +
+        content.innerHTML = '<h2 class="page-title">端口映射 (Pod -> Service)</h2>' +
+            '<p class="muted">选择 notebook Pod,输入要映射的端口,自动创建 Service + NetworkPolicy(放行同端口)。其他字段自动填充。</p>' +
+            '<div class="card">' +
+            '<div class="section-title">Notebook Pod 列表</div>' +
+            '<button class="btn btn-primary btn-sm" id="btn-load-pods">刷新 Pod 列表</button>' +
+            '<div id="pods-msg" class="info-msg"></div>' +
+            '<table class="data-table mt-2" id="pods-table"><thead><tr>' +
+            '<th>Pod 名称</th><th>命名空间</th><th>节点</th><th>状态</th><th>IP</th><th>操作</th>' +
+            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="6" class="muted">点击刷新加载。</td></tr></tbody></table>' +
+            '</div>' +
+            '<div class="card mt-2">' +
+            '<div class="section-title">已创建的端口映射 (Service)</div>' +
+            '<div class="form-field"><label>命名空间</label><input type="text" id="svc-list-ns" value="" placeholder="留空查全部"></div>' +
+            '<button class="btn btn-primary btn-sm" id="btn-list-svc">查询</button>' +
             '<div id="svc-msg" class="info-msg"></div>' +
             '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>ClusterIP</th><th>端口</th><th>操作</th></tr></thead>' +
             '<tbody id="svc-tbody"><tr><td colspan="6" class="muted">点击查询加载。</td></tr></tbody></table>' +
-            '</div></div>' +
-
-            '<div class="col"><div class="card">' +
-            '<div class="section-title">NetworkPolicy 列表</div>' +
-            '<div class="form-field"><label>命名空间</label><input type="text" id="k8s-np-ns" placeholder="default" value="default"></div>' +
-            '<button class="btn btn-primary btn-sm" id="btn-list-np">查询</button> ' +
-            '<button class="btn btn-success btn-sm" id="btn-new-np">+ 创建策略</button>' +
-            '<div id="np-msg" class="info-msg"></div>' +
-            '<table class="data-table mt-2" id="np-table"><thead><tr><th>名称</th><th>命名空间</th><th>Pod 选择器</th><th>操作</th></tr></thead>' +
-            '<tbody id="np-tbody"><tr><td colspan="4" class="muted">点击查询加载。</td></tr></tbody></table>' +
-            '</div></div>' +
             '</div>';
 
-        document.getElementById('btn-list-svc').addEventListener('click', function () { listK8sServices(content); });
-        document.getElementById('btn-new-svc').addEventListener('click', function () { showCreateServiceForm(content); });
-        document.getElementById('btn-list-np').addEventListener('click', function () { listK8sNetworkPolicies(content); });
-        document.getElementById('btn-new-np').addEventListener('click', function () { showCreateNetworkPolicyForm(content); });
+        document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
+        document.getElementById('btn-list-svc').addEventListener('click', function () { listSvcs(content); });
+        loadPods(content);
     });
 
-    async function listK8sServices(content) {
-        var ns = document.getElementById('k8s-svc-ns').value || 'default';
+    async function loadPods(content) {
+        var tbody = document.getElementById('pods-tbody');
+        var msgEl = document.getElementById('pods-msg');
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
+        try {
+            var r = await apiJSON('/k8s/pods');
+            if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
+            var pods = r.data || [];
+            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="6" class="muted">未找到 notebook Pod(name 含 notebook)。</td></tr>'; return; }
+            tbody.innerHTML = pods.map(function (p) {
+                return '<tr>' +
+                    '<td>' + esc(p.name) + '</td>' +
+                    '<td>' + esc(p.namespace) + '</td>' +
+                    '<td>' + esc(p.node) + '</td>' +
+                    '<td>' + statusBadge(p.status) + '</td>' +
+                    '<td>' + esc((p.ips || []).join(', ')) + '</td>' +
+                    '<td><button class="btn btn-sm btn-success" data-pod=\'' + esc(JSON.stringify(p)) + '\'>映射端口</button></td>' +
+                    '</tr>';
+            }).join('');
+            tbody.querySelectorAll('button[data-pod]').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var pod = JSON.parse(this.getAttribute('data-pod'));
+                    showPortMappingForm(content, pod);
+                });
+            });
+        } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+    }
+
+    async function showPortMappingForm(content, pod) {
+        var html = '<div class="modal-overlay" id="port-modal"><div class="modal">' +
+            '<h3 class="modal-title">映射端口 - ' + esc(pod.name) + '</h3>' +
+            '<p class="muted">Service 与 NetworkPolicy 自动绑定到该 Pod(随 Pod 生命周期自动删除)。只需输入要映射的端口。</p>' +
+            '<form id="port-form">' +
+            '<div class="form-field"><label>命名空间</label><input type="text" name="namespace" value="' + esc(pod.namespace) + '" readonly></div>' +
+            '<div class="form-field"><label>Pod 名称</label><input type="text" value="' + esc(pod.name) + '" readonly></div>' +
+            '<div class="form-field"><label>Service 类型</label><select name="type"><option value="NodePort">NodePort</option><option value="ClusterIP">ClusterIP</option></select></div>' +
+            '<div class="form-field"><label>要映射的端口 (逗号分隔,如 8080,22 或 8080:80)</label><input type="text" name="ports" placeholder="8080,22" required></div>' +
+            '<p class="muted" style="font-size:12px;">格式: 端口 或 端口:目标端口。NetworkPolicy 会自动放行这些端口。</p>' +
+            '<button type="submit" class="btn btn-primary">创建映射</button> <button type="button" class="btn btn-link" id="port-cancel" style="color:#555;">取消</button>' +
+            '<div id="port-form-msg" class="error-msg"></div></form></div></div>';
+        content.insertAdjacentHTML('beforeend', html);
+        var modal = document.getElementById('port-modal');
+        document.getElementById('port-cancel').addEventListener('click', function () { modal.remove(); });
+        document.getElementById('port-form').addEventListener('submit', async function (e) {
+            e.preventDefault();
+            var f = e.target;
+            var ports = (f.ports.value || '').split(',').filter(Boolean).map(function (p) {
+                var parts = p.split(':');
+                var port = parseInt(parts[0], 10);
+                return { port: port, target_port: parseInt(parts[1] || parts[0], 10), node_port: 0, protocol: 'TCP' };
+            });
+            var body = {
+                namespace: pod.namespace, pod_name: pod.name, pod_uid: pod.uid,
+                selector: pod.labels || {}, type: f.type.value, ports: ports
+            };
+            var msgEl = document.getElementById('port-form-msg');
+            try {
+                var r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                modal.remove();
+                var taskID = r.data && r.data.task_id;
+                if (taskID) window.location.hash = '#/tasks/' + taskID;
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+        });
+    }
+
+    async function listSvcs(content) {
+        var ns = document.getElementById('svc-list-ns').value || '';
         var tbody = document.getElementById('svc-tbody');
         var msgEl = document.getElementById('svc-msg');
         tbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
@@ -448,22 +507,15 @@
             var r = await apiJSON('/k8s/services?namespace=' + encodeURIComponent(ns));
             if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
             var svcs = r.data || [];
-            if (svcs.items) svcs = svcs.items; // handle k8s List format if returned
-            if (!Array.isArray(svcs) || svcs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="muted">未找到 Service。</td></tr>';
-                return;
-            }
+            if (svcs.items) svcs = svcs.items;
+            if (!Array.isArray(svcs) || svcs.length === 0) { tbody.innerHTML = '<tr><td colspan="6" class="muted">未找到 Service。</td></tr>'; return; }
             tbody.innerHTML = svcs.map(function (s) {
                 var name = s.metadata ? s.metadata.name : s.name || '?';
                 var namespace = s.metadata ? s.metadata.namespace : s.namespace || ns;
                 var type = s.spec ? s.spec.type : s.type || '-';
                 var clusterIP = s.spec ? s.spec.clusterIP : s.clusterIP || '-';
                 var ports = '-';
-                if (s.spec && s.spec.ports) {
-                    ports = s.spec.ports.map(function (p) { return p.port + '/' + (p.protocol || 'TCP'); }).join(', ');
-                } else if (s.ports) {
-                    ports = s.ports;
-                }
+                if (s.spec && s.spec.ports) { ports = s.spec.ports.map(function (p) { return p.port + '/' + (p.protocol || 'TCP'); }).join(', '); }
                 return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(type) + '</td><td>' + esc(clusterIP) + '</td><td>' + esc(ports) + '</td>' +
                     '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">删除</button></td></tr>';
             }).join('');
@@ -476,243 +528,109 @@
                         var r = await apiJSON('/k8s/services/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
                         if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
                         var taskID = r.data && r.data.task_id;
-                        if (taskID) window.location.hash = '#/tasks/' + taskID;
-                        else listK8sServices(content);
+                        if (taskID) window.location.hash = '#/tasks/' + taskID; else listSvcs(content);
                     } catch (err) { alert('错误: ' + err.message); }
                 });
             });
         } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
     }
-
-    async function showCreateServiceForm(content) {
-        var html = '<div class="modal-overlay" id="svc-modal"><div class="modal">' +
-            '<h3 class="modal-title">创建 Service</h3>' +
-            '<form id="svc-create-form">' +
-            '<div class="form-field"><label>命名空间</label><input type="text" name="namespace" value="default"></div>' +
-            '<div class="form-field"><label>Pod 名称</label><input type="text" name="pod_name" required></div>' +
-            '<div class="form-field"><label>Pod UID</label><input type="text" name="pod_uid" required></div>' +
-            '<div class="form-field"><label>选择器 (key=value,逗号分隔)</label><input type="text" name="selector" placeholder="app=web"></div>' +
-            '<div class="form-field"><label>类型</label><select name="type"><option value="ClusterIP">ClusterIP</option><option value="NodePort">NodePort</option></select></div>' +
-            '<div class="form-field"><label>端口 (port:target_port:protocol,逗号分隔)</label><input type="text" name="ports" placeholder="80:8080:TCP"></div>' +
-            '<button type="submit" class="btn btn-primary">创建</button> <button type="button" class="btn btn-link" id="svc-cancel" style="color:#555;">取消</button>' +
-            '<div id="svc-form-msg" class="error-msg"></div></form></div></div>';
-        content.insertAdjacentHTML('beforeend', html);
-        var modal = document.getElementById('svc-modal');
-        document.getElementById('svc-cancel').addEventListener('click', function () { modal.remove(); });
-
-        document.getElementById('svc-create-form').addEventListener('submit', async function (e) {
-            e.preventDefault();
-            var form = e.target;
-            var selector = {};
-            (form.selector.value || '').split(',').filter(Boolean).forEach(function (kv) {
-                var parts = kv.split('=');
-                if (parts.length === 2) selector[parts[0].trim()] = parts[1].trim();
-            });
-            var ports = [];
-            (form.ports.value || '').split(',').filter(Boolean).forEach(function (p) {
-                var parts = p.split(':');
-                ports.push({ port: parseInt(parts[0], 10), target_port: parseInt(parts[1] || parts[0], 10), protocol: parts[2] || 'TCP' });
-            });
-            var body = {
-                namespace: form.namespace.value || 'default',
-                pod_name: form.pod_name.value,
-                pod_uid: form.pod_uid.value,
-                selector: selector,
-                type: form.type.value,
-                ports: ports
-            };
-            var msgEl = document.getElementById('svc-form-msg');
-            try {
-                var r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
-                modal.remove();
-                var taskID = r.data && r.data.task_id;
-                if (taskID) window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
-        });
-    }
-
-    async function listK8sNetworkPolicies(content) {
-        var ns = document.getElementById('k8s-np-ns').value || 'default';
-        var tbody = document.getElementById('np-tbody');
-        var msgEl = document.getElementById('np-msg');
-        tbody.innerHTML = '<tr><td colspan="4" class="muted">加载中...</td></tr>';
-        try {
-            var r = await apiJSON('/k8s/network-policies?namespace=' + encodeURIComponent(ns));
-            if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
-            var nps = r.data || [];
-            if (nps.items) nps = nps.items;
-            if (!Array.isArray(nps) || nps.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="muted">未找到 NetworkPolicy。</td></tr>';
-                return;
-            }
-            tbody.innerHTML = nps.map(function (np) {
-                var name = np.metadata ? np.metadata.name : np.name || '?';
-                var namespace = np.metadata ? np.metadata.namespace : np.namespace || ns;
-                var sel = '-';
-                if (np.spec && np.spec.podSelector && np.spec.podSelector.matchLabels) {
-                    sel = Object.entries(np.spec.podSelector.matchLabels).map(function (kv) { return kv[0] + '=' + kv[1]; }).join(',');
-                }
-                return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(sel) + '</td>' +
-                    '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">删除</button></td></tr>';
-            }).join('');
-            tbody.querySelectorAll('button[data-name]').forEach(function (btn) {
-                btn.addEventListener('click', async function () {
-                    if (!confirm('确认删除 NetworkPolicy ' + this.getAttribute('data-name') + '?')) return;
-                    var name = this.getAttribute('data-name');
-                    var ns2 = this.getAttribute('data-ns');
-                    try {
-                        var r = await apiJSON('/k8s/network-policies/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
-                        if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
-                        var taskID = r.data && r.data.task_id;
-                        if (taskID) window.location.hash = '#/tasks/' + taskID;
-                        else listK8sNetworkPolicies(content);
-                    } catch (err) { alert('错误: ' + err.message); }
-                });
-            });
-        } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
-    }
-
-    async function showCreateNetworkPolicyForm(content) {
-        var html = '<div class="modal-overlay" id="np-modal"><div class="modal">' +
-            '<h3 class="modal-title">创建 NetworkPolicy</h3>' +
-            '<form id="np-create-form">' +
-            '<div class="form-field"><label>命名空间</label><input type="text" name="namespace" value="default"></div>' +
-            '<div class="form-field"><label>Pod 名称</label><input type="text" name="pod_name" required></div>' +
-            '<div class="form-field"><label>Pod UID</label><input type="text" name="pod_uid" required></div>' +
-            '<div class="form-field"><label>Pod 选择器 (key=value,逗号分隔)</label><input type="text" name="pod_selector" placeholder="app=web"></div>' +
-            '<div class="form-field"><label>入站端口 (protocol:port,逗号分隔)</label><input type="text" name="ingress_ports" placeholder="TCP:80,TCP:443"></div>' +
-            '<button type="submit" class="btn btn-primary">创建</button> <button type="button" class="btn btn-link" id="np-cancel" style="color:#555;">取消</button>' +
-            '<div id="np-form-msg" class="error-msg"></div></form></div></div>';
-        content.insertAdjacentHTML('beforeend', html);
-        var modal = document.getElementById('np-modal');
-        document.getElementById('np-cancel').addEventListener('click', function () { modal.remove(); });
-
-        document.getElementById('np-create-form').addEventListener('submit', async function (e) {
-            e.preventDefault();
-            var form = e.target;
-            var sel = {};
-            (form.pod_selector.value || '').split(',').filter(Boolean).forEach(function (kv) {
-                var parts = kv.split('=');
-                if (parts.length === 2) sel[parts[0].trim()] = parts[1].trim();
-            });
-            var ports = [];
-            (form.ingress_ports.value || '').split(',').filter(Boolean).forEach(function (p) {
-                var parts = p.split(':');
-                ports.push({ protocol: parts[0] || 'TCP', port: parseInt(parts[1], 10) });
-            });
-            var body = {
-                namespace: form.namespace.value || 'default',
-                pod_name: form.pod_name.value,
-                pod_uid: form.pod_uid.value,
-                pod_selector: sel,
-                ingress_ports: ports
-            };
-            var msgEl = document.getElementById('np-form-msg');
-            try {
-                var r = await apiJSON('/k8s/network-policies', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
-                modal.remove();
-                var taskID = r.data && r.data.task_id;
-                if (taskID) window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
-        });
-    }
-
-    // ====================================================================
-    // STORAGE PAGE
-    // ====================================================================
 
     registerRoute('/storage', async function (content) {
-        content.innerHTML = '<h2 class="page-title">存储编排</h2>' +
-            '<div class="row">' +
-            '<div class="col"><div class="card">' +
-            '<div class="section-title">创建 NFS 存储</div>' +
-            '<form id="provision-form">' +
-            '<div class="form-field"><label>Worker ID</label><input type="number" name="worker_id" required></div>' +
-            '<div class="form-field"><label>Volume Group 名称</label><input type="text" name="vg_name" placeholder="vg0" required></div>' +
-            '<div class="form-field"><label>逻辑卷名称</label><input type="text" name="lv_name" required></div>' +
-            '<div class="form-field"><label>大小 (GB)</label><input type="number" name="size_gb" required></div>' +
-            '<div class="form-field"><label>文件系统类型</label><input type="text" name="fs_type" value="ext4"></div>' +
-            '<div class="form-field"><label>挂载点</label><input type="text" name="mount_point" placeholder="/mnt/nfs/export1" required></div>' +
-            '<div class="form-field"><label>导出选项(可选)</label><input type="text" name="export_opts" placeholder="*(rw,sync,no_root_squash)"></div>' +
-            '<button type="submit" class="btn btn-primary">创建</button>' +
-            '<div id="provision-msg" class="error-msg"></div>' +
-            '<p class="muted mt-1">异步: 提交任务,成功后跳转到任务页查看进度。</p>' +
-            '</form></div>' +
-
-            '<div class="col"><div class="card">' +
-            '<div class="section-title">回收 NFS 存储</div>' +
-            '<form id="reclaim-form">' +
-            '<div class="form-field"><label>Worker ID</label><input type="number" name="worker_id" required></div>' +
-            '<div class="form-field"><label>Volume Group 名称</label><input type="text" name="vg_name" required></div>' +
-            '<div class="form-field"><label>逻辑卷名称</label><input type="text" name="lv_name" required></div>' +
-            '<div class="form-field"><label>挂载点</label><input type="text" name="mount_point" required></div>' +
-            '<button type="submit" class="btn btn-danger">回收</button>' +
-            '<div id="reclaim-msg" class="error-msg"></div>' +
-            '<p class="muted mt-1">异步: 提交任务,成功后跳转到任务页查看进度。</p>' +
-            '</form></div>' +
+        content.innerHTML = '<h2 class="page-title">NFS 存储编排</h2>' +
+            '<div class="card">' +
+            '<div class="section-title">创建 NFS 共享</div>' +
+            '<div class="form-field"><label>Worker 节点</label><select id="nfs-worker-select"><option value="">-- 选择 Worker --</option></select></div>' +
+            '<div class="form-field"><label>Volume Group</label><select id="nfs-vg-select" disabled><option value="">-- 先选 Worker --</option></select> <span id="nfs-vg-info" class="muted"></span></div>' +
+            '<div class="form-field"><label>大小 (GB)</label><input type="number" id="nfs-size" placeholder="如 200"></div>' +
+            '<button class="btn btn-primary" id="btn-nfs-create">创建 NFS</button>' +
+            '<div id="nfs-create-msg" class="error-msg"></div>' +
+            '<p class="muted mt-1" style="font-size:12px;">逻辑卷名/挂载点/导出选项自动生成。异步任务,成功后跳转任务页。</p>' +
             '</div>' +
-            '<div class="card mt-2"><div class="section-title">最近存储任务</div>' +
-            '<table class="data-table" id="storage-table"><thead><tr><th>ID</th><th>类型</th><th>Worker</th><th>状态</th><th>创建时间</th><th>完成时间</th></tr></thead>' +
-            '<tbody id="storage-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table></div>';
+            '<div class="card mt-2">' +
+            '<div class="section-title">NFS 共享列表 (最近任务)</div>' +
+            '<table class="data-table" id="storage-table"><thead><tr><th>ID</th><th>类型</th><th>Worker</th><th>状态</th><th>创建时间</th><th>完成时间</th><th>操作</th></tr></thead>' +
+            '<tbody id="storage-tbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody></table></div>';
 
-        document.getElementById('provision-form').addEventListener('submit', async function (e) {
-            e.preventDefault();
-            var f = e.target;
-            var body = {
-                worker_id: parseInt(f.worker_id.value, 10),
-                vg_name: f.vg_name.value,
-                lv_name: f.lv_name.value,
-                size_gb: parseInt(f.size_gb.value, 10),
-                fs_type: f.fs_type.value || 'ext4',
-                mount_point: f.mount_point.value
-            };
-            if (f.export_opts.value) body.export_opts = f.export_opts.value;
-            var msgEl = document.getElementById('provision-msg');
-            try {
-                var r = await apiJSON('/storage/provision', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
-                var taskID = r.data && r.data.task_id;
-                window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
-        });
-
-        document.getElementById('reclaim-form').addEventListener('submit', async function (e) {
-            e.preventDefault();
-            var f = e.target;
-            var body = {
-                worker_id: parseInt(f.worker_id.value, 10),
-                vg_name: f.vg_name.value,
-                lv_name: f.lv_name.value,
-                mount_point: f.mount_point.value
-            };
-            var msgEl = document.getElementById('reclaim-msg');
-            try {
-                var r = await apiJSON('/storage/reclaim', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
-                var taskID = r.data && r.data.task_id;
-                window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
-        });
-
-        // Load storage tasks
+        // Load workers into the dropdown.
+        var wsel = document.getElementById('nfs-worker-select');
+        var vsel = document.getElementById('nfs-vg-select');
+        var vinfo = document.getElementById('nfs-vg-info');
         try {
-            var r = await apiJSON('/storage');
-            var tbody = document.getElementById('storage-tbody');
-            if (!r.resp.ok) { tbody.innerHTML = '<tr><td colspan="6" class="muted">加载失败。</td></tr>'; return; }
-            var tasks = r.data || [];
-            if (tasks.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无存储任务。</td></tr>';
-                return;
+            var r = await apiJSON('/workers');
+            if (r.resp.ok && Array.isArray(r.data)) {
+                r.data.forEach(function (w) { var o = document.createElement('option'); o.value = w.id; o.textContent = w.name + ' (' + w.host + ')'; wsel.appendChild(o); });
             }
-            tbody.innerHTML = tasks.map(function (t) {
-                return '<tr style="cursor:pointer" data-href="#/tasks/' + t.id + '"><td>' + esc(t.id) + '</td><td>' + esc(t.type) + '</td><td>' + esc(t.target_id) + '</td><td>' + statusBadge(t.status) + '</td><td>' + esc(fmtTime(t.created_at)) + '</td><td>' + esc(fmtTime(t.finished_at)) + '</td></tr>';
+        } catch (e) {}
+
+        wsel.addEventListener('change', async function () {
+            var wid = wsel.value;
+            if (!wid) { vsel.innerHTML = '<option value="">-- 先选 Worker --</option>'; vsel.disabled = true; vinfo.textContent = ''; return; }
+            vsel.innerHTML = '<option value="">加载中...</option>';
+            vsel.disabled = true;
+            vinfo.textContent = '';
+            try {
+                var r = await apiJSON('/storage/vgs?worker_id=' + encodeURIComponent(wid));
+                if (!r.resp.ok) { vsel.innerHTML = '<option value="">-- 加载失败 --</option>'; setMsg(document.getElementById('nfs-create-msg'), '错误: ' + (r.data && r.data.error), 'error'); return; }
+                var vgs = r.data || [];
+                if (vgs.length === 0) { vsel.innerHTML = '<option value="">-- 该节点无 VG --</option>'; return; }
+                vsel.innerHTML = '';
+                vgs.forEach(function (v) {
+                    var o = document.createElement('option');
+                    o.value = v.name;
+                    o.textContent = v.name + ' (剩余 ' + (v.free_gb || 0).toFixed(1) + 'G / 共 ' + v.vsize + ')';
+                    vsel.appendChild(o);
+                });
+                vsel.disabled = false;
+                var sel = vgs[0];
+                vinfo.textContent = '可用 ' + (sel.free_gb || 0).toFixed(1) + ' GB';
+                vsel.addEventListener('change', function () {
+                    var cur = vgs.find(function (x) { return x.name === vsel.value; });
+                    vinfo.textContent = cur ? '可用 ' + (cur.free_gb || 0).toFixed(1) + ' GB' : '';
+                });
+            } catch (err) { vsel.innerHTML = '<option value="">-- 加载失败 --</option>'; }
+        });
+
+        document.getElementById('btn-nfs-create').addEventListener('click', async function () {
+            var wid = parseInt(wsel.value, 10);
+            var vg = vsel.value;
+            var size = parseInt(document.getElementById('nfs-size').value, 10);
+            var msgEl = document.getElementById('nfs-create-msg');
+            if (!wid || !vg || !size) { setMsg(msgEl, '请选择 Worker、VG 并输入大小', 'error'); return; }
+            // Auto-generate lv name + mount point.
+            var lv = 'lv_nb_' + Date.now().toString(36);
+            var mp = '/data02/nfs_' + lv;
+            try {
+                var r = await apiJSON('/storage/provision', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: vg, lv_name: lv, size_gb: size, fs_type: 'ext4', mount_point: mp }) });
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+        });
+
+        // Load NFS tasks with a delete (reclaim) action.
+        try {
+            var r2 = await apiJSON('/storage');
+            var tbody = document.getElementById('storage-tbody');
+            if (!r2.resp.ok) { tbody.innerHTML = '<tr><td colspan="7" class="muted">加载失败</td></tr>'; return; }
+            var tasks = r2.data || [];
+            // Filter to provision tasks (succeeded) to show as "shares" with delete.
+            var shares = tasks.filter(function (t) { return t.type === 'storage_provision_nfs' && t.status === 'succeeded'; });
+            if (shares.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无已创建的 NFS 共享。</td></tr>'; return; }
+            tbody.innerHTML = shares.map(function (t) {
+                return '<tr><td>' + esc(t.id) + '</td><td>' + esc(t.type) + '</td><td>' + esc(t.target_id) + '</td><td>' + statusBadge(t.status) + '</td><td>' + esc(fmtTime(t.created_at)) + '</td><td>' + esc(fmtTime(t.finished_at)) + '</td>' +
+                    '<td><button class="btn btn-sm btn-danger" data-task=\'' + esc(JSON.stringify(t)) + '\'>删除</button></td></tr>';
             }).join('');
-            tbody.querySelectorAll('tr[data-href]').forEach(function (tr) {
-                tr.addEventListener('click', function () { window.location.hash = this.getAttribute('data-href'); });
+            tbody.querySelectorAll('button[data-task]').forEach(function (btn) {
+                btn.addEventListener('click', async function () {
+                    var t = JSON.parse(this.getAttribute('data-task'));
+                    if (!confirm('确认回收该 NFS 共享 (任务 #' + t.id + ')?空间将归还 VG。')) return;
+                    try {
+                        var rr = await apiJSON('/storage/reclaim', { method: 'POST', body: JSON.stringify({ task_id: t.id }) });
+                        if (!rr.resp.ok) { alert('错误: ' + (rr.data && rr.data.error)); return; }
+                        window.location.hash = '#/tasks/' + (rr.data && rr.data.task_id);
+                    } catch (err) { alert('错误: ' + err.message); }
+                });
             });
-        } catch (err) { /* ignore */ }
+        } catch (err) {}
     });
 
     // ====================================================================

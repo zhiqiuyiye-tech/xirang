@@ -72,7 +72,7 @@ func main() {
 	storage.RegisterStorageHandlers(eng, sshm, store)
 
 	gin.SetMode(gin.ReleaseMode)
-	r := api.NewRouter(tk, ws, store, eng, k8sClient)
+	r := api.NewRouter(tk, ws, store, eng, k8sClient, sshm)
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: r}
 	go func() {

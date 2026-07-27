@@ -7,6 +7,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/ssh"
+	"xirang/control_panel/internal/storage"
 	"xirang/control_panel/internal/tasks"
 )
 
@@ -17,8 +19,9 @@ import (
 // handler (see storage.RegisterStorageHandlers, called from main.go). List is
 // synchronous and returns recent tasks whose target_kind is 'storage'.
 type storageHandlers struct {
-	eng   *tasks.Engine
-	store *db.Store
+	eng    *tasks.Engine
+	store  *db.Store
+	runner ssh.Runner
 }
 
 // provision: POST /api/v1/storage/provision
@@ -75,6 +78,28 @@ func (h *storageHandlers) list(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// listVgs: GET /api/v1/storage/vgs?worker_id=X
+// Synchronous: SSHes to the worker and returns its volume groups with free
+// space, so the UI can show available capacity before creating an NFS share.
+func (h *storageHandlers) listVgs(c *gin.Context) {
+	wid, err := strconv.ParseInt(c.Query("worker_id"), 10, 64)
+	if err != nil || wid <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "worker_id required"})
+		return
+	}
+	w, err := h.store.GetWorker(c, wid)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "worker not found"})
+		return
+	}
+	vgs, err := storage.ListVGs(c, h.runner, *w)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, vgs)
 }
 
 // parseWorkerID extracts the worker_id from a JSON-decoded map value (which

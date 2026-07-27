@@ -56,8 +56,19 @@ func TestCreateSvcHandlerCreatesService(t *testing.T) {
 		t.Fatalf("ownerRef wrong: %+v", svc.OwnerReferences)
 	}
 	steps, _ := store.ListSteps(context.Background(), id)
-	if len(steps) != 1 || steps[0].Status != "succeeded" {
+	if len(steps) != 2 || steps[0].Status != "succeeded" || steps[1].Status != "succeeded" {
 		t.Fatalf("steps wrong: %+v", steps)
+	}
+	if steps[0].Name != "create_service" || steps[1].Name != "create_network_policy" {
+		t.Fatalf("step names wrong: %+v", steps)
+	}
+	// The auto-created NetworkPolicy must exist and allow the same port.
+	nps, _ := ListNetworkPolicies(context.Background(), cs, "ns1")
+	if len(nps) != 1 {
+		t.Fatalf("expected 1 network policy auto-created, got %d", len(nps))
+	}
+	if len(nps[0].Spec.Ingress) != 1 || len(nps[0].Spec.Ingress[0].Ports) != 1 {
+		t.Fatalf("np ingress ports wrong: %+v", nps[0].Spec.Ingress)
 	}
 }
 

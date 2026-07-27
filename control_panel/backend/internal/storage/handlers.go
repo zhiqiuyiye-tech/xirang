@@ -101,6 +101,7 @@ type reclaimHandler struct {
 
 func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
 	var p struct {
+		TaskID     int64  `json:"task_id"` // provision task to reclaim (reads its params)
 		WorkerID   int64  `json:"worker_id"`
 		VGName     string `json:"vg_name"`
 		LVName     string `json:"lv_name"`
@@ -109,6 +110,27 @@ func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Report
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
 		r.Fail(fmt.Sprintf("parse params: %v", err))
 		return err
+	}
+	// If task_id given, read the original provision task's params (which hold
+	// the vg/lv/mount_point/worker_id) so the UI can delete by task_id without
+	// re-entering them.
+	if p.TaskID != 0 {
+		prov, err := h.store.GetTask(ctx, p.TaskID)
+		if err != nil {
+			r.Fail(fmt.Sprintf("load provision task %d: %v", p.TaskID, err))
+			return err
+		}
+		var pp struct {
+			WorkerID   int64  `json:"worker_id"`
+			VGName     string `json:"vg_name"`
+			LVName     string `json:"lv_name"`
+			MountPoint string `json:"mount_point"`
+		}
+		if err := json.Unmarshal([]byte(prov.ParamsJSON), &pp); err != nil {
+			r.Fail(fmt.Sprintf("parse provision params: %v", err))
+			return err
+		}
+		p.WorkerID, p.VGName, p.LVName, p.MountPoint = pp.WorkerID, pp.VGName, pp.LVName, pp.MountPoint
 	}
 	w, err := h.store.GetWorker(ctx, p.WorkerID)
 	if err != nil {

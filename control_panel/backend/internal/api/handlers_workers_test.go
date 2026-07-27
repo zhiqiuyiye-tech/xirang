@@ -40,7 +40,7 @@ func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.To
 	cs := fake.NewSimpleClientset()
 	k8s.RegisterK8sHandlers(eng, cs)
 	storage.RegisterStorageHandlers(eng, sshm, s)
-	return NewRouter(tk, ws, s, eng, cs), ws, s, tk
+	return NewRouter(tk, ws, s, eng, cs, sshm), ws, s, tk
 }
 
 func authHeader(t *testing.T, tk *auth.Tokens) string {

@@ -166,6 +166,23 @@ func (h *k8sHandlers) listNodes(c *gin.Context) {
 	c.JSON(http.StatusOK, nodes)
 }
 
+// listPods: GET /api/v1/k8s/pods
+// Returns notebook pods (name contains "notebook") across all namespaces,
+// with namespace/name/uid/node/labels. The UI uses these to drive SVC creation:
+// selecting a pod auto-fills selector + ownerReference.
+func (h *k8sHandlers) listPods(c *gin.Context) {
+	if h.client == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
+		return
+	}
+	pods, err := k8s.ListNotebookPods(c, h.client)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, pods)
+}
+
 // audit records an audit log entry. The actor is read from the JWT claims
 // (defaulting to "admin"). Mirrors the helper on workerHandlers so the k8s
 // endpoints record the same audit trail.

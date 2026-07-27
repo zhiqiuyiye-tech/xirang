@@ -5,6 +5,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/ssh"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 )
@@ -13,7 +14,7 @@ import (
 // (non-cluster / local dev) - in that case the k8s endpoints return 503
 // Service Unavailable instead of panicking. The k8s task handlers are
 // registered separately by k8s.RegisterK8sHandlers (called from main.go).
-func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks.Engine, k8sClient kubernetes.Interface) *gin.Engine {
+func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks.Engine, k8sClient kubernetes.Interface, sshRunner ssh.Runner) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
@@ -61,15 +62,17 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.GET("/k8s/network-policies", kh.listNetworkPolicies)
 		authed.DELETE("/k8s/network-policies/:name", kh.deleteNetworkPolicy)
 		authed.GET("/k8s/nodes", kh.listNodes)
+		authed.GET("/k8s/pods", kh.listPods)
 
 		// Storage endpoints: provision and reclaim are async (submit a task
 		// and respond 202 + task_id); list is synchronous. The task handlers
 		// are registered separately by storage.RegisterStorageHandlers
 		// (called from main.go).
-		sh := &storageHandlers{eng: eng, store: store}
+		sh := &storageHandlers{eng: eng, store: store, runner: sshRunner}
 		authed.POST("/storage/provision", sh.provision)
 		authed.POST("/storage/reclaim", sh.reclaim)
 		authed.GET("/storage", sh.list)
+		authed.GET("/storage/vgs", sh.listVgs)
 	}
 
 	// Static frontend: embedded SPA served at GET / and GET /static/*.
