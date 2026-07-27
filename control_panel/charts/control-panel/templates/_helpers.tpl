@@ -17,36 +17,27 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
-AES_KEY: 32 random bytes, base64-encoded (decodes to exactly 32 bytes for
-AES-256). Pinned if .Values.secrets.aesKey set.
+secretValue returns the value for a Secret key, preserving stability across
+upgrades. Priority:
+  1. .Values.secrets.<key> if pinned (caller passes it non-empty)
+  2. the existing deployed Secret's value (lookup) - so upgrades reuse the
+     value generated on first install instead of regenerating it
+  3. a freshly generated random value (first install)
+Regenerating on upgrade would break admin login (seedAdmin only runs once) and
+rotate AES_KEY/JWT (invalidating encrypted worker creds + sessions). lookup
+returns empty during `helm template` and on first install.
+Usage: include "control-panel.secretValue" (dict "Values" .Values "key" "AES_KEY" "pinned" .Values.secrets.aesKey "gen" (randBytes 32 | b64enc))
 */}}
-{{- define "control-panel.aesKey" -}}
-{{- if .Values.secrets.aesKey -}}
-{{- .Values.secrets.aesKey -}}
+{{- define "control-panel.secretValue" -}}
+{{- $v := . -}}
+{{- if $v.pinned -}}
+{{- $v.pinned -}}
 {{- else -}}
-{{- randBytes 32 | b64enc -}}
-{{- end -}}
-{{- end -}}
-
-{{/*
-JWT_SECRET: 32 random bytes, base64-encoded. Pinned if .Values.secrets.jwtSecret set.
-*/}}
-{{- define "control-panel.jwtSecret" -}}
-{{- if .Values.secrets.jwtSecret -}}
-{{- .Values.secrets.jwtSecret -}}
+{{- $existing := lookup "v1" "Secret" $v.Values.namespace "control-panel-secrets" -}}
+{{- if $existing -}}
+{{- index $existing.data $v.key -}}
 {{- else -}}
-{{- randBytes 32 | b64enc -}}
+{{- $v.gen -}}
 {{- end -}}
-{{- end -}}
-
-{{/*
-ADMIN_INIT_PASSWORD: plaintext, base64-encoded for the Secret data field.
-Pinned if .Values.secrets.adminPassword set, else auto-generated.
-*/}}
-{{- define "control-panel.adminPassword" -}}
-{{- if .Values.secrets.adminPassword -}}
-{{- .Values.secrets.adminPassword | b64enc -}}
-{{- else -}}
-{{- randAlphaNum 16 | b64enc -}}
 {{- end -}}
 {{- end -}}
