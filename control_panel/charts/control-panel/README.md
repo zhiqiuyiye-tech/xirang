@@ -17,9 +17,38 @@ secrets (AES_KEY, JWT_SECRET, ADMIN_INIT_PASSWORD) are auto-generated on install
 2. **Cluster has a default StorageClass** (for the 1Gi PVC), or set
    `persistence.storageClassName`.
 
-3. **Helm 3** installed on the master, and `kubectl` configured.
+3. **Helm >= 3.8** installed on the master (OCI support), and `kubectl` configured.
 
-## Install (one command)
+## Publish the Chart to the OCI Registry (once, from a machine with the source)
+
+To install from any machine (not just the one with the source), publish the
+chart as an OCI artifact to the same registry as the image:
+
+```bash
+# From repo root. Packages the chart and pushes it as an OCI artifact.
+./control_panel/deploy/push-chart.sh
+```
+
+Or manually:
+
+```bash
+helm package ./control_panel/charts/control-panel --destination /tmp
+helm registry login registry-xirang.jxslpt.cn:30443
+helm push /tmp/control-panel-0.1.0.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+```
+
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:0.1.0`.
+
+## Install
+
+### From the OCI registry (any machine)
+
+```bash
+helm install control-panel oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel \
+  --version 0.1.0 --create-namespace -n control-panel
+```
+
+### From a local chart checkout
 
 ```bash
 helm install control-panel ./control_panel/charts/control-panel \
