@@ -26,14 +26,14 @@ upgrades. Priority:
 Regenerating on upgrade would break admin login (seedAdmin only runs once) and
 rotate AES_KEY/JWT (invalidating encrypted worker creds + sessions). lookup
 returns empty during `helm template` and on first install.
-Usage: include "control-panel.secretValue" (dict "Values" .Values "key" "AES_KEY" "pinned" .Values.secrets.aesKey "gen" (randBytes 32 | b64enc))
+Usage: include "control-panel.secretValue" (dict "Release" .Release "key" "AES_KEY" "pinned" .Values.secrets.aesKey "gen" (randBytes 32 | b64enc))
 */}}
 {{- define "control-panel.secretValue" -}}
 {{- $v := . -}}
 {{- if $v.pinned -}}
 {{- $v.pinned -}}
 {{- else -}}
-{{- $existing := lookup "v1" "Secret" $v.Values.namespace "control-panel-secrets" -}}
+{{- $existing := lookup "v1" "Secret" $v.Release.Namespace "control-panel-secrets" -}}
 {{- if $existing -}}
 {{- index $existing.data $v.key -}}
 {{- else -}}

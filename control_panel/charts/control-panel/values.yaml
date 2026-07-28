@@ -12,6 +12,8 @@ image:
   # imagePullSecrets:
   #   - name: my-registry-secret
 
+# Namespace is set by `helm install -n <ns> --create-namespace`, not here.
+# This value is kept only for reference; templates use .Release.Namespace.
 namespace: control-panel
 
 # Service exposure. NodePort is the default for internal admin access.

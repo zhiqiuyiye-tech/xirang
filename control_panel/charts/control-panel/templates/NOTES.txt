@@ -1,12 +1,12 @@
-Control panel is deploying to namespace '{{ .Values.namespace }}'.
+Control panel is deploying to namespace '{{ .Release.Namespace }}'.
 
 1. Wait for the pod to become Ready:
 
-   kubectl -n {{ .Values.namespace }} rollout status deployment/control-panel
+   kubectl -n {{ .Release.Namespace }} rollout status deployment/control-panel
 
 2. Retrieve the auto-generated initial admin password (username: admin):
 
-   kubectl -n {{ .Values.namespace }} get secret control-panel-secrets \
+   kubectl -n {{ .Release.Namespace }} get secret control-panel-secrets \
      -o jsonpath='{.data.ADMIN_INIT_PASSWORD}' | base64 -d ; echo
 
 {{- if eq .Values.service.type "NodePort" }}
@@ -17,7 +17,7 @@ Control panel is deploying to namespace '{{ .Values.namespace }}'.
 {{- else }}
 3. Access the web UI via the Service ClusterIP:
 
-   kubectl -n {{ .Values.namespace }} port-forward svc/control-panel 8080:{{ .Values.service.port }}
+   kubectl -n {{ .Release.Namespace }} port-forward svc/control-panel 8080:{{ .Values.service.port }}
    then open http://localhost:8080/
 
 {{- end }}
