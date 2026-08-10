@@ -102,6 +102,86 @@ func (h *storageHandlers) listVgs(c *gin.Context) {
 	c.JSON(http.StatusOK, vgs)
 }
 
+// listInventory: GET /api/v1/storage/inventory?worker_id=X
+// Synchronous: SSHes to the worker once and returns its VGs, LVs (with mount
+// point + filesystem), and unused disks - everything the storage UI needs to
+// render the VG/LV management blocks and the create-VG-pool action in one call.
+func (h *storageHandlers) listInventory(c *gin.Context) {
+	wid, err := strconv.ParseInt(c.Query("worker_id"), 10, 64)
+	if err != nil || wid <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "worker_id required"})
+		return
+	}
+	w, err := h.store.GetWorker(c, wid)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "worker not found"})
+		return
+	}
+	inv, err := storage.ListInventory(c, h.runner, *w)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, inv)
+}
+
+// createVG: POST /api/v1/storage/vg
+// Body: {worker_id, vg_name?, disks[]}. Submits storage_create_vg (pvcreate each
+// disk + vgcreate/vgextend). Responds 202 + {task_id}.
+func (h *storageHandlers) createVG(c *gin.Context) {
+	var req map[string]any
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	wid, _ := parseWorkerID(req["worker_id"])
+	taskID, err := h.eng.Submit(c, "storage_create_vg", "storage", wid, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "storage.create_vg", strconv.FormatInt(wid, 10), "submitted")
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
+// resizeLV: POST /api/v1/storage/lv/resize
+// Body: {worker_id, vg_name, lv_name, action: grow|shrink, delta_gb}. Submits
+// storage_resize_lv (lvextend/lvreduce -r). Responds 202 + {task_id}.
+func (h *storageHandlers) resizeLV(c *gin.Context) {
+	var req map[string]any
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	wid, _ := parseWorkerID(req["worker_id"])
+	taskID, err := h.eng.Submit(c, "storage_resize_lv", "storage", wid, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "storage.resize_lv", strconv.FormatInt(wid, 10), "submitted")
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
+// deleteLV: POST /api/v1/storage/lv/delete
+// Body: {worker_id, vg_name, lv_name}. Submits storage_delete_lv (teardown +
+// lvremove, releasing space to the VG). Responds 202 + {task_id}.
+func (h *storageHandlers) deleteLV(c *gin.Context) {
+	var req map[string]any
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	wid, _ := parseWorkerID(req["worker_id"])
+	taskID, err := h.eng.Submit(c, "storage_delete_lv", "storage", wid, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "storage.delete_lv", strconv.FormatInt(wid, 10), "submitted")
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
 // parseWorkerID extracts the worker_id from a JSON-decoded map value (which
 // arrives as float64 from encoding/json). Returns 0 if missing or unparseable;
 // the task handler will surface a clear error for an invalid worker_id.

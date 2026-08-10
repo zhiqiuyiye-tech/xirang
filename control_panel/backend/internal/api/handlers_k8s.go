@@ -52,16 +52,17 @@ func (h *k8sHandlers) createService(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
-// listServices: GET /api/v1/k8s/services?namespace=
-// Synchronous: returns the JSON array of Services managed by the control panel
-// in the given namespace.
+// listServices: GET /api/v1/k8s/services
+// Synchronous: returns ServiceInfo for every Service in namespaces that contain
+// notebook pods - including Services NOT created by the control panel (e.g. the
+// platform's notebook-multi-port-svc). Each entry carries a Managed flag so the
+// UI can mark ours (deletable) vs external (read-only).
 func (h *k8sHandlers) listServices(c *gin.Context) {
 	if h.client == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
 		return
 	}
-	ns := c.Query("namespace")
-	svcs, err := k8s.ListServices(c, h.client, ns)
+	svcs, err := k8s.ListServicesForNotebooks(c, h.client)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

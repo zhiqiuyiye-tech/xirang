@@ -430,10 +430,11 @@
             '</tr></thead><tbody id="pods-tbody"><tr><td colspan="6" class="muted">点击刷新加载。</td></tr></tbody></table>' +
             '</div>' +
             '<div class="card mt-2">' +
-            '<div class="section-title">已创建的端口映射 (Service)</div>' +
+            '<div class="section-title">端口映射列表 (Service)</div>' +
+            '<p class="muted" style="font-size:12px;">列出所有 notebook 命名空间下的 Service,含非本面板创建的已有映射。<span class="badge badge-success">本面板</span> 可删除,<span class="badge badge-muted">外部</span> 只读。</p>' +
             '<div id="svc-msg" class="info-msg"></div>' +
-            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>外部端口(NodePort)</th><th>内部端口(Port->Target)</th><th>操作</th></tr></thead>' +
-            '<tbody id="svc-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table>' +
+            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>外部端口(NodePort)</th><th>内部端口(Port->Target)</th><th>来源</th><th>操作</th></tr></thead>' +
+            '<tbody id="svc-tbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody></table>' +
             '</div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
@@ -510,28 +511,24 @@
     async function listSvcs(content) {
         var tbody = document.getElementById('svc-tbody');
         var msgEl = document.getElementById('svc-msg');
-        tbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="muted">加载中...</td></tr>';
         try {
-            var r = await apiJSON('/k8s/services?namespace=');
+            var r = await apiJSON('/k8s/services');
             if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
             var svcs = r.data || [];
-            if (svcs.items) svcs = svcs.items;
-            if (!Array.isArray(svcs) || svcs.length === 0) { tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无端口映射。</td></tr>'; return; }
+            if (!Array.isArray(svcs) || svcs.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无端口映射。</td></tr>'; return; }
+            // Managed (ours) first, then external - ours are the actionable ones.
+            svcs.sort(function (a, b) { return (a.managed === b.managed) ? 0 : (a.managed ? -1 : 1); });
             tbody.innerHTML = svcs.map(function (s) {
-                var name = s.metadata ? s.metadata.name : s.name || '?';
-                var namespace = s.metadata ? s.metadata.namespace : s.namespace || '';
-                var type = s.spec ? s.spec.type : s.type || '-';
-                var extPorts = '-', intPorts = '-';
-                if (s.spec && s.spec.ports) {
-                    extPorts = s.spec.ports.map(function (p) { return (p.nodePort || '-') + '/' + (p.protocol || 'TCP'); }).join(', ');
-                    intPorts = s.spec.ports.map(function (p) {
-                        var tp = p.targetPort;
-                        if (tp && typeof tp === 'object') tp = tp.IntVal || tp.StrVal || '?';
-                        return p.port + '->' + (tp || p.port);
-                    }).join(', ');
-                }
-                return '<tr><td>' + esc(name) + '</td><td>' + esc(namespace) + '</td><td>' + esc(type) + '</td><td>' + esc(extPorts) + '</td><td>' + esc(intPorts) + '</td>' +
-                    '<td><button class="btn btn-sm btn-danger" data-name="' + esc(name) + '" data-ns="' + esc(namespace) + '">删除</button></td></tr>';
+                var ports = s.ports || [];
+                var extPorts = ports.length ? ports.map(function (p) { return (p.node_port || '-') + '/' + (p.protocol || 'TCP'); }).join(', ') : '-';
+                var intPorts = ports.length ? ports.map(function (p) { return p.port + '->' + (p.target_port || p.port); }).join(', ') : '-';
+                var srcBadge = s.managed ? '<span class="badge badge-success">本面板</span>' : '<span class="badge badge-muted">外部</span>';
+                var action = s.managed
+                    ? '<button class="btn btn-sm btn-danger" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">删除</button>'
+                    : '<span class="muted" style="font-size:12px;">只读</span>';
+                return '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.namespace) + '</td><td>' + esc(s.type) + '</td><td>' + esc(extPorts) + '</td><td>' + esc(intPorts) + '</td><td>' + srcBadge + '</td>' +
+                    '<td>' + action + '</td></tr>';
             }).join('');
             tbody.querySelectorAll('button[data-name]').forEach(function (btn) {
                 btn.addEventListener('click', async function () {
@@ -552,23 +549,43 @@
     registerRoute('/storage', async function (content) {
         content.innerHTML = '<h2 class="page-title">NFS 存储编排</h2>' +
             '<div class="card">' +
+            '<div class="section-title">Worker 节点</div>' +
+            '<div class="form-field"><label>选择 Worker</label><select id="st-worker-select"><option value="">-- 选择 Worker --</option></select></div>' +
+            '<div id="st-inv-msg" class="info-msg"></div>' +
+            '</div>' +
+            // Block A: VG pool management
+            '<div class="card mt-2">' +
+            '<div class="section-title">存储池 (VG) 管理</div>' +
+            '<button class="btn btn-primary btn-sm" id="btn-init-vg" disabled>初始化 VG 池 (从未挂载盘)</button>' +
+            '<span id="st-vg-summary" class="muted"></span>' +
+            '<table class="data-table mt-2" id="st-vg-table"><thead><tr><th>VG 名称</th><th>总量</th><th>剩余</th></tr></thead>' +
+            '<tbody id="st-vg-tbody"><tr><td colspan="3" class="muted">先选择 Worker。</td></tr></tbody></table>' +
+            '</div>' +
+            // Block B: LV management
+            '<div class="card mt-2">' +
+            '<div class="section-title">逻辑卷 (LV) 管理 <span class="muted" style="font-size:12px;">(含非本面板创建的 LV,可扩容/缩容/删除释放空间)</span></div>' +
+            '<table class="data-table" id="st-lv-table"><thead><tr><th>名称</th><th>VG</th><th>大小(GB)</th><th>挂载点</th><th>文件系统</th><th>操作</th></tr></thead>' +
+            '<tbody id="st-lv-tbody"><tr><td colspan="6" class="muted">先选择 Worker。</td></tr></tbody></table>' +
+            '</div>' +
+            // Block C: create NFS share
+            '<div class="card mt-2">' +
             '<div class="section-title">创建 NFS 共享</div>' +
-            '<div class="form-field"><label>Worker 节点</label><select id="nfs-worker-select"><option value="">-- 选择 Worker --</option></select></div>' +
-            '<div class="form-field"><label>Volume Group</label><select id="nfs-vg-select" disabled><option value="">-- 先选 Worker --</option></select> <span id="nfs-vg-info" class="muted"></span></div>' +
-            '<div class="form-field"><label>大小 (GB)</label><input type="number" id="nfs-size" placeholder="如 200"></div>' +
-            '<button class="btn btn-primary" id="btn-nfs-create">创建 NFS</button>' +
-            '<div id="nfs-create-msg" class="error-msg"></div>' +
+            '<div class="form-field"><label>Volume Group</label><select id="st-vg-select" disabled><option value="">-- 先选 Worker --</option></select> <span id="st-vg-free" class="muted"></span></div>' +
+            '<div class="form-field"><label>大小 (GB)</label><input type="number" id="st-nfs-size" placeholder="如 200"></div>' +
+            '<button class="btn btn-primary" id="btn-nfs-create" disabled>创建 NFS</button>' +
+            '<div id="st-nfs-msg" class="error-msg"></div>' +
             '<p class="muted mt-1" style="font-size:12px;">逻辑卷名/挂载点/导出选项自动生成。异步任务,成功后跳转任务页。</p>' +
             '</div>' +
+            // Block D: NFS shares list
             '<div class="card mt-2">' +
             '<div class="section-title">NFS 共享列表 (最近任务)</div>' +
-            '<table class="data-table" id="storage-table"><thead><tr><th>ID</th><th>类型</th><th>Worker</th><th>状态</th><th>创建时间</th><th>完成时间</th><th>操作</th></tr></thead>' +
-            '<tbody id="storage-tbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody></table></div>';
+            '<table class="data-table" id="st-storage-table"><thead><tr><th>ID</th><th>类型</th><th>Worker</th><th>状态</th><th>创建时间</th><th>完成时间</th><th>操作</th></tr></thead>' +
+            '<tbody id="st-storage-tbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody></table></div>';
+
+        var wsel = document.getElementById('st-worker-select');
+        var lastInventory = null; // cached for the init-VG modal
 
         // Load workers into the dropdown.
-        var wsel = document.getElementById('nfs-worker-select');
-        var vsel = document.getElementById('nfs-vg-select');
-        var vinfo = document.getElementById('nfs-vg-info');
         try {
             var r = await apiJSON('/workers');
             if (r.resp.ok && Array.isArray(r.data)) {
@@ -576,41 +593,120 @@
             }
         } catch (e) {}
 
-        wsel.addEventListener('change', async function () {
-            var wid = wsel.value;
-            if (!wid) { vsel.innerHTML = '<option value="">-- 先选 Worker --</option>'; vsel.disabled = true; vinfo.textContent = ''; return; }
+        async function loadInventory(wid) {
+            var invMsg = document.getElementById('st-inv-msg');
+            var vgTbody = document.getElementById('st-vg-tbody');
+            var lvTbody = document.getElementById('st-lv-tbody');
+            var vsel = document.getElementById('st-vg-select');
+            var vfree = document.getElementById('st-vg-free');
+            var btnInit = document.getElementById('btn-init-vg');
+            var btnNfs = document.getElementById('btn-nfs-create');
+            var summary = document.getElementById('st-vg-summary');
+            // reset
+            btnInit.disabled = true; btnNfs.disabled = true; vsel.disabled = true;
             vsel.innerHTML = '<option value="">加载中...</option>';
-            vsel.disabled = true;
-            vinfo.textContent = '';
+            vfree.textContent = ''; summary.textContent = '';
+            vgTbody.innerHTML = '<tr><td colspan="3" class="muted">加载中...</td></tr>';
+            lvTbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
             try {
-                var r = await apiJSON('/storage/vgs?worker_id=' + encodeURIComponent(wid));
-                if (!r.resp.ok) { vsel.innerHTML = '<option value="">-- 加载失败 --</option>'; setMsg(document.getElementById('nfs-create-msg'), '错误: ' + (r.data && r.data.error), 'error'); return; }
-                var vgs = r.data || [];
-                if (vgs.length === 0) { vsel.innerHTML = '<option value="">-- 该节点无 VG --</option>'; return; }
-                vsel.innerHTML = '';
-                vgs.forEach(function (v) {
-                    var o = document.createElement('option');
-                    o.value = v.name;
-                    o.textContent = v.name + ' (剩余 ' + (v.free_gb || 0).toFixed(1) + 'G / 共 ' + v.vsize + ')';
-                    vsel.appendChild(o);
-                });
-                vsel.disabled = false;
-                var sel = vgs[0];
-                vinfo.textContent = '可用 ' + (sel.free_gb || 0).toFixed(1) + ' GB';
-                vsel.addEventListener('change', function () {
-                    var cur = vgs.find(function (x) { return x.name === vsel.value; });
-                    vinfo.textContent = cur ? '可用 ' + (cur.free_gb || 0).toFixed(1) + ' GB' : '';
-                });
-            } catch (err) { vsel.innerHTML = '<option value="">-- 加载失败 --</option>'; }
+                var r = await apiJSON('/storage/inventory?worker_id=' + encodeURIComponent(wid));
+                if (!r.resp.ok) {
+                    var err = (r.data && r.data.error) || '加载失败';
+                    setMsg(invMsg, '加载存储清单失败: ' + err + ' (若未安装 lvm2/nfs,先点 Worker 页的"安装依赖")', 'error');
+                    vgTbody.innerHTML = '<tr><td colspan="3" class="muted">加载失败</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="6" class="muted">加载失败</td></tr>';
+                    vsel.innerHTML = '<option value="">-- 加载失败 --</option>';
+                    return;
+                }
+                setMsg(invMsg, '', 'info');
+                var inv = r.data || { vgs: [], lvs: [], unused_disks: [] };
+                lastInventory = inv;
+
+                // VG table
+                var vgs = inv.vgs || [];
+                if (vgs.length === 0) {
+                    vgTbody.innerHTML = '<tr><td colspan="3" class="muted">无 VG。可从未挂载盘初始化一个 vg_data。</td></tr>';
+                } else {
+                    vgTbody.innerHTML = vgs.map(function (v) {
+                        return '<tr><td>' + esc(v.name) + '</td><td>' + esc(v.vsize) + '</td><td>' + esc(v.vfree) + ' (' + (v.free_gb || 0).toFixed(1) + 'G)</td></tr>';
+                    }).join('');
+                }
+
+                // Unused-disk summary + init button
+                var disks = inv.unused_disks || [];
+                if (disks.length > 0) {
+                    btnInit.disabled = false;
+                    summary.textContent = '发现 ' + disks.length + ' 块未挂载盘可创建 VG 池。';
+                } else {
+                    summary.textContent = '无未挂载盘可用于新建 VG 池。';
+                }
+
+                // LV table with resize/delete actions
+                var lvs = inv.lvs || [];
+                if (lvs.length === 0) {
+                    lvTbody.innerHTML = '<tr><td colspan="6" class="muted">无逻辑卷。</td></tr>';
+                } else {
+                    lvTbody.innerHTML = lvs.map(function (lv) {
+                        var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
+                        return '<tr><td>' + esc(lv.name) + '</td><td>' + esc(lv.vg_name) + '</td><td>' + (lv.size_gb || 0).toFixed(1) + '</td><td>' + esc(lv.mount_point || '-') + '</td><td>' + esc(lv.fs_type || '-') + '</td>' +
+                            '<td><button class="btn btn-sm btn-primary" data-act="grow" data-lv=\'' + esc(data) + '\'>扩容</button> ' +
+                            '<button class="btn btn-sm btn-primary" data-act="shrink" data-lv=\'' + esc(data) + '\'>缩容</button> ' +
+                            '<button class="btn btn-sm btn-danger" data-act="delete" data-lv=\'' + esc(data) + '\'>删除</button></td></tr>';
+                    }).join('');
+                    lvTbody.querySelectorAll('button[data-act]').forEach(function (btn) {
+                        btn.addEventListener('click', function () {
+                            var lv = JSON.parse(this.getAttribute('data-lv'));
+                            var act = this.getAttribute('data-act');
+                            if (act === 'delete') doDeleteLV(content, wid, lv);
+                            else showResizeLVForm(content, wid, lv, act);
+                        });
+                    });
+                }
+
+                // NFS form VG dropdown
+                if (vgs.length === 0) {
+                    vsel.innerHTML = '<option value="">-- 该节点无 VG --</option>';
+                } else {
+                    vsel.innerHTML = '';
+                    vgs.forEach(function (v) {
+                        var o = document.createElement('option');
+                        o.value = v.name;
+                        o.textContent = v.name + ' (剩余 ' + (v.free_gb || 0).toFixed(1) + 'G / 共 ' + v.vsize + ')';
+                        vsel.appendChild(o);
+                    });
+                    vsel.disabled = false; btnNfs.disabled = false;
+                    vfree.textContent = '可用 ' + (vgs[0].free_gb || 0).toFixed(1) + ' GB';
+                    vsel.onchange = function () {
+                        var cur = vgs.find(function (x) { return x.name === vsel.value; });
+                        vfree.textContent = cur ? '可用 ' + (cur.free_gb || 0).toFixed(1) + ' GB' : '';
+                    };
+                }
+            } catch (err) {
+                setMsg(invMsg, '加载存储清单出错: ' + err.message, 'error');
+            }
+        }
+
+        wsel.addEventListener('change', function () {
+            var wid = wsel.value;
+            if (!wid) { return; }
+            loadInventory(wid);
         });
 
+        // Init VG pool: modal listing unused disks -> POST /storage/vg.
+        document.getElementById('btn-init-vg').addEventListener('click', function () {
+            if (!wsel.value || !lastInventory) return;
+            showInitVGForm(content, parseInt(wsel.value, 10), lastInventory.unused_disks || [], function () {
+                loadInventory(wsel.value);
+            });
+        });
+
+        // Create NFS share.
         document.getElementById('btn-nfs-create').addEventListener('click', async function () {
             var wid = parseInt(wsel.value, 10);
-            var vg = vsel.value;
-            var size = parseInt(document.getElementById('nfs-size').value, 10);
-            var msgEl = document.getElementById('nfs-create-msg');
+            var vg = document.getElementById('st-vg-select').value;
+            var size = parseInt(document.getElementById('st-nfs-size').value, 10);
+            var msgEl = document.getElementById('st-nfs-msg');
             if (!wid || !vg || !size) { setMsg(msgEl, '请选择 Worker、VG 并输入大小', 'error'); return; }
-            // Auto-generate lv name + mount point.
             var lv = 'lv_nb_' + Date.now().toString(36);
             var mp = '/data02/nfs_' + lv;
             try {
@@ -623,10 +719,9 @@
         // Load NFS tasks with a delete (reclaim) action.
         try {
             var r2 = await apiJSON('/storage');
-            var tbody = document.getElementById('storage-tbody');
+            var tbody = document.getElementById('st-storage-tbody');
             if (!r2.resp.ok) { tbody.innerHTML = '<tr><td colspan="7" class="muted">加载失败</td></tr>'; return; }
             var tasks = r2.data || [];
-            // Filter to provision tasks (succeeded) to show as "shares" with delete.
             var shares = tasks.filter(function (t) { return t.type === 'storage_provision_nfs' && t.status === 'succeeded'; });
             if (shares.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无已创建的 NFS 共享。</td></tr>'; return; }
             tbody.innerHTML = shares.map(function (t) {
@@ -646,6 +741,78 @@
             });
         } catch (err) {}
     });
+
+    // Init VG pool modal: lists unused disks (checkboxes, default all) + vg name.
+    async function showInitVGForm(content, wid, disks, onDone) {
+        if (!disks || disks.length === 0) { alert('该节点没有未挂载盘可用于创建 VG 池。'); return; }
+        var diskRows = disks.map(function (d, i) {
+            return '<label style="display:block;margin:4px 0;"><input type="checkbox" data-disk="' + esc(d.name) + '" checked> ' + esc(d.name) + ' <span class="muted">(' + (d.size_gb || 0).toFixed(1) + ' GB)</span></label>';
+        }).join('');
+        var html = '<div class="modal-overlay" id="vg-modal"><div class="modal">' +
+            '<h3 class="modal-title">初始化 VG 池</h3>' +
+            '<p class="muted">把以下未挂载盘 pvcreate 后合并成一个 VG(已有同名 VG 则 vgextend 加入)。<b>会擦除盘上现有数据。</b></p>' +
+            '<div class="form-field"><label>VG 名称</label><input type="text" id="vg-name-input" value="vg_data"></div>' +
+            '<div class="form-field"><label>未挂载盘</label>' + diskRows + '</div>' +
+            '<button type="button" class="btn btn-primary" id="vg-create-btn">创建</button> ' +
+            '<button type="button" class="btn btn-link" id="vg-cancel" style="color:#555;">取消</button>' +
+            '<div id="vg-msg" class="error-msg"></div></div></div>';
+        content.insertAdjacentHTML('beforeend', html);
+        var modal = document.getElementById('vg-modal');
+        document.getElementById('vg-cancel').addEventListener('click', function () { modal.remove(); });
+        document.getElementById('vg-create-btn').addEventListener('click', async function () {
+            var vgName = document.getElementById('vg-name-input').value.trim();
+            var chosen = Array.from(modal.querySelectorAll('input[data-disk]:checked')).map(function (c) { return c.getAttribute('data-disk'); });
+            var msgEl = document.getElementById('vg-msg');
+            if (!vgName) { setMsg(msgEl, '请输入 VG 名称', 'error'); return; }
+            if (chosen.length === 0) { setMsg(msgEl, '至少选择一块盘', 'error'); return; }
+            try {
+                var r = await apiJSON('/storage/vg', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: vgName, disks: chosen }) });
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                modal.remove();
+                var taskID = r.data && r.data.task_id;
+                if (taskID) window.location.hash = '#/tasks/' + taskID;
+                else if (onDone) onDone();
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+        });
+    }
+
+    // Resize LV modal: grow/shrink by delta GB.
+    async function showResizeLVForm(content, wid, lv, action) {
+        var isGrow = action === 'grow';
+        var html = '<div class="modal-overlay" id="rsz-modal"><div class="modal">' +
+            '<h3 class="modal-title">' + (isGrow ? '扩容' : '缩容') + ' LV - ' + esc(lv.name) + '</h3>' +
+            '<p class="muted">当前大小 ' + (lv.size || 0).toFixed(1) + ' GB,文件系统 ' + esc(lv.fs || '未知') + '。</p>' +
+            '<div class="form-field"><label>变化量 (GB)</label><input type="number" id="rsz-delta" placeholder="如 50" min="1"></div>' +
+            (isGrow ? '' : '<p class="muted" style="font-size:12px;">缩容会先缩小文件系统再缩减 LV。<b>xfs 不支持缩容,ext4 缩容有数据风险,请先备份。</b></p>') +
+            '<button type="button" class="btn btn-primary" id="rsz-go">' + (isGrow ? '扩容' : '缩容') + '</button> ' +
+            '<button type="button" class="btn btn-link" id="rsz-cancel" style="color:#555;">取消</button>' +
+            '<div id="rsz-msg" class="error-msg"></div></div></div>';
+        content.insertAdjacentHTML('beforeend', html);
+        var modal = document.getElementById('rsz-modal');
+        document.getElementById('rsz-cancel').addEventListener('click', function () { modal.remove(); });
+        document.getElementById('rsz-go').addEventListener('click', async function () {
+            var delta = parseInt(document.getElementById('rsz-delta').value, 10);
+            var msgEl = document.getElementById('rsz-msg');
+            if (!delta || delta <= 0) { setMsg(msgEl, '请输入正整数 GB', 'error'); return; }
+            try {
+                var r = await apiJSON('/storage/lv/resize', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: lv.vg, lv_name: lv.name, action: action, delta_gb: delta }) });
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                modal.remove();
+                window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+        });
+    }
+
+    // Delete LV: confirm (tears down exports/fstab/umount + lvremove, releases space).
+    async function doDeleteLV(content, wid, lv) {
+        var detail = 'LV ' + lv.vg + '/' + lv.name + ' (' + (lv.size || 0).toFixed(1) + ' GB' + (lv.mp ? ', 挂载于 ' + lv.mp : ', 未挂载') + ')';
+        if (!confirm('确认删除 ' + detail + '?\n将先卸载并清理 /etc/exports、/etc/fstab,再 lvremove,空间归还 VG。\n该操作不可逆,请确认数据已备份。')) return;
+        try {
+            var r = await apiJSON('/storage/lv/delete', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: lv.vg, lv_name: lv.name }) });
+            if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
+            window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
+        } catch (err) { alert('错误: ' + err.message); }
+    }
 
     // ====================================================================
     // TASKS PAGE (list + detail + SSE)

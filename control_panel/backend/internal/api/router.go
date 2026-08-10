@@ -73,6 +73,10 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/storage/reclaim", sh.reclaim)
 		authed.GET("/storage", sh.list)
 		authed.GET("/storage/vgs", sh.listVgs)
+		authed.GET("/storage/inventory", sh.listInventory)
+		authed.POST("/storage/vg", sh.createVG)
+		authed.POST("/storage/lv/resize", sh.resizeLV)
+		authed.POST("/storage/lv/delete", sh.deleteLV)
 	}
 
 	// Static frontend: embedded SPA served at GET / and GET /static/*.

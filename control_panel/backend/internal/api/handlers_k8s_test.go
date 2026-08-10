@@ -85,20 +85,34 @@ func TestCreateServiceViaAPI(t *testing.T) {
 }
 
 // TestListServicesViaAPI verifies the sync list path: GET /api/v1/k8s/services
-// returns 200 and the JSON array of Services managed by the control panel.
+// returns 200 and the JSON array of ServiceInfo for every Service in notebook
+// namespaces - including ones NOT created by the control panel (external), each
+// carrying a managed flag so the UI can mark ours vs read-only external.
 func TestListServicesViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
-	// Pre-create a service via the k8s package directly so the list has data.
-	_, err := k8s.CreateService(context.Background(), cs, k8s.CreateServiceReq{
-		Namespace: "ns1", PodName: "p1", PodUID: "u1",
-		Selector: map[string]string{"app": "p1"}, Type: "NodePort",
-		Ports: []k8s.PortSpec{{Port: 31555, TargetPort: 31555, NodePort: 31555, Protocol: "TCP"}},
-	})
-	if err != nil {
+	// A notebook pod in ns1 makes ns1 a "notebook namespace" so its Services are
+	// included. Without it, ListServicesForNotebooks would skip ns1 entirely.
+	if _, err := cs.CoreV1().Pods("ns1").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "notebook-abc", Namespace: "ns1", UID: "u1"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// A managed Service (ours).
+	if _, err := cs.CoreV1().Services("ns1").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-svc-1", Namespace: "ns1", Labels: map[string]string{"managed-by": "control-panel"}},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Ports: []corev1.ServicePort{{Port: 31555, NodePort: 31555, Protocol: "TCP"}}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// An external Service (not managed by us) - must also be listed, read-only.
+	if _, err := cs.CoreV1().Services("ns1").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-svc", Namespace: "ns1"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
+	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("GET", "/api/v1/k8s/services?namespace=ns1", nil)
+	req := httptest.NewRequest("GET", "/api/v1/k8s/services", nil)
 	req.Header.Set("Authorization", authHeader(t, tk))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -109,8 +123,18 @@ func TestListServicesViaAPI(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 1 {
-		t.Fatalf("expected 1 svc in list, got %d", len(list))
+	if len(list) != 2 {
+		t.Fatalf("expected 2 svcs (managed + external), got %d", len(list))
+	}
+	byName := map[string]map[string]any{}
+	for _, s := range list {
+		byName[s["name"].(string)] = s
+	}
+	if m, ok := byName["cp-svc-1"]; !ok || m["managed"] != true {
+		t.Fatalf("cp-svc-1 should be managed: %+v", m)
+	}
+	if e, ok := byName["external-svc"]; !ok || e["managed"] != false {
+		t.Fatalf("external-svc should be present and not managed: %+v", e)
 	}
 }
 

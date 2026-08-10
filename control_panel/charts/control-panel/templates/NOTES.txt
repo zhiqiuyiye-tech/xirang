@@ -27,8 +27,11 @@ or panel-side password via the UI, click "安装依赖" to auto-install lvm2/nfs
 then manage K8s SVC/NetworkPolicy and NFS storage from the UI.
 
 Notes:
-- AES_KEY/JWT_SECRET were auto-generated. To pin them (preserve encrypted worker
-  credentials across upgrades), set secrets.aesKey / secrets.jwtSecret in values.
+- AES_KEY/JWT_SECRET/admin password are generated once on first install and
+  reused across `helm upgrade` (lookup reuses the existing Secret), so the
+  admin password and encrypted worker credentials keep working after an image
+  bump. To force a rotation, pin secrets.aesKey / secrets.jwtSecret /
+  secrets.adminPassword in values (only on first install or when rotating).
 - The pod pulls {{ .Values.image.repository }}:{{ .Values.image.tag }} with
   imagePullPolicy: {{ .Values.image.pullPolicy }}. Ensure cluster nodes can reach
   the registry; if it needs auth, set image.imagePullSecrets in values.

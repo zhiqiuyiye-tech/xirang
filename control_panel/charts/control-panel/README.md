@@ -34,10 +34,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-0.1.0.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-0.3.0.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:0.1.0`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:0.3.0`.
 
 ## Install
 
@@ -45,7 +45,7 @@ The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-p
 
 ```bash
 helm install control-panel oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel \
-  --version 0.1.0 --create-namespace -n control-panel
+  --version 0.3.0 --create-namespace -n control-panel
 ```
 
 ### From a local chart checkout
@@ -77,17 +77,26 @@ Login with username `admin` + the retrieved password.
 
 ```bash
 helm upgrade control-panel ./control_panel/charts/control-panel -n control-panel
+# or, to bump just the image tag:
+helm upgrade control-panel ./control_panel/charts/control-panel -n control-panel \
+  --set image.tag=v2
 ```
 
 `imagePullPolicy: Always` makes the pod pull the latest image on restart.
 
+Passwords survive the upgrade: the admin login password (bcrypt-hashed in the
+SQLite DB on the PVC) and the per-worker SSH credentials (AES-encrypted in the
+same DB) are never touched by `helm upgrade`. The Secret values
+(`AES_KEY`/`JWT_SECRET`/`ADMIN_INIT_PASSWORD`) are reused from the existing
+deployed Secret via the `lookup` function (see `templates/_helpers.tpl`), so the
+key that decrypts worker creds and the password retrievable via `kubectl get
+secret ... ADMIN_INIT_PASSWORD | base64 -d` both stay stable across upgrades.
+
 ## Pin secrets across upgrades
 
-By default AES_KEY/JWT_SECRET/admin-password regenerate only on first install
-(Kubernetes keeps the Secret across `helm upgrade` unless the template forces
-regeneration - here it does NOT, since `randAlphaNum` is only evaluated when the
-Secret is created). To explicitly pin them (e.g. to guarantee no rotation or to
-set your own admin password), set in values or `--set`:
+By default the three Secret values are generated once on first install and
+reused on every upgrade via `lookup`. To explicitly pin them (e.g. to set your
+own admin password or to force a rotation), set them in values or `--set`:
 
 ```bash
 helm install control-panel ./control_panel/charts/control-panel -n control-panel \
@@ -96,6 +105,11 @@ helm install control-panel ./control_panel/charts/control-panel -n control-panel
   --set secrets.aesKey=$(openssl rand 32 | base64) \
   --set secrets.jwtSecret=$(openssl rand 32 | base64)
 ```
+
+Note: pinning `secrets.aesKey`/`secrets.jwtSecret` on a `helm upgrade` of an
+existing release WILL rotate them (pinned values win over `lookup`), which
+invalidates existing encrypted worker credentials and login sessions. Only pin
+on first install, or when you intend to rotate.
 
 ## Uninstall
 

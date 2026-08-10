@@ -96,10 +96,41 @@ cd control_panel/deploy
    `deployment.yaml`, `service.yaml`).
 7. Print the NodePort access URL.
 
-The script is **idempotent**: re-running regenerates the Secret. If a Secret
-already exists in the cluster you will be warned and asked to confirm the
-overwrite (which rotates `AES_KEY` and `JWT_SECRET`, invalidating existing
-encrypted per-worker SSH private keys and all login sessions).
+The script is **idempotent and upgrade-safe**: re-running it when the Secret
+`control-panel-secrets` already exists **reuses** its values
+(`AES_KEY`/`JWT_SECRET`/`ADMIN_INIT_PASSWORD`) unchanged, so the admin password
+(bcrypt-hashed in the SQLite DB on the PVC) and the AES-encrypted per-worker SSH
+credentials keep working. Only `secret.yaml` is re-rendered (a no-op on the
+cluster) and the other manifests are re-applied (picking up any image/deployment
+changes). Pass `--reset-secrets` to force regeneration - this invalidates
+existing encrypted worker credentials and the retrievable admin password, so
+back up first.
+
+## Upgrade (after a new image push)
+
+```bash
+# 1. Build and push the new image (see "Build and Push the Image" above).
+docker build -t registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest ./control_panel/backend
+docker push registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
+
+# 2. Re-run install.sh - it reuses the existing Secret and only re-applies the
+#    manifests (imagePullPolicy: Always makes the pod pull the new image).
+cd control_panel/deploy
+./install.sh
+```
+
+Or, to update the image without touching the Secret at all:
+
+```bash
+kubectl -n control-panel set image deployment/control-panel \
+    control-panel=registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:<new-tag>
+```
+
+Because the admin password lives in the SQLite DB (PVC-backed) and the worker
+credentials are encrypted with the reused `AES_KEY`, both keep working after the
+upgrade. The `ADMIN_INIT_PASSWORD` in the Secret is only used to seed the admin
+account on first startup; it is not consulted afterwards, so reusing it keeps
+the `kubectl get secret ... | base64 -d` retrieval command accurate.
 
 ## Access
 

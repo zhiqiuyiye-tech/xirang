@@ -4,17 +4,24 @@
 #
 # This script:
 #   1. Validates that kubectl is available and connected to a cluster.
-#   2. Prompts interactively for the initial admin password.
-#   3. Generates fresh AES_KEY and JWT_SECRET via openssl.
-#   4. Renders a Secret (control-panel-secrets) into secret.yaml (git-ignored).
+#   2. If the Secret 'control-panel-secrets' already exists: REUSES its values
+#      (AES_KEY/JWT_SECRET/ADMIN_INIT_PASSWORD) unchanged, so the admin password
+#      and encrypted worker credentials keep working across upgrades. Only
+#      re-renders secret.yaml (a no-op on the cluster) and re-applies the other
+#      manifests (picking up any image/deployment changes).
+#   3. On first install (or with --reset-secrets): generates fresh AES_KEY and
+#      JWT_SECRET via openssl and prompts for the initial admin password.
+#   4. Renders the Secret into secret.yaml (git-ignored).
 #   5. Applies all manifests in this directory to the cluster.
 #   6. Prints the NodePort access URL.
 #
-# Idempotent: re-running regenerates the Secret. If a Secret already exists in
-# the cluster you will be warned and asked to confirm overwriting it.
+# Idempotent and upgrade-safe: re-running to pick up a new image preserves the
+# existing Secret by default. Use --reset-secrets to force regeneration (this
+# invalidates existing encrypted worker credentials and the retrievable admin
+# password - back up first).
 #
 # Usage:
-#   ./install.sh
+#   ./install.sh [--reset-secrets]
 #
 # Prerequisites:
 #   - kubectl installed and configured to talk to the target cluster.
@@ -58,47 +65,97 @@ fi
 
 command -v openssl >/dev/null 2>&1 || die "openssl not found on PATH. Install openssl."
 
-# --- generate secret values ------------------------------------------------
+# --- flag parsing ---------------------------------------------------------
 
-log "Generating AES_KEY (32 random bytes, base64)..."
-AES_KEY="$(openssl rand 32 | base64 | tr -d '\n')"
-if [ -z "${AES_KEY}" ]; then die "failed to generate AES_KEY"; fi
+RESET_SECRETS=0
+for arg in "$@"; do
+    case "${arg}" in
+        --reset-secrets) RESET_SECRETS=1 ;;
+        --help|-h)
+            cat <<'EOF'
+Usage: ./install.sh [--reset-secrets]
 
-log "Generating JWT_SECRET (32 random bytes, base64)..."
-JWT_SECRET="$(openssl rand 32 | base64 | tr -d '\n')"
-if [ -z "${JWT_SECRET}" ]; then die "failed to generate JWT_SECRET"; fi
+Installs or upgrades the control panel. By default, if the Secret
+'control-panel-secrets' already exists, its values (AES_KEY, JWT_SECRET,
+ADMIN_INIT_PASSWORD) are REUSED unchanged so the admin password and encrypted
+worker credentials keep working across image upgrades.
 
-log "Prompt for initial admin password (input hidden)..."
-while true; do
-    read -r -s -p "  Initial admin password (min 8 chars): " ADMIN_PW
-    echo
-    if [ "${#ADMIN_PW}" -lt 8 ]; then
-        warn "Password must be at least 8 characters. Please try again."
-        continue
-    fi
-    read -r -s -p "  Confirm password: " ADMIN_PW_CONFIRM
-    echo
-    if [ "${ADMIN_PW}" != "${ADMIN_PW_CONFIRM}" ]; then
-        warn "Passwords do not match. Please try again."
-        continue
-    fi
-    break
+  --reset-secrets   Force regeneration of AES_KEY/JWT_SECRET/admin password.
+                    Invalidates existing encrypted worker credentials and the
+                    retrievable admin password - back up first.
+EOF
+            exit 0 ;;
+        *) die "unknown argument: ${arg} (see --help)" ;;
+    esac
 done
 
-ADMIN_INIT_PASSWORD_B64="$(printf '%s' "${ADMIN_PW}" | base64 | tr -d '\n')"
-unset ADMIN_PW ADMIN_PW_CONFIRM
+# --- secret values: reuse existing, or generate on first install ----------
 
-# --- warn on existing secret ----------------------------------------------
-
+SECRET_EXISTS=0
 if kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1; then
-    warn "Secret '${SECRET_NAME}' already exists in namespace '${NAMESPACE}'."
-    warn "Re-applying will OVERWRITE the existing values, which will:"
-    warn "  - Rotate AES_KEY: existing encrypted per-worker SSH private keys become DECRYPTABLE ONLY IF the old AES_KEY is preserved (they are not - this regenerates it)."
-    warn "    Existing encrypted data will become unreadable. Back up the old AES_KEY first if you need to preserve it."
-    warn "  - Rotate JWT_SECRET: all current login sessions are invalidated."
-    warn "  - Reset ADMIN_INIT_PASSWORD: only takes effect if no admin has been seeded yet (the admin password is only seeded on first startup)."
-    read -r -p "Overwrite? Type 'yes' to continue: " CONFIRM
-    [ "${CONFIRM}" = "yes" ] || die "aborted by user."
+    SECRET_EXISTS=1
+fi
+
+# read_secret_key echoes the existing base64 value for a Secret data key
+# (empty if the secret or key is absent). Called only when SECRET_EXISTS=1.
+read_secret_key() {
+    kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" \
+        -o "jsonpath={.data.$1}" 2>/dev/null || true
+}
+
+if [ "${SECRET_EXISTS}" = "1" ] && [ "${RESET_SECRETS}" = "0" ]; then
+    # Upgrade / re-run: reuse the existing Secret values verbatim. The admin
+    # password is bcrypt-hashed in the SQLite DB (on the PVC) and the per-worker
+    # SSH credentials are AES-encrypted with AES_KEY in the same DB - reusing
+    # these values keeps both working. Re-rendering secret.yaml with identical
+    # values is a no-op on the cluster; re-applying picks up image/deployment
+    # changes only.
+    log "Secret '${SECRET_NAME}' exists - reusing its values (passwords unchanged)."
+    AES_KEY="$(read_secret_key AES_KEY)"
+    JWT_SECRET="$(read_secret_key JWT_SECRET)"
+    ADMIN_INIT_PASSWORD_B64="$(read_secret_key ADMIN_INIT_PASSWORD)"
+    if [ -z "${AES_KEY}" ] || [ -z "${JWT_SECRET}" ] || [ -z "${ADMIN_INIT_PASSWORD_B64}" ]; then
+        die "existing Secret is missing AES_KEY/JWT_SECRET/ADMIN_INIT_PASSWORD; re-run with --reset-secrets to regenerate."
+    fi
+else
+    # First install, or explicit reset.
+    if [ "${SECRET_EXISTS}" = "1" ] && [ "${RESET_SECRETS}" = "1" ]; then
+        warn "Secret '${SECRET_NAME}' exists and --reset-secrets was given."
+        warn "Re-applying will OVERWRITE the existing values:"
+        warn "  - Rotate AES_KEY: existing encrypted per-worker SSH private keys become unreadable (back up the old key first if needed)."
+        warn "  - Rotate JWT_SECRET: all current login sessions are invalidated."
+        warn "  - Reset ADMIN_INIT_PASSWORD: the retrievable password changes (the DB bcrypt hash is only seeded on first startup, so the old password keeps working until you change it)."
+        read -r -p "Overwrite? Type 'yes' to continue: " CONFIRM
+        [ "${CONFIRM}" = "yes" ] || die "aborted by user."
+    fi
+
+    log "Generating AES_KEY (32 random bytes, base64)..."
+    AES_KEY="$(openssl rand 32 | base64 | tr -d '\n')"
+    if [ -z "${AES_KEY}" ]; then die "failed to generate AES_KEY"; fi
+
+    log "Generating JWT_SECRET (32 random bytes, base64)..."
+    JWT_SECRET="$(openssl rand 32 | base64 | tr -d '\n')"
+    if [ -z "${JWT_SECRET}" ]; then die "failed to generate JWT_SECRET"; fi
+
+    log "Prompt for initial admin password (input hidden)..."
+    while true; do
+        read -r -s -p "  Initial admin password (min 8 chars): " ADMIN_PW
+        echo
+        if [ "${#ADMIN_PW}" -lt 8 ]; then
+            warn "Password must be at least 8 characters. Please try again."
+            continue
+        fi
+        read -r -s -p "  Confirm password: " ADMIN_PW_CONFIRM
+        echo
+        if [ "${ADMIN_PW}" != "${ADMIN_PW_CONFIRM}" ]; then
+            warn "Passwords do not match. Please try again."
+            continue
+        fi
+        break
+    done
+
+    ADMIN_INIT_PASSWORD_B64="$(printf '%s' "${ADMIN_PW}" | base64 | tr -d '\n')"
+    unset ADMIN_PW ADMIN_PW_CONFIRM
 fi
 
 # --- render secret.yaml ----------------------------------------------------

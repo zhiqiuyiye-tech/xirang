@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -71,6 +72,128 @@ func TestReclaimStorageViaAPI(t *testing.T) {
 	}
 }
 
+// TestCreateVGViaAPI verifies POST /api/v1/storage/vg submits the
+// storage_create_vg task and returns 202 + task_id.
+func TestCreateVGViaAPI(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	wid, _ := ws.Create(context.Background(), workers.CreateReq{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root",
+	})
+	body, _ := json.Marshal(map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "disks": []string{"/dev/sdb", "/dev/sdc"},
+	})
+	req := httptest.NewRequest("POST", "/api/v1/storage/vg", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader(t, tk))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["task_id"] == nil {
+		t.Fatalf("no task_id: %s", w.Body.String())
+	}
+}
+
+// TestResizeLVViaAPI verifies POST /api/v1/storage/lv/resize submits the
+// storage_resize_lv task and returns 202 + task_id.
+func TestResizeLVViaAPI(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	wid, _ := ws.Create(context.Background(), workers.CreateReq{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root",
+	})
+	body, _ := json.Marshal(map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+		"action": "grow", "delta_gb": 50,
+	})
+	req := httptest.NewRequest("POST", "/api/v1/storage/lv/resize", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader(t, tk))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["task_id"] == nil {
+		t.Fatalf("no task_id: %s", w.Body.String())
+	}
+}
+
+// TestDeleteLVViaAPI verifies POST /api/v1/storage/lv/delete submits the
+// storage_delete_lv task and returns 202 + task_id.
+func TestDeleteLVViaAPI(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	wid, _ := ws.Create(context.Background(), workers.CreateReq{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root",
+	})
+	body, _ := json.Marshal(map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+	})
+	req := httptest.NewRequest("POST", "/api/v1/storage/lv/delete", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader(t, tk))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["task_id"] == nil {
+		t.Fatalf("no task_id: %s", w.Body.String())
+	}
+}
+
+// TestListInventoryValidation verifies the sync inventory endpoint's input
+// validation: missing worker_id -> 400, unknown worker -> 404. (The 200 path
+// requires a live SSH connection and is not exercised here, matching the
+// existing listVgs coverage.)
+func TestListInventoryValidation(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	wid, _ := ws.Create(context.Background(), workers.CreateReq{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root",
+	})
+	// Missing worker_id.
+	req := httptest.NewRequest("GET", "/api/v1/storage/inventory", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing worker_id: code=%d want 400", w.Code)
+	}
+	// Unknown worker.
+	req2 := httptest.NewRequest("GET", "/api/v1/storage/inventory?worker_id=99999", nil)
+	req2.Header.Set("Authorization", authHeader(t, tk))
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusNotFound {
+		t.Fatalf("unknown worker: code=%d want 404", w2.Code)
+	}
+	// Valid worker_id but SSH unreachable -> 500 (not a 202; sync endpoint).
+	req3 := httptest.NewRequest("GET", "/api/v1/storage/inventory?worker_id="+itoa(wid), nil)
+	req3.Header.Set("Authorization", authHeader(t, tk))
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusInternalServerError {
+		t.Fatalf("valid worker unreachable: code=%d want 500", w3.Code)
+	}
+}
+
+// itoa is a tiny strconv.Itoa alias to keep imports lean in this test file.
+func itoa(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
 // TestListStorageTasksViaAPI verifies GET /api/v1/storage returns 200 and the
 // filtered list of tasks with target_kind='storage'. A provision task is
 // submitted first so the list has at least one storage task; the async task
@@ -124,8 +247,8 @@ func TestListStorageTasksViaAPI(t *testing.T) {
 	}
 }
 
-// TestStorageEndpointsRequireAuth verifies all three storage endpoints are
-// behind BearerMiddleware (authed group): no Authorization header -> 401.
+// TestStorageEndpointsRequireAuth verifies the storage endpoints are behind
+// BearerMiddleware (authed group): no Authorization header -> 401.
 func TestStorageEndpointsRequireAuth(t *testing.T) {
 	r, _, _, _ := newRouter(t)
 	endpoints := []struct {
@@ -134,6 +257,10 @@ func TestStorageEndpointsRequireAuth(t *testing.T) {
 		{"POST", "/api/v1/storage/provision"},
 		{"POST", "/api/v1/storage/reclaim"},
 		{"GET", "/api/v1/storage"},
+		{"GET", "/api/v1/storage/inventory"},
+		{"POST", "/api/v1/storage/vg"},
+		{"POST", "/api/v1/storage/lv/resize"},
+		{"POST", "/api/v1/storage/lv/delete"},
 	}
 	for _, e := range endpoints {
 		req := httptest.NewRequest(e.method, e.path, nil)

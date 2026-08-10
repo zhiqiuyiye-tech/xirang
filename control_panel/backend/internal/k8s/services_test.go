@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -67,6 +68,65 @@ func TestListServicesFiltersByManagedBy(t *testing.T) {
 	}
 	if len(svcs) != 1 || svcs[0].Name != "a" {
 		t.Fatalf("list wrong: %+v", svcs)
+	}
+}
+
+func TestListServicesForNotebooksIncludesExternal(t *testing.T) {
+	// A managed Service and an external Service co-located with a notebook pod
+	// in the same namespace must both be returned, with the Managed flag set
+	// correctly. Services in a non-notebook namespace must be excluded.
+	cs := fake.NewSimpleClientset()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "notebook-abc", Namespace: "ns-notebook", UID: "uid-1"}}
+	if _, err := cs.CoreV1().Pods("ns-notebook").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Managed by the control panel.
+	if _, err := cs.CoreV1().Services("ns-notebook").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-svc-1", Namespace: "ns-notebook", Labels: map[string]string{"managed-by": "control-panel"}},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "notebook"},
+			Ports: []corev1.ServicePort{{Port: 31555, TargetPort: intstr.FromInt(31555), NodePort: 31555, Protocol: corev1.ProtocolTCP}}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// External - created by the platform, NOT managed-by=control-panel.
+	if _, err := cs.CoreV1().Services("ns-notebook").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "notebook-multi-port-svc", Namespace: "ns-notebook"},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "notebook"},
+			Ports: []corev1.ServicePort{{Port: 32703, TargetPort: intstr.FromInt(32703), NodePort: 32703, Protocol: corev1.ProtocolTCP}}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Noise: a service in a non-notebook namespace must NOT appear.
+	if _, err := cs.CoreV1().Services("kube-system").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-dns", Namespace: "kube-system"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	svcs, err := ListServicesForNotebooks(context.Background(), cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(svcs) != 2 {
+		t.Fatalf("expected 2 services (managed + external), got %d: %+v", len(svcs), svcs)
+	}
+	byName := map[string]ServiceInfo{}
+	for _, s := range svcs {
+		byName[s.Name] = s
+	}
+	if m, ok := byName["cp-svc-1"]; !ok || !m.Managed {
+		t.Fatalf("cp-svc-1 should be managed: %+v", m)
+	}
+	if e, ok := byName["notebook-multi-port-svc"]; !ok || e.Managed {
+		t.Fatalf("notebook-multi-port-svc should be present and NOT managed: %+v", e)
+	}
+	if _, ok := byName["kube-dns"]; ok {
+		t.Fatal("kube-dns (non-notebook ns) should not be listed")
+	}
+	// Port flattening + target port resolution.
+	if got := byName["cp-svc-1"].Ports[0]; got.Port != 31555 || got.TargetPort != 31555 || got.NodePort != 31555 || got.Protocol != "TCP" {
+		t.Fatalf("port row wrong: %+v", got)
 	}
 }
 

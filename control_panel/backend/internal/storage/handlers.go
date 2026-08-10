@@ -4,20 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/ssh"
 	"xirang/control_panel/internal/tasks"
 )
 
-// RegisterStorageHandlers registers the two storage task handlers on the
-// engine: storage_provision_nfs and storage_reclaim_nfs. Each handler parses
-// task.ParamsJSON, fetches the target worker from the store, and executes the
-// provision or reclaim command sequence via the SSH runner.
+// RegisterStorageHandlers registers the storage task handlers on the engine:
+// storage_provision_nfs / storage_reclaim_nfs (LVM+NFS lifecycle), install_deps
+// (lvm2/nfs-utils), storage_create_vg (auto-pool unused disks), storage_resize_lv
+// (lvextend/lvreduce), and storage_delete_lv (generalized LV teardown). Each
+// handler parses task.ParamsJSON, fetches the target worker, and executes the
+// command sequence via the SSH runner.
 func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store) {
 	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store})
 	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store})
 	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
+	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store})
+	eng.Register("storage_resize_lv", &resizeLVHandler{runner: runner, store: store})
+	eng.Register("storage_delete_lv", &deleteLVHandler{runner: runner, store: store})
 }
 
 // --- provisionHandler ---
@@ -249,6 +255,207 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 		return fmt.Errorf("verify failed")
 	}
 	st4.Done("succeeded", out4, "", "deps installed and verified")
+	r.Succeed()
+	return nil
+}
+
+// --- createVGHandler ---
+
+// createVGHandler pvcreates each unused disk and vgcreates (new VG) or vgextends
+// (existing VG) them into one pool. The VG name defaults to vg_data. It first
+// detects whether the VG already exists so a re-run adds new disks to the
+// existing pool instead of failing on vgcreate.
+type createVGHandler struct {
+	runner ssh.Runner
+	store  *db.Store
+}
+
+func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		WorkerID int64    `json:"worker_id"`
+		VGName   string   `json:"vg_name"`
+		Disks    []string `json:"disks"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("parse params: %v", err))
+		return err
+	}
+	if p.VGName == "" {
+		p.VGName = "vg_data"
+	}
+	if err := ValidateName(p.VGName); err != nil {
+		r.Fail(fmt.Sprintf("invalid vg_name: %v", err))
+		return err
+	}
+	if len(p.Disks) == 0 {
+		r.Fail("no disks provided")
+		return fmt.Errorf("no disks provided")
+	}
+	for _, d := range p.Disks {
+		if err := ValidateDisk(d); err != nil {
+			r.Fail(fmt.Sprintf("invalid disk %q: %v", d, err))
+			return err
+		}
+	}
+	w, err := h.store.GetWorker(ctx, p.WorkerID)
+	if err != nil {
+		r.Fail(err.Error())
+		return err
+	}
+
+	// 1. detect whether the VG already exists (vgextend vs vgcreate).
+	st, err := r.Step("detect_vg")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	// `vgs <name>` exits 0 if the VG exists, non-zero otherwise; the echo gives
+	// a parseable token regardless of exit status.
+	detectCmd := fmt.Sprintf("vgs %s >/dev/null 2>&1 && echo exists || echo absent", p.VGName)
+	out, stderr, _, _ := h.runner.Run(ctx, *w, detectCmd)
+	exists := strings.Contains(out, "exists")
+	st.Done("succeeded", out, stderr, fmt.Sprintf("vg %s exists=%v", p.VGName, exists))
+
+	// 2. pvcreate each disk + vgcreate/vgextend.
+	for _, s := range CreateVGSteps(CreateVGReq{VGName: p.VGName, Disks: p.Disks, Exists: exists}) {
+		sh, err := r.Step(s.Name)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
+		if err != nil || code != 0 {
+			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
+			r.Fail(fmt.Sprintf("create vg failed at %s: %s", s.Name, stderr))
+			return fmt.Errorf("create vg failed at %s", s.Name)
+		}
+		sh.Done("succeeded", out, stderr, "")
+	}
+	r.Succeed()
+	return nil
+}
+
+// --- resizeLVHandler ---
+
+// resizeLVHandler extends (action=grow, default) or reduces (action=shrink) an
+// LV by DeltaGB, using -r so the filesystem is resized in the same operation.
+type resizeLVHandler struct {
+	runner ssh.Runner
+	store  *db.Store
+}
+
+func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		WorkerID int64  `json:"worker_id"`
+		VGName   string `json:"vg_name"`
+		LVName   string `json:"lv_name"`
+		Action   string `json:"action"`  // "grow" (default) | "shrink"
+		DeltaGB  int    `json:"delta_gb"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("parse params: %v", err))
+		return err
+	}
+	for _, f := range []string{p.VGName, p.LVName} {
+		if err := ValidateName(f); err != nil {
+			r.Fail(fmt.Sprintf("invalid param: %v", err))
+			return err
+		}
+	}
+	if p.DeltaGB <= 0 {
+		r.Fail("delta_gb must be > 0")
+		return fmt.Errorf("delta_gb must be > 0")
+	}
+	grow := p.Action != "shrink"
+	w, err := h.store.GetWorker(ctx, p.WorkerID)
+	if err != nil {
+		r.Fail(err.Error())
+		return err
+	}
+	for _, s := range ResizeLVSteps(ResizeLVReq{VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB}) {
+		sh, err := r.Step(s.Name)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
+		if err != nil || code != 0 {
+			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
+			r.Fail(fmt.Sprintf("resize failed at %s: %s", s.Name, stderr))
+			return fmt.Errorf("resize failed at %s", s.Name)
+		}
+		sh.Done("succeeded", out, stderr, "")
+	}
+	r.Succeed()
+	return nil
+}
+
+// --- deleteLVHandler ---
+
+// deleteLVHandler tears down and removes an arbitrary LV (not just ones the
+// panel provisioned), releasing its space back to the VG. It first detects the
+// mount point via findmnt so it can clean /etc/exports, umount, and clean
+// /etc/fstab before lvremove. Works for LVs created outside the control panel.
+type deleteLVHandler struct {
+	runner ssh.Runner
+	store  *db.Store
+}
+
+func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	var p struct {
+		WorkerID int64  `json:"worker_id"`
+		VGName   string `json:"vg_name"`
+		LVName   string `json:"lv_name"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("parse params: %v", err))
+		return err
+	}
+	for _, f := range []string{p.VGName, p.LVName} {
+		if err := ValidateName(f); err != nil {
+			r.Fail(fmt.Sprintf("invalid param: %v", err))
+			return err
+		}
+	}
+	w, err := h.store.GetWorker(ctx, p.WorkerID)
+	if err != nil {
+		r.Fail(err.Error())
+		return err
+	}
+	lvDev := fmt.Sprintf("/dev/%s/%s", p.VGName, p.LVName)
+
+	// 1. detect mount point. findmnt --source resolves the /dev/vg/lv symlink to
+	// the dm device, so it matches however the LV was mounted. Non-zero exit
+	// means "not mounted" (not an error): we skip the exports/umount steps.
+	st, err := r.Step("detect_mount")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	out, stderr, code, _ := h.runner.Run(ctx, *w, fmt.Sprintf("findmnt -n -o TARGET --source %s 2>/dev/null", lvDev))
+	mountPoint := strings.TrimSpace(out)
+	if code == 0 && mountPoint != "" {
+		st.Done("succeeded", out, stderr, "mounted at "+mountPoint)
+	} else {
+		mountPoint = ""
+		st.Done("succeeded", out, stderr, "not mounted")
+	}
+
+	// 2. teardown + remove.
+	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoint: mountPoint}) {
+		sh, err := r.Step(s.Name)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
+		if err != nil || code != 0 {
+			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
+			r.Fail(fmt.Sprintf("delete failed at %s: %s", s.Name, stderr))
+			return fmt.Errorf("delete failed at %s", s.Name)
+		}
+		sh.Done("succeeded", out, stderr, "")
+	}
 	r.Succeed()
 	return nil
 }
