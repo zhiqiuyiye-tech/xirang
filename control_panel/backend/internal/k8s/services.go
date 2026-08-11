@@ -94,10 +94,12 @@ func ListServices(ctx context.Context, client kubernetes.Interface, namespace st
 }
 
 // ServiceInfo is a compact, UI-facing view of a Service: its ports are
-// flattened into PortRow and a Managed flag indicates whether the control panel
-// created it (managed-by=control-panel label). Services created by other
-// systems are included so the admin can see ALL existing port mappings for
-// notebook pods, not just ours; the UI presents external ones read-only.
+// flattened into PortRow, a Managed flag indicates whether the control panel
+// created it (managed-by=control-panel label), and Pods lists the notebook pods
+// the Service routes to (selector match). Pods lets the UI show existing port
+// mappings grouped PER notebook pod instead of a flat cluster-wide list;
+// Services created by other systems are included (read-only) when they target
+// the same pod.
 type ServiceInfo struct {
 	Name      string            `json:"name"`
 	Namespace string            `json:"namespace"`
@@ -105,6 +107,13 @@ type ServiceInfo struct {
 	Selector  map[string]string `json:"selector"`
 	Managed   bool              `json:"managed"`
 	Ports     []PortRow         `json:"ports"`
+	Pods      []PodRef          `json:"pods"` // notebook pods this Service routes to (selector match); empty if none
+}
+
+// PodRef is a minimal reference to a notebook pod a Service routes to.
+type PodRef struct {
+	Name string `json:"name"`
+	UID  string `json:"uid"`
 }
 
 // PortRow is a flattened Service port for the UI.
@@ -116,10 +125,12 @@ type PortRow struct {
 }
 
 // ListServicesForNotebooks returns every Service in namespaces that contain at
-// least one notebook pod, as ServiceInfo with a Managed flag. Unlike ListServices
+// least one notebook pod, as ServiceInfo. Each Service's Pods field is
+// populated with the notebook pods it routes to (by selector match), so the UI
+// can display existing mappings grouped per notebook pod. Unlike ListServices
 // (managed-by=control-panel only), this includes Services created by other
-// systems (e.g. the platform's notebook-multi-port-svc) so the admin can see all
-// existing port mappings. Scoping to notebook-pod namespaces avoids pulling in
+// systems (e.g. the platform's notebook-multi-port-svc) when they target a
+// notebook pod. Scoping to notebook-pod namespaces avoids pulling in
 // kube-system / default noise.
 func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) ([]ServiceInfo, error) {
 	pods, err := ListNotebookPods(ctx, client)
@@ -127,8 +138,10 @@ func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) 
 		return nil, fmt.Errorf("list notebook pods: %w", err)
 	}
 	nsSet := make(map[string]struct{}, len(pods))
+	podsByNs := make(map[string][]PodInfo, len(pods))
 	for _, p := range pods {
 		nsSet[p.Namespace] = struct{}{}
+		podsByNs[p.Namespace] = append(podsByNs[p.Namespace], p)
 	}
 	out := make([]ServiceInfo, 0)
 	for ns := range nsSet {
@@ -137,10 +150,33 @@ func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) 
 			return nil, err
 		}
 		for _, s := range list.Items {
-			out = append(out, toServiceInfo(s))
+			si := toServiceInfo(s)
+			for _, p := range podsByNs[ns] {
+				if selectorMatches(s.Spec.Selector, p.Labels) {
+					si.Pods = append(si.Pods, PodRef{Name: p.Name, UID: p.UID})
+				}
+			}
+			out = append(out, si)
 		}
 	}
 	return out, nil
+}
+
+// selectorMatches reports whether a Service selector routes to a pod with the
+// given labels: every selector key must be present on the pod with the same
+// value. An empty selector (manual-endpoint Services like kube-dns) matches no
+// pod. This is the K8s Service->Pod routing semantics, used to attribute each
+// existing port mapping to the notebook pod(s) it serves.
+func selectorMatches(selector, podLabels map[string]string) bool {
+	if len(selector) == 0 {
+		return false
+	}
+	for k, v := range selector {
+		if podLabels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // toServiceInfo flattens a corev1.Service into the UI-facing ServiceInfo DTO.

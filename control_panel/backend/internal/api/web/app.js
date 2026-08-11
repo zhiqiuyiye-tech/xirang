@@ -418,47 +418,55 @@
 
     // ====================================================================
     // K8S PAGE (Pod-centric port mapping)
+    var k8sServices = []; // notebook-namespace Services, refreshed with the pod list
+
     registerRoute('/k8s', async function (content) {
         content.innerHTML = '<h2 class="page-title">端口映射 (Pod -> Service)</h2>' +
-            '<p class="muted">选择 notebook Pod,输入要映射的端口,自动创建 Service + NetworkPolicy(放行同端口)。其他字段自动填充。</p>' +
+            '<p class="muted">每个 notebook Pod 的已有端口映射(含非本面板创建的)按 Pod 分组显示。点击「端口映射」查看该 Pod 已有映射并新增。</p>' +
             '<div class="card">' +
             '<div class="section-title">Notebook Pod 列表</div>' +
             '<button class="btn btn-primary btn-sm" id="btn-load-pods">刷新 Pod 列表</button>' +
             '<div id="pods-msg" class="info-msg"></div>' +
             '<table class="data-table mt-2" id="pods-table"><thead><tr>' +
-            '<th>Pod 名称</th><th>命名空间</th><th>节点</th><th>状态</th><th>IP</th><th>操作</th>' +
-            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="6" class="muted">点击刷新加载。</td></tr></tbody></table>' +
-            '</div>' +
-            '<div class="card mt-2">' +
-            '<div class="section-title">端口映射列表 (Service)</div>' +
-            '<p class="muted" style="font-size:12px;">列出所有 notebook 命名空间下的 Service,含非本面板创建的已有映射。<span class="badge badge-success">本面板</span> 可删除,<span class="badge badge-muted">外部</span> 只读。</p>' +
-            '<div id="svc-msg" class="info-msg"></div>' +
-            '<table class="data-table mt-2" id="svc-table"><thead><tr><th>名称</th><th>命名空间</th><th>类型</th><th>外部端口(NodePort)</th><th>内部端口(Port->Target)</th><th>来源</th><th>操作</th></tr></thead>' +
-            '<tbody id="svc-tbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody></table>' +
+            '<th>Pod 名称</th><th>命名空间</th><th>节点</th><th>状态</th><th>IP</th><th>已有映射</th><th>操作</th>' +
+            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="7" class="muted">点击刷新加载。</td></tr></tbody></table>' +
             '</div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
         loadPods(content);
-        listSvcs(content);
     });
+
+    // servicesForPod returns the cached Services that route to the given pod
+    // (selector match, attributed by the backend via the pods field).
+    function servicesForPod(podUid) {
+        return k8sServices.filter(function (s) {
+            return (s.pods || []).some(function (p) { return p.uid === podUid; });
+        });
+    }
 
     async function loadPods(content) {
         var tbody = document.getElementById('pods-tbody');
         var msgEl = document.getElementById('pods-msg');
-        tbody.innerHTML = '<tr><td colspan="6" class="muted">加载中...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="muted">加载中...</td></tr>';
         try {
-            var r = await apiJSON('/k8s/pods');
-            if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
-            var pods = r.data || [];
-            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="6" class="muted">未找到 notebook Pod(name 含 notebook)。</td></tr>'; return; }
+            // Load pods and Services in parallel; Services are cached so the
+            // per-pod "已有映射" count and the port-mapping modal can render them.
+            var results = await Promise.all([apiJSON('/k8s/pods'), apiJSON('/k8s/services')]);
+            var pr = results[0], sr = results[1];
+            if (!pr.resp.ok) { setMsg(msgEl, '错误: ' + (pr.data && pr.data.error), 'error'); tbody.innerHTML = ''; return; }
+            k8sServices = (sr.resp.ok && Array.isArray(sr.data)) ? sr.data : [];
+            var pods = pr.data || [];
+            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">未找到 notebook Pod(name 含 notebook)。</td></tr>'; return; }
             tbody.innerHTML = pods.map(function (p) {
+                var cnt = servicesForPod(p.uid).length;
                 return '<tr>' +
                     '<td>' + esc(p.name) + '</td>' +
                     '<td>' + esc(p.namespace) + '</td>' +
                     '<td>' + esc(p.node) + '</td>' +
                     '<td>' + statusBadge(p.status) + '</td>' +
                     '<td>' + esc((p.ips || []).join(', ')) + '</td>' +
-                    '<td><button class="btn btn-sm btn-success" data-pod=\'' + esc(JSON.stringify(p)) + '\'>映射端口</button></td>' +
+                    '<td>' + (cnt > 0 ? '<span class="badge badge-success">' + cnt + '</span>' : '<span class="muted">-</span>') + '</td>' +
+                    '<td><button class="btn btn-sm btn-success" data-pod=\'' + esc(JSON.stringify(p)) + '\'>端口映射</button></td>' +
                     '</tr>';
             }).join('');
             tbody.querySelectorAll('button[data-pod]').forEach(function (btn) {
@@ -472,7 +480,12 @@
 
     async function showPortMappingForm(content, pod) {
         var html = '<div class="modal-overlay" id="port-modal"><div class="modal">' +
-            '<h3 class="modal-title">映射端口 - ' + esc(pod.name) + '</h3>' +
+            '<h3 class="modal-title">端口映射 - ' + esc(pod.name) + '</h3>' +
+            '<div class="card"><div class="section-title">该 Pod 已有的端口映射</div>' +
+            '<p class="muted" style="font-size:12px;">含非本面板创建的已有映射。<span class="badge badge-success">本面板</span> 可删除,<span class="badge badge-muted">外部</span> 只读。</p>' +
+            '<table class="data-table" id="pod-svc-table"><thead><tr><th>名称</th><th>类型</th><th>外部端口(NodePort)</th><th>内部端口(Port->Target)</th><th>来源</th><th>操作</th></tr></thead>' +
+            '<tbody id="pod-existing-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table></div>' +
+            '<div class="card mt-2"><div class="section-title">新增端口映射</div>' +
             '<p class="muted">Service 与 NetworkPolicy 自动绑定到该 Pod(随 Pod 生命周期自动删除)。只需输入要映射的端口。</p>' +
             '<form id="port-form">' +
             '<div class="form-field"><label>命名空间</label><input type="text" name="namespace" value="' + esc(pod.namespace) + '" readonly></div>' +
@@ -485,6 +498,7 @@
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('port-modal');
         document.getElementById('port-cancel').addEventListener('click', function () { modal.remove(); });
+        renderExistingMappings(modal, pod);
         document.getElementById('port-form').addEventListener('submit', async function (e) {
             e.preventDefault();
             var f = e.target;
@@ -508,42 +522,44 @@
         });
     }
 
-    async function listSvcs(content) {
-        var tbody = document.getElementById('svc-tbody');
-        var msgEl = document.getElementById('svc-msg');
-        tbody.innerHTML = '<tr><td colspan="7" class="muted">加载中...</td></tr>';
-        try {
-            var r = await apiJSON('/k8s/services');
-            if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); tbody.innerHTML = ''; return; }
-            var svcs = r.data || [];
-            if (!Array.isArray(svcs) || svcs.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无端口映射。</td></tr>'; return; }
-            // Managed (ours) first, then external - ours are the actionable ones.
-            svcs.sort(function (a, b) { return (a.managed === b.managed) ? 0 : (a.managed ? -1 : 1); });
-            tbody.innerHTML = svcs.map(function (s) {
-                var ports = s.ports || [];
-                var extPorts = ports.length ? ports.map(function (p) { return (p.node_port || '-') + '/' + (p.protocol || 'TCP'); }).join(', ') : '-';
-                var intPorts = ports.length ? ports.map(function (p) { return p.port + '->' + (p.target_port || p.port); }).join(', ') : '-';
-                var srcBadge = s.managed ? '<span class="badge badge-success">本面板</span>' : '<span class="badge badge-muted">外部</span>';
-                var action = s.managed
-                    ? '<button class="btn btn-sm btn-danger" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">删除</button>'
-                    : '<span class="muted" style="font-size:12px;">只读</span>';
-                return '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.namespace) + '</td><td>' + esc(s.type) + '</td><td>' + esc(extPorts) + '</td><td>' + esc(intPorts) + '</td><td>' + srcBadge + '</td>' +
-                    '<td>' + action + '</td></tr>';
-            }).join('');
-            tbody.querySelectorAll('button[data-name]').forEach(function (btn) {
-                btn.addEventListener('click', async function () {
-                    if (!confirm('确认删除 Service ' + this.getAttribute('data-name') + '?')) return;
-                    var name = this.getAttribute('data-name');
-                    var ns2 = this.getAttribute('data-ns');
-                    try {
-                        var r = await apiJSON('/k8s/services/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
-                        if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
-                        var taskID = r.data && r.data.task_id;
-                        if (taskID) window.location.hash = '#/tasks/' + taskID; else listSvcs(content);
-                    } catch (err) { alert('错误: ' + err.message); }
-                });
+    // renderExistingMappings fills the modal's "该 Pod 已有的端口映射" table with
+    // the cached Services that route to this pod (managed + external). Managed
+    // rows get a delete button; external rows are read-only. Delete navigates
+    // to the task page (async, consistent with create).
+    function renderExistingMappings(scope, pod) {
+        var el = scope.querySelector('#pod-existing-tbody');
+        if (!el) return;
+        var mine = servicesForPod(pod.uid);
+        if (mine.length === 0) {
+            el.innerHTML = '<tr><td colspan="6" class="muted">该 Pod 暂无已有端口映射。</td></tr>';
+            return;
+        }
+        // Managed (ours) first, then external - ours are the actionable ones.
+        mine.sort(function (a, b) { return (a.managed === b.managed) ? 0 : (a.managed ? -1 : 1); });
+        el.innerHTML = mine.map(function (s) {
+            var ports = s.ports || [];
+            var extPorts = ports.length ? ports.map(function (p) { return (p.node_port || '-') + '/' + (p.protocol || 'TCP'); }).join(', ') : '-';
+            var intPorts = ports.length ? ports.map(function (p) { return p.port + '->' + (p.target_port || p.port); }).join(', ') : '-';
+            var srcBadge = s.managed ? '<span class="badge badge-success">本面板</span>' : '<span class="badge badge-muted">外部</span>';
+            var action = s.managed
+                ? '<button class="btn btn-sm btn-danger" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">删除</button>'
+                : '<span class="muted" style="font-size:12px;">只读</span>';
+            return '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.type) + '</td><td>' + esc(extPorts) + '</td><td>' + esc(intPorts) + '</td><td>' + srcBadge + '</td>' +
+                '<td>' + action + '</td></tr>';
+        }).join('');
+        el.querySelectorAll('button[data-name]').forEach(function (btn) {
+            btn.addEventListener('click', async function () {
+                if (!confirm('确认删除 Service ' + this.getAttribute('data-name') + '?')) return;
+                var name = this.getAttribute('data-name');
+                var ns2 = this.getAttribute('data-ns');
+                try {
+                    var r = await apiJSON('/k8s/services/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
+                    if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
+                    var taskID = r.data && r.data.task_id;
+                    if (taskID) window.location.hash = '#/tasks/' + taskID;
+                } catch (err) { alert('错误: ' + err.message); }
             });
-        } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+        });
     }
 
     registerRoute('/storage', async function (content) {

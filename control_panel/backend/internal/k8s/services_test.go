@@ -72,27 +72,42 @@ func TestListServicesFiltersByManagedBy(t *testing.T) {
 }
 
 func TestListServicesForNotebooksIncludesExternal(t *testing.T) {
-	// A managed Service and an external Service co-located with a notebook pod
-	// in the same namespace must both be returned, with the Managed flag set
-	// correctly. Services in a non-notebook namespace must be excluded.
+	// A managed Service and an external Service that both route to a notebook
+	// pod (selector matches the pod's labels) must be returned and attributed to
+	// that pod via Pods[]. A Service whose selector matches NO notebook pod is
+	// still listed but with empty Pods. A Service in a non-notebook namespace is
+	// excluded entirely.
 	cs := fake.NewSimpleClientset()
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "notebook-abc", Namespace: "ns-notebook", UID: "uid-1"}}
+	// Notebook pod with labels that both Services select on.
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "notebook-abc", Namespace: "ns-notebook", UID: "uid-1",
+		Labels: map[string]string{"app": "nb-1"},
+	}}
 	if _, err := cs.CoreV1().Pods("ns-notebook").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	// Managed by the control panel.
+	// Managed by the control panel; selector matches the pod.
 	if _, err := cs.CoreV1().Services("ns-notebook").Create(context.Background(), &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "cp-svc-1", Namespace: "ns-notebook", Labels: map[string]string{"managed-by": "control-panel"}},
-		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "notebook"},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "nb-1"},
 			Ports: []corev1.ServicePort{{Port: 31555, TargetPort: intstr.FromInt(31555), NodePort: 31555, Protocol: corev1.ProtocolTCP}}},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	// External - created by the platform, NOT managed-by=control-panel.
+	// External - created by the platform, selector also matches the pod.
 	if _, err := cs.CoreV1().Services("ns-notebook").Create(context.Background(), &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "notebook-multi-port-svc", Namespace: "ns-notebook"},
-		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "notebook"},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "nb-1"},
 			Ports: []corev1.ServicePort{{Port: 32703, TargetPort: intstr.FromInt(32703), NodePort: 32703, Protocol: corev1.ProtocolTCP}}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// A Service in the notebook namespace whose selector matches NO notebook pod:
+	// still listed (it's in a notebook namespace) but Pods must be empty, so the
+	// per-notebook UI won't attribute it to any pod.
+	if _, err := cs.CoreV1().Services("ns-notebook").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "unmatched-svc", Namespace: "ns-notebook"},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, Selector: map[string]string{"app": "other"}},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -108,13 +123,14 @@ func TestListServicesForNotebooksIncludesExternal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(svcs) != 2 {
-		t.Fatalf("expected 2 services (managed + external), got %d: %+v", len(svcs), svcs)
+	if len(svcs) != 3 {
+		t.Fatalf("expected 3 services, got %d: %+v", len(svcs), svcs)
 	}
 	byName := map[string]ServiceInfo{}
 	for _, s := range svcs {
 		byName[s.Name] = s
 	}
+	// Managed flag.
 	if m, ok := byName["cp-svc-1"]; !ok || !m.Managed {
 		t.Fatalf("cp-svc-1 should be managed: %+v", m)
 	}
@@ -124,9 +140,42 @@ func TestListServicesForNotebooksIncludesExternal(t *testing.T) {
 	if _, ok := byName["kube-dns"]; ok {
 		t.Fatal("kube-dns (non-notebook ns) should not be listed")
 	}
+	// Pod attribution: both pod-targeting Services route to notebook-abc.
+	wantPod := PodRef{Name: "notebook-abc", UID: "uid-1"}
+	for _, name := range []string{"cp-svc-1", "notebook-multi-port-svc"} {
+		s := byName[name]
+		if len(s.Pods) != 1 || s.Pods[0] != wantPod {
+			t.Fatalf("%s should route to notebook-abc, got Pods=%+v", name, s.Pods)
+		}
+	}
+	// The unmatched Service routes to no notebook pod.
+	if u := byName["unmatched-svc"]; len(u.Pods) != 0 {
+		t.Fatalf("unmatched-svc should have empty Pods, got %+v", u.Pods)
+	}
 	// Port flattening + target port resolution.
 	if got := byName["cp-svc-1"].Ports[0]; got.Port != 31555 || got.TargetPort != 31555 || got.NodePort != 31555 || got.Protocol != "TCP" {
 		t.Fatalf("port row wrong: %+v", got)
+	}
+}
+
+func TestSelectorMatches(t *testing.T) {
+	podLabels := map[string]string{"app": "nb-1", "tier": "web"}
+	cases := []struct {
+		name     string
+		selector map[string]string
+		want     bool
+	}{
+		{"exact match", map[string]string{"app": "nb-1", "tier": "web"}, true},
+		{"subset match", map[string]string{"app": "nb-1"}, true},
+		{"wrong value", map[string]string{"app": "nb-2"}, false},
+		{"missing key", map[string]string{"env": "prod"}, false},
+		{"empty selector matches nothing", map[string]string{}, false},
+		{"nil selector matches nothing", nil, false},
+	}
+	for _, c := range cases {
+		if got := selectorMatches(c.selector, podLabels); got != c.want {
+			t.Fatalf("%s: selectorMatches=%v want %v", c.name, got, c.want)
+		}
 	}
 }
 

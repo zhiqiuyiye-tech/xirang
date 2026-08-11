@@ -87,27 +87,29 @@ func TestCreateServiceViaAPI(t *testing.T) {
 // TestListServicesViaAPI verifies the sync list path: GET /api/v1/k8s/services
 // returns 200 and the JSON array of ServiceInfo for every Service in notebook
 // namespaces - including ones NOT created by the control panel (external), each
-// carrying a managed flag so the UI can mark ours vs read-only external.
+// carrying a managed flag and the notebook pod(s) it routes to (pods field) so
+// the UI can show existing mappings grouped per notebook pod.
 func TestListServicesViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
 	// A notebook pod in ns1 makes ns1 a "notebook namespace" so its Services are
-	// included. Without it, ListServicesForNotebooks would skip ns1 entirely.
+	// included. Labels let selector-matching attribute Services to this pod.
 	if _, err := cs.CoreV1().Pods("ns1").Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "notebook-abc", Namespace: "ns1", UID: "u1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "notebook-abc", Namespace: "ns1", UID: "u1", Labels: map[string]string{"app": "nb-1"}},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	// A managed Service (ours).
+	// A managed Service (ours) selecting the pod.
 	if _, err := cs.CoreV1().Services("ns1").Create(context.Background(), &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "cp-svc-1", Namespace: "ns1", Labels: map[string]string{"managed-by": "control-panel"}},
-		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Ports: []corev1.ServicePort{{Port: 31555, NodePort: 31555, Protocol: "TCP"}}},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "nb-1"}, Ports: []corev1.ServicePort{{Port: 31555, NodePort: 31555, Protocol: "TCP"}}},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	// An external Service (not managed by us) - must also be listed, read-only.
+	// An external Service (not managed by us) selecting the same pod - must also
+	// be listed, read-only, and attributed to the pod.
 	if _, err := cs.CoreV1().Services("ns1").Create(context.Background(), &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "external-svc", Namespace: "ns1"},
-		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeNodePort, Selector: map[string]string{"app": "nb-1"}},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +137,17 @@ func TestListServicesViaAPI(t *testing.T) {
 	}
 	if e, ok := byName["external-svc"]; !ok || e["managed"] != false {
 		t.Fatalf("external-svc should be present and not managed: %+v", e)
+	}
+	// Both Services route to notebook-abc (pods field attributed).
+	for _, name := range []string{"cp-svc-1", "external-svc"} {
+		pods, _ := byName[name]["pods"].([]any)
+		if len(pods) != 1 {
+			t.Fatalf("%s should route to 1 pod, got %v", name, byName[name]["pods"])
+		}
+		first, _ := pods[0].(map[string]any)
+		if first["name"] != "notebook-abc" || first["uid"] != "u1" {
+			t.Fatalf("%s pod attribution wrong: %+v", name, first)
+		}
 	}
 }
 
