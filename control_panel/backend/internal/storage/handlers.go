@@ -261,10 +261,13 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 
 // --- createVGHandler ---
 
-// createVGHandler pvcreates each unused disk and vgcreates (new VG) or vgextends
-// (existing VG) them into one pool. The VG name defaults to vg_data. It first
-// detects whether the VG already exists so a re-run adds new disks to the
-// existing pool instead of failing on vgcreate.
+// createVGHandler pvcreates each unused disk and vgcreates a SEPARATE VG per
+// disk (named <prefix>_<basename>, e.g. vg_data_sdb), rather than merging all
+// disks into one VG. One-VG-per-disk sidesteps LVM's same-physical-block-size
+// constraint, so disks of different sector sizes (512e vs 4Kn) can coexist. The
+// VG name prefix defaults to vg_data. For each disk it first checks whether the
+// derived VG name is already taken; if so it skips that disk (idempotent) so a
+// re-run doesn't fail on a VG that already exists.
 type createVGHandler struct {
 	runner ssh.Runner
 	store  *db.Store
@@ -273,7 +276,7 @@ type createVGHandler struct {
 func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
 	var p struct {
 		WorkerID int64    `json:"worker_id"`
-		VGName   string   `json:"vg_name"`
+		VGName   string   `json:"vg_name"` // VG name PREFIX; each disk becomes <prefix>_<basename>
 		Disks    []string `json:"disks"`
 	}
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
@@ -284,7 +287,7 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		p.VGName = "vg_data"
 	}
 	if err := ValidateName(p.VGName); err != nil {
-		r.Fail(fmt.Sprintf("invalid vg_name: %v", err))
+		r.Fail(fmt.Sprintf("invalid vg_name prefix: %v", err))
 		return err
 	}
 	if len(p.Disks) == 0 {
@@ -303,33 +306,44 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return err
 	}
 
-	// 1. detect whether the VG already exists (vgextend vs vgcreate).
-	st, err := r.Step("detect_vg")
-	if err != nil {
-		r.Fail(fmt.Sprintf("create step: %v", err))
-		return err
-	}
-	// `vgs <name>` exits 0 if the VG exists, non-zero otherwise; the echo gives
-	// a parseable token regardless of exit status.
-	detectCmd := fmt.Sprintf("vgs %s >/dev/null 2>&1 && echo exists || echo absent", p.VGName)
-	out, stderr, _, _ := h.runner.Run(ctx, *w, detectCmd)
-	exists := strings.Contains(out, "exists")
-	st.Done("succeeded", out, stderr, fmt.Sprintf("vg %s exists=%v", p.VGName, exists))
-
-	// 2. pvcreate each disk + vgcreate/vgextend.
-	for _, s := range CreateVGSteps(CreateVGReq{VGName: p.VGName, Disks: p.Disks, Exists: exists}) {
-		sh, err := r.Step(s.Name)
+	// Per disk: detect whether the derived VG already exists; if so skip it
+	// (idempotent). pvcreate is still safe to re-run, but vgcreate fails on an
+	// existing name, so we skip the whole disk to avoid a confusing failure.
+	for _, d := range p.Disks {
+		vg := VGNameForDisk(p.VGName, d)
+		detect, err := r.Step("detect_vg:" + vg)
 		if err != nil {
 			r.Fail(fmt.Sprintf("create step: %v", err))
 			return err
 		}
-		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
-		if err != nil || code != 0 {
-			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
-			r.Fail(fmt.Sprintf("create vg failed at %s: %s", s.Name, stderr))
-			return fmt.Errorf("create vg failed at %s", s.Name)
+		// `vgs <name>` exits 0 if the VG exists, non-zero otherwise; the echo
+		// gives a parseable token regardless of exit status.
+		out, stderr, _, _ := h.runner.Run(ctx, *w, fmt.Sprintf("vgs %s >/dev/null 2>&1 && echo exists || echo absent", vg))
+		exists := strings.Contains(out, "exists")
+		if exists {
+			detect.Done("succeeded", out, stderr, "vg "+vg+" already exists, skipping disk "+d)
+			continue
 		}
-		sh.Done("succeeded", out, stderr, "")
+		detect.Done("succeeded", out, stderr, "vg "+vg+" absent, will create")
+
+		// pvcreate + vgcreate for this disk only.
+		for _, s := range []Step{
+			{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("wipefs -a %s && pvcreate %s", d, d)},
+			{Name: "vgcreate:" + vg, Cmd: fmt.Sprintf("vgcreate %s %s", vg, d)},
+		} {
+			sh, err := r.Step(s.Name)
+			if err != nil {
+				r.Fail(fmt.Sprintf("create step: %v", err))
+				return err
+			}
+			out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
+			if err != nil || code != 0 {
+				sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
+				r.Fail(fmt.Sprintf("create vg failed at %s: %s", s.Name, stderr))
+				return fmt.Errorf("create vg failed at %s", s.Name)
+			}
+			sh.Done("succeeded", out, stderr, "")
+		}
 	}
 	r.Succeed()
 	return nil

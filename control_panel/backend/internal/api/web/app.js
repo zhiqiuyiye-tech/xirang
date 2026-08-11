@@ -652,7 +652,7 @@
                 var disks = inv.unused_disks || [];
                 if (disks.length > 0) {
                     btnInit.disabled = false;
-                    summary.textContent = '发现 ' + disks.length + ' 块未挂载盘可创建 VG 池。';
+                    summary.textContent = '发现 ' + disks.length + ' 块未挂载盘可创建 VG(每盘一个独立 VG)。';
                 } else {
                     summary.textContent = '无未挂载盘可用于新建 VG 池。';
                 }
@@ -761,25 +761,34 @@
     // Init VG pool modal: lists unused disks (checkboxes, default all) + vg name.
     async function showInitVGForm(content, wid, disks, onDone) {
         if (!disks || disks.length === 0) { alert('该节点没有未挂载盘可用于创建 VG 池。'); return; }
-        var diskRows = disks.map(function (d, i) {
-            return '<label style="display:block;margin:4px 0;"><input type="checkbox" data-disk="' + esc(d.name) + '" checked> ' + esc(d.name) + ' <span class="muted">(' + (d.size_gb || 0).toFixed(1) + ' GB)</span></label>';
-        }).join('');
+        // Derived per-disk VG name preview = prefix + "_" + basename.
+        function vgFor(disk, prefix) { return prefix + '_' + disk.split('/').pop(); }
+        function renderDiskRows(prefix) {
+            return disks.map(function (d) {
+                return '<label style="display:block;margin:4px 0;"><input type="checkbox" data-disk="' + esc(d.name) + '" checked> ' + esc(d.name) + ' <span class="muted">(' + (d.size_gb || 0).toFixed(1) + ' GB) -> VG ' + esc(vgFor(d.name, prefix)) + '</span></label>';
+            }).join('');
+        }
         var html = '<div class="modal-overlay" id="vg-modal"><div class="modal">' +
             '<h3 class="modal-title">初始化 VG 池</h3>' +
-            '<p class="muted">把以下未挂载盘 pvcreate 后合并成一个 VG(已有同名 VG 则 vgextend 加入)。<b>会擦除盘上现有数据。</b></p>' +
-            '<div class="form-field"><label>VG 名称</label><input type="text" id="vg-name-input" value="vg_data"></div>' +
-            '<div class="form-field"><label>未挂载盘</label>' + diskRows + '</div>' +
+            '<p class="muted">每块盘创建一个独立 VG(命名 <VG前缀>_<盘名>,如 vg_data_sdb),<b>不合并</b>--这样不同扇区大小(512e/4Kn)的盘也能共存。已存在的同名 VG 会跳过。<b>会擦除盘上现有数据。</b></p>' +
+            '<div class="form-field"><label>VG 名称前缀</label><input type="text" id="vg-name-input" value="vg_data"></div>' +
+            '<div class="form-field"><label>未挂载盘</label><div id="vg-disk-list">' + renderDiskRows('vg_data') + '</div></div>' +
             '<button type="button" class="btn btn-primary" id="vg-create-btn">创建</button> ' +
             '<button type="button" class="btn btn-link" id="vg-cancel" style="color:#555;">取消</button>' +
             '<div id="vg-msg" class="error-msg"></div></div></div>';
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('vg-modal');
+        var nameInput = document.getElementById('vg-name-input');
+        // Re-render the per-disk VG preview as the prefix changes.
+        nameInput.addEventListener('input', function () {
+            document.getElementById('vg-disk-list').innerHTML = renderDiskRows(nameInput.value.trim() || 'vg_data');
+        });
         document.getElementById('vg-cancel').addEventListener('click', function () { modal.remove(); });
         document.getElementById('vg-create-btn').addEventListener('click', async function () {
-            var vgName = document.getElementById('vg-name-input').value.trim();
+            var vgName = nameInput.value.trim();
             var chosen = Array.from(modal.querySelectorAll('input[data-disk]:checked')).map(function (c) { return c.getAttribute('data-disk'); });
             var msgEl = document.getElementById('vg-msg');
-            if (!vgName) { setMsg(msgEl, '请输入 VG 名称', 'error'); return; }
+            if (!vgName) { setMsg(msgEl, '请输入 VG 名称前缀', 'error'); return; }
             if (chosen.length === 0) { setMsg(msgEl, '至少选择一块盘', 'error'); return; }
             try {
                 var r = await apiJSON('/storage/vg', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: vgName, disks: chosen }) });

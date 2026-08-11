@@ -103,37 +103,46 @@ func ReclaimSteps(r ReclaimReq) []Step {
 // --- VG pool creation ---
 
 // CreateVGReq holds parameters for building a create-VG command sequence.
-// Exists controls whether the VG already exists (vgextend) or not (vgcreate).
+// Each disk becomes its OWN VG (vgcreate one disk per VG), which sidesteps
+// LVM's same-physical-block-size constraint that blocks mixing disks of
+// different sector sizes (512e vs 4Kn) into one VG. VGNamePrefix gives each
+// disk a distinct VG name derived from the prefix + disk basename
+// (e.g. prefix "vg_data" + "/dev/sdb" -> "vg_data_sdb").
 type CreateVGReq struct {
-	VGName string
-	Disks  []string
-	Exists bool
+	VGNamePrefix string
+	Disks        []string
 }
 
-// CreateVGSteps builds the sequence: wipefs+pvcreate each disk, then vgcreate
-// (new VG) or vgextend (existing VG). Each disk is its own step so a single
-// disk failure aborts before the VG change and the failure names which disk.
+// VGNameForDisk derives a VG name for a single disk: prefix + "_" + the disk's
+// basename (basename of "/dev/sdb" is "sdb"). The caller validates the prefix;
+// the basename is alnum so the result passes ValidateName.
+func VGNameForDisk(prefix, disk string) string {
+	return prefix + "_" + BaseName(disk)
+}
+
+// BaseName returns the last path segment of disk (e.g. "/dev/sdb" -> "sdb").
+// Exported for tests.
+func BaseName(path string) string {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
+
+// CreateVGSteps builds, per disk: wipefs + pvcreate + vgcreate. Each disk is its
+// own VG so disks of different physical block sizes can coexist (LVM otherwise
+// refuses to mix them in one VG). Each disk is its own step pair so a single
+// disk failure aborts before later disks and the failure names which disk.
 // wipefs first ensures pvcreate does not prompt on stale filesystem signatures
 // (which would hang the non-interactive SSH session).
 func CreateVGSteps(r CreateVGReq) []Step {
-	steps := make([]Step, 0, len(r.Disks)*2+1)
+	steps := make([]Step, 0, len(r.Disks)*2)
 	for _, d := range r.Disks {
-		steps = append(steps, Step{
-			Name: "pvcreate:" + d,
-			Cmd:  fmt.Sprintf("wipefs -a %s && pvcreate %s", d, d),
-		})
-	}
-	joined := strings.Join(r.Disks, " ")
-	if r.Exists {
-		steps = append(steps, Step{
-			Name: "vgextend",
-			Cmd:  fmt.Sprintf("vgextend %s %s", r.VGName, joined),
-		})
-	} else {
-		steps = append(steps, Step{
-			Name: "vgcreate",
-			Cmd:  fmt.Sprintf("vgcreate %s %s", r.VGName, joined),
-		})
+		vg := VGNameForDisk(r.VGNamePrefix, d)
+		steps = append(steps,
+			Step{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("wipefs -a %s && pvcreate %s", d, d)},
+			Step{Name: "vgcreate:" + vg, Cmd: fmt.Sprintf("vgcreate %s %s", vg, d)},
+		)
 	}
 	return steps
 }

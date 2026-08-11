@@ -75,29 +75,51 @@ func TestValidateDisk(t *testing.T) {
 }
 
 func TestCreateVGSteps_New(t *testing.T) {
-	steps := CreateVGSteps(CreateVGReq{VGName: "vg_data", Disks: []string{"/dev/sdb", "/dev/sdc"}, Exists: false})
-	// 2 pvcreate + 1 vgcreate
-	if len(steps) != 3 {
-		t.Fatalf("expected 3 steps, got %d", len(steps))
+	// Each disk becomes its OWN VG: 2 disks -> 2x (pvcreate + vgcreate) = 4 steps.
+	// The VG name is derived from the prefix + disk basename (vg_data + sdb -> vg_data_sdb).
+	steps := CreateVGSteps(CreateVGReq{VGNamePrefix: "vg_data", Disks: []string{"/dev/sdb", "/dev/sdc"}})
+	if len(steps) != 4 {
+		t.Fatalf("expected 4 steps (2 disks x 2), got %d", len(steps))
 	}
 	if steps[0].Name != "pvcreate:/dev/sdb" || steps[0].Cmd != "wipefs -a /dev/sdb && pvcreate /dev/sdb" {
 		t.Fatalf("pvcreate sdb wrong: %+v", steps[0])
 	}
-	if steps[1].Name != "pvcreate:/dev/sdc" {
-		t.Fatalf("pvcreate sdc wrong: %+v", steps[1])
+	if steps[1].Name != "vgcreate:vg_data_sdb" || steps[1].Cmd != "vgcreate vg_data_sdb /dev/sdb" {
+		t.Fatalf("vgcreate sdb wrong: %+v", steps[1])
 	}
-	if steps[2].Name != "vgcreate" || steps[2].Cmd != "vgcreate vg_data /dev/sdb /dev/sdc" {
-		t.Fatalf("vgcreate wrong: %+v", steps[2])
+	if steps[2].Name != "pvcreate:/dev/sdc" {
+		t.Fatalf("pvcreate sdc wrong: %+v", steps[2])
+	}
+	if steps[3].Name != "vgcreate:vg_data_sdc" || steps[3].Cmd != "vgcreate vg_data_sdc /dev/sdc" {
+		t.Fatalf("vgcreate sdc wrong: %+v", steps[3])
 	}
 }
 
-func TestCreateVGSteps_Extend(t *testing.T) {
-	steps := CreateVGSteps(CreateVGReq{VGName: "vg_data", Disks: []string{"/dev/sdc"}, Exists: true})
+func TestCreateVGSteps_NvmeName(t *testing.T) {
+	// NVMe disks (/dev/nvme0n1) keep their full basename in the VG name.
+	steps := CreateVGSteps(CreateVGReq{VGNamePrefix: "vg_data", Disks: []string{"/dev/nvme0n1"}})
 	if len(steps) != 2 {
 		t.Fatalf("expected 2 steps, got %d", len(steps))
 	}
-	if steps[1].Name != "vgextend" || steps[1].Cmd != "vgextend vg_data /dev/sdc" {
-		t.Fatalf("vgextend wrong: %+v", steps[1])
+	if steps[1].Name != "vgcreate:vg_data_nvme0n1" || steps[1].Cmd != "vgcreate vg_data_nvme0n1 /dev/nvme0n1" {
+		t.Fatalf("nvme vgcreate wrong: %+v", steps[1])
+	}
+}
+
+func TestVGNameForDisk(t *testing.T) {
+	cases := []struct{ prefix, disk, want string }{
+		{"vg_data", "/dev/sdb", "vg_data_sdb"},
+		{"vg_data", "/dev/nvme0n1", "vg_data_nvme0n1"},
+		{"vg", "/dev/disk/by-id/wwn-0x5000c500a", "vg_wwn-0x5000c500a"},
+	}
+	for _, c := range cases {
+		if got := VGNameForDisk(c.prefix, c.disk); got != c.want {
+			t.Fatalf("VGNameForDisk(%q,%q)=%q want %q", c.prefix, c.disk, got, c.want)
+		}
+		// The derived name must pass ValidateName (no shell metacharacters).
+		if err := ValidateName(VGNameForDisk(c.prefix, c.disk)); err != nil {
+			t.Fatalf("derived VG name %q fails ValidateName: %v", c.disk, err)
+		}
 	}
 }
 
