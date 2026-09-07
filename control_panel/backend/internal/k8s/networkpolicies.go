@@ -77,7 +77,8 @@ func DeleteNetworkPolicy(ctx context.Context, client kubernetes.Interface, names
 // managed by the control panel (filtered by managed-by=control-panel).
 func ListNetworkPolicies(ctx context.Context, client kubernetes.Interface, namespace string) ([]networkingv1.NetworkPolicy, error) {
 	list, err := client.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "managed-by=control-panel",
+		LabelSelector:  "managed-by=control-panel",
+		ResourceVersion: "0",
 	})
 	if err != nil {
 		return nil, err

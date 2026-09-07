@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,7 +86,8 @@ func DeleteService(ctx context.Context, client kubernetes.Interface, namespace, 
 // control panel (filtered by managed-by=control-panel).
 func ListServices(ctx context.Context, client kubernetes.Interface, namespace string) ([]corev1.Service, error) {
 	list, err := client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "managed-by=control-panel",
+		LabelSelector:  "managed-by=control-panel",
+		ResourceVersion: "0",
 	})
 	if err != nil {
 		return nil, err
@@ -132,6 +134,11 @@ type PortRow struct {
 // systems (e.g. the platform's notebook-multi-port-svc) when they target a
 // notebook pod. Scoping to notebook-pod namespaces avoids pulling in
 // kube-system / default noise.
+//
+// The per-namespace Service lists run concurrently (bounded fan-out) - the
+// sequential N+1 added up to (n x RTT) latency on this synchronous HTTP
+// endpoint. Lists are served from the API server watch cache
+// (ResourceVersion=0), skipping the etcd quorum read.
 func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) ([]ServiceInfo, error) {
 	pods, err := ListNotebookPods(ctx, client)
 	if err != nil {
@@ -144,20 +151,45 @@ func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) 
 		podsByNs[p.Namespace] = append(podsByNs[p.Namespace], p)
 	}
 	out := make([]ServiceInfo, 0)
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+	)
+	sem := make(chan struct{}, 8) // bound the fan-out
 	for ns := range nsSet {
-		list, err := client.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, s := range list.Items {
-			si := toServiceInfo(s)
-			for _, p := range podsByNs[ns] {
-				if selectorMatches(s.Spec.Selector, p.Labels) {
-					si.Pods = append(si.Pods, PodRef{Name: p.Name, UID: p.UID})
+		wg.Add(1)
+		go func(ns string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			list, err := client.CoreV1().Services(ns).List(ctx, metav1.ListOptions{
+				ResourceVersion: "0",
+			})
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("list services in %s: %w", ns, err)
 				}
+				mu.Unlock()
+				return
 			}
-			out = append(out, si)
-		}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, s := range list.Items {
+				si := toServiceInfo(s)
+				for _, p := range podsByNs[ns] {
+					if selectorMatches(s.Spec.Selector, p.Labels) {
+						si.Pods = append(si.Pods, PodRef{Name: p.Name, UID: p.UID})
+					}
+				}
+				out = append(out, si)
+			}
+		}(ns)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return out, nil
 }

@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,6 +207,31 @@ func TestDeleteNPHandlerDeletesNetworkPolicy(t *testing.T) {
 	}
 	if len(nps) != 0 {
 		t.Fatalf("expected 0 np after delete, got %d", len(nps))
+	}
+}
+
+// TestNilClientFailsTask verifies the nil-client guard: a k8s task submitted
+// while the panel runs without an in-cluster client (main.go registers the
+// handlers even then) fails cleanly instead of nil-deref panicking inside the
+// engine goroutine.
+func TestNilClientFailsTask(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	RegisterK8sHandlers(eng, nil) // nil client = non-cluster mode
+
+	for _, typeName := range []string{"k8s_create_svc", "k8s_delete_svc", "k8s_create_np", "k8s_delete_np"} {
+		id, err := eng.Submit(context.Background(), typeName, "k8s", 0, map[string]any{
+			"namespace": "ns1", "name": "x",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, store, id, "failed", 2*time.Second)
+		got, _ := store.GetTask(context.Background(), id)
+		if got.Error == nil || !strings.Contains(*got.Error, "unavailable") {
+			t.Fatalf("%s: error=%v, want 'unavailable'", typeName, got.Error)
+		}
 	}
 }
 

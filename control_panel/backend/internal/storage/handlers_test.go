@@ -79,6 +79,55 @@ func TestProvisionHandlerFailureTriggersRollback(t *testing.T) {
 	}
 }
 
+// TestProvisionHandlerRejectsExportOptsInjection verifies the export_opts
+// command-injection fix: a payload containing a single quote (which would
+// break out of the single-quoted echo in the exports step) fails the task
+// BEFORE any command is run on the worker.
+func TestProvisionHandlerRejectsExportOptsInjection(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	mr := &mockRunner{}
+	RegisterStorageHandlers(eng, mr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, _ := eng.Submit(context.Background(), "storage_provision_nfs", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1", "size_gb": 100.0,
+		"fs_type": "xfs", "mount_point": "/data02/nb",
+		"export_opts": "'; touch /tmp/PWNED; '",
+	})
+	waitFor(t, store, id, "failed", 2*time.Second)
+	if len(mr.calls) != 0 {
+		t.Fatalf("no command should run for a rejected task, got: %v", mr.calls)
+	}
+	got, _ := store.GetTask(context.Background(), id)
+	if got.Error == nil || !contains(*got.Error, "export_opts") {
+		t.Fatalf("error=%v, want export_opts rejection", got.Error)
+	}
+}
+
+// TestProvisionHandlerRejectsBadSize verifies size_gb <= 0 is rejected before
+// any command runs (previously it relied on lvcreate failing downstream).
+func TestProvisionHandlerRejectsBadSize(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	mr := &mockRunner{}
+	RegisterStorageHandlers(eng, mr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, _ := eng.Submit(context.Background(), "storage_provision_nfs", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1", "size_gb": 0,
+		"fs_type": "xfs", "mount_point": "/data02/nb",
+	})
+	waitFor(t, store, id, "failed", 2*time.Second)
+	if len(mr.calls) != 0 {
+		t.Fatalf("no command should run for a rejected task, got: %v", mr.calls)
+	}
+}
+
 func waitFor(t *testing.T, store *db.Store, id int64, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

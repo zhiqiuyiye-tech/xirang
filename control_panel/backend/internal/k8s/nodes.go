@@ -19,7 +19,9 @@ type NodeInfo struct {
 // (master/control-plane vs worker). Used by the UI to prefill worker records
 // so the admin only needs to supply SSH credentials.
 func ListNodes(ctx context.Context, client kubernetes.Interface) ([]NodeInfo, error) {
-	list, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	list, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		ResourceVersion: "0",
+	})
 	if err != nil {
 		return nil, err
 	}

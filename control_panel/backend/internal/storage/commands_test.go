@@ -35,16 +35,47 @@ func TestProvisionSteps(t *testing.T) {
 	if steps[1].Cmd != "mkfs.xfs /dev/vg_data/lv_200g" {
 		t.Fatalf("step1 wrong: %s", steps[1].Cmd)
 	}
-	// step4 fstab: idempotent grep dedup then append
+	// step4 fstab: idempotent sed dedupe then append
 	if !contains(steps[4].Cmd, "/dev/vg_data/lv_200g /data02/nb xfs defaults 0 0") {
 		t.Fatalf("fstab step wrong: %s", steps[4].Cmd)
 	}
-	if !contains(steps[4].Cmd, "grep -v") || !contains(steps[4].Cmd, "mv") {
+	if !contains(steps[4].Cmd, "sed -i") {
 		t.Fatalf("fstab not idempotent: %s", steps[4].Cmd)
 	}
 	// step5 exports
 	if !contains(steps[5].Cmd, "/data02/nb") || !contains(steps[5].Cmd, "no_root_squash") {
 		t.Fatalf("exports step wrong: %s", steps[5].Cmd)
+	}
+}
+
+func TestValidateExportOpts(t *testing.T) {
+	// Legitimate export option strings pass.
+	for _, s := range []string{
+		"",
+		"*(rw,sync,no_root_squash,no_subtree_check)",
+		"192.168.0.0/24(rw,async)",
+		"host.example.com(ro) 10.0.0.0/8(rw,no_wdelay)",
+		"*(ro,root_squash)",
+	} {
+		if err := ValidateExportOpts(s); err != nil {
+			t.Fatalf("unexpected err for %q: %v", s, err)
+		}
+	}
+	// Injection payloads are rejected: each of these would break out of the
+	// single-quoted echo in the exports step.
+	for _, s := range []string{
+		"'; rm -rf /; '",
+		"') && touch /tmp/pwned && echo '",
+		"$(reboot)",
+		"`reboot`",
+		"rw;shutdown -h now",
+		"rw & reboot",
+		"rw | cat /etc/shadow",
+		"rw\n10.0.0.1(rw)",
+	} {
+		if err := ValidateExportOpts(s); err == nil {
+			t.Fatalf("expected err for %q", s)
+		}
 	}
 }
 

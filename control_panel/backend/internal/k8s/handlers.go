@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"xirang/control_panel/internal/db"
@@ -10,6 +11,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+// errNoK8sClient is the failure recorded when a k8s task runs while the panel
+// has no in-cluster client (non-cluster / local dev mode). The HTTP layer
+// returns 503 up front in that case, so reaching a task handler with a nil
+// client should be impossible - this guard turns the would-be nil-deref
+// panic into a clean failed task.
+var errNoK8sClient = errors.New("k8s client unavailable (non-cluster mode)")
 
 // RegisterK8sHandlers registers the four K8s task handlers (k8s_create_svc,
 // k8s_delete_svc, k8s_create_np, k8s_delete_np) on the engine. Each handler
@@ -27,6 +35,10 @@ func RegisterK8sHandlers(eng *tasks.Engine, client kubernetes.Interface) {
 type createSvcHandler struct{ client kubernetes.Interface }
 
 func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	if h.client == nil {
+		r.Fail(errNoK8sClient.Error())
+		return errNoK8sClient
+	}
 	var p struct {
 		Namespace string                       `json:"namespace"`
 		PodName   string                       `json:"pod_name"`
@@ -120,6 +132,10 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 type deleteSvcHandler struct{ client kubernetes.Interface }
 
 func (h *deleteSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	if h.client == nil {
+		r.Fail(errNoK8sClient.Error())
+		return errNoK8sClient
+	}
 	var p struct {
 		Namespace string `json:"namespace"`
 		Name      string `json:"name"`
@@ -149,6 +165,10 @@ func (h *deleteSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 type createNPHandler struct{ client kubernetes.Interface }
 
 func (h *createNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	if h.client == nil {
+		r.Fail(errNoK8sClient.Error())
+		return errNoK8sClient
+	}
 	var p struct {
 		Namespace    string                       `json:"namespace"`
 		PodName      string                       `json:"pod_name"`
@@ -205,6 +225,10 @@ func (h *createNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 type deleteNPHandler struct{ client kubernetes.Interface }
 
 func (h *deleteNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	if h.client == nil {
+		r.Fail(errNoK8sClient.Error())
+		return errNoK8sClient
+	}
 	var p struct {
 		Namespace string `json:"namespace"`
 		Name      string `json:"name"`

@@ -53,6 +53,16 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 			return err
 		}
 	}
+	// ExportOpts is interpolated into the exports step's shell command, so it
+	// MUST be validated too - a single quote would break out of the echo.
+	if err := ValidateExportOpts(p.ExportOpts); err != nil {
+		r.Fail(fmt.Sprintf("invalid export_opts: %v", err))
+		return err
+	}
+	if p.SizeGB <= 0 {
+		r.Fail("size_gb must be > 0")
+		return fmt.Errorf("size_gb must be > 0")
+	}
 	w, err := h.store.GetWorker(ctx, p.WorkerID)
 	if err != nil {
 		r.Fail(err.Error())
@@ -84,8 +94,9 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 }
 
 // rollback executes the best-effort undo sequence for a provision failure.
-// Each undo step is recorded via the reporter even if the command itself
-// fails, so the failure path is never blocked.
+// Each undo step is recorded via the reporter with its REAL outcome (a
+// failed undo shows as failed), but rollback itself never blocks the failure
+// path - every step is attempted regardless.
 func (h *provisionHandler) rollback(ctx context.Context, w db.WorkerNode, r *tasks.Reporter, req ProvisionReq, done []string) {
 	rb := RollbackFor(req, done)
 	for _, st := range rb {
@@ -93,8 +104,12 @@ func (h *provisionHandler) rollback(ctx context.Context, w db.WorkerNode, r *tas
 		if err != nil {
 			continue // best-effort: skip steps that can't be recorded
 		}
-		out, stderr, _, _ := h.runner.Run(ctx, w, st.Cmd)
-		sh.Done("succeeded", out, stderr, "") // best-effort: always record
+		out, stderr, code, _ := h.runner.Run(ctx, w, st.Cmd)
+		if code != 0 {
+			sh.Done("failed", out, stderr, fmt.Sprintf("rollback step %s failed (code=%d): %s", st.Name, code, stderr))
+			continue
+		}
+		sh.Done("succeeded", out, stderr, "")
 	}
 }
 

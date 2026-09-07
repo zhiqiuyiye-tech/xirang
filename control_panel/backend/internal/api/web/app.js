@@ -877,6 +877,12 @@
 
     // Task detail with SSE live updates
     var currentSSE = null;
+    // stepsData caches the current task's steps keyed by seq. SSE step events
+    // are upserted here and re-rendered locally - no per-event refetch of
+    // GET /tasks/:id (the old behavior issued one full fetch + re-render per
+    // step event). A single final fetch happens when the task reaches a
+    // terminal state, to pick up completed steps' stdout/stderr.
+    var stepsData = {};
 
     function closeSSE() {
         if (currentSSE) { currentSSE.close(); currentSSE = null; }
@@ -885,6 +891,7 @@
     registerRoute('/tasks/', async function (content, hash) {
         var id = hash.split('/')[2];
         closeSSE();
+        stepsData = {};
 
         content.innerHTML = '<h2 class="page-title">任务 #' + esc(id) + '</h2>' +
             '<div class="card" id="task-info"><p class="muted">加载中...</p></div>' +
@@ -904,7 +911,8 @@
             var steps = result.steps || [];
 
             renderTaskInfo(task);
-            renderSteps(steps);
+            steps.forEach(function (s) { stepsData[s.seq] = s; });
+            renderStepsFromCache();
 
             // Subscribe to SSE if task is not finished
             if (task.status === 'pending' || task.status === 'running') {
@@ -931,14 +939,16 @@
             (task.error ? '<div class="error-msg mt-1">' + esc(task.error) + '</div>' : '');
     }
 
-    function renderSteps(steps) {
+    function renderStepsFromCache() {
         var el = document.getElementById('steps-container');
         if (!el) return;
-        if (!steps || steps.length === 0) {
+        var seqs = Object.keys(stepsData).map(Number).sort(function (a, b) { return a - b; });
+        if (seqs.length === 0) {
             el.innerHTML = '<p class="muted">暂无步骤。</p>';
             return;
         }
-        el.innerHTML = steps.map(function (s) {
+        el.innerHTML = seqs.map(function (seq) {
+            var s = stepsData[seq];
             return '<div class="step-item ' + esc(s.status) + '">' +
                 '<div class="step-name">' + esc(s.seq) + '. ' + esc(s.name) + ' ' + statusBadge(s.status) + '</div>' +
                 (s.stdout ? '<div class="step-stdout">' + esc(s.stdout) + '</div>' : '') +
@@ -946,6 +956,33 @@
                 (s.error ? '<div class="step-stderr">Error: ' + esc(s.error) + '</div>' : '') +
                 '</div>';
         }).join('');
+    }
+
+    // upsertStep merges a step (from an SSE event or a fetch) into stepsData.
+    // SSE step events carry seq/name/status but not stdout/stderr; previously
+    // fetched details are preserved for fields the event lacks.
+    function upsertStep(s) {
+        if (!s || !s.seq) return;
+        var prev = stepsData[s.seq] || {};
+        stepsData[s.seq] = {
+            seq: s.seq,
+            name: s.name || prev.name || '',
+            status: s.status || prev.status || '',
+            stdout: (s.stdout != null && s.stdout !== '') ? s.stdout : (prev.stdout || ''),
+            stderr: (s.stderr != null && s.stderr !== '') ? s.stderr : (prev.stderr || ''),
+            error: (s.error != null && s.error !== '') ? s.error : (prev.error || '')
+        };
+    }
+
+    // fetchFinalSteps does ONE final full fetch when a task reaches terminal
+    // state, to display the persisted stdout/stderr of all completed steps.
+    function fetchFinalSteps(taskID) {
+        apiJSON('/tasks/' + taskID).then(function (r) {
+            if (r.resp.ok && r.data && r.data.steps) {
+                r.data.steps.forEach(function (s) { upsertStep(s); });
+                renderStepsFromCache();
+            }
+        }).catch(function () {});
     }
 
     function subscribeSSE(taskID) {
@@ -960,6 +997,7 @@
                 var task = JSON.parse(e.data);
                 renderTaskInfo(task);
                 if (task.status !== 'pending' && task.status !== 'running') {
+                    fetchFinalSteps(taskID);
                     closeSSE();
                 }
             } catch (err) { /* ignore parse errors */ }
@@ -968,12 +1006,8 @@
         es.addEventListener('step', function (e) {
             try {
                 var step = JSON.parse(e.data);
-                // Fetch the full steps list to re-render
-                apiJSON('/tasks/' + taskID).then(function (r) {
-                    if (r.resp.ok && r.data && r.data.steps) {
-                        renderSteps(r.data.steps);
-                    }
-                }).catch(function () {});
+                upsertStep(step);
+                renderStepsFromCache();
             } catch (err) { /* ignore */ }
         });
 

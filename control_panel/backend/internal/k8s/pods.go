@@ -22,9 +22,14 @@ type PodInfo struct {
 }
 
 // ListNotebookPods returns all pods whose name contains "notebook"
-// (case-insensitive), across every namespace.
+// (case-insensitive), across every namespace. Served from the API server
+// watch cache (ResourceVersion=0) - the name filter is client-side so a
+// server-side selector is not possible, but the cached read avoids an etcd
+// quorum read on large clusters.
 func ListNotebookPods(ctx context.Context, client kubernetes.Interface) ([]PodInfo, error) {
-	list, err := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	list, err := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		ResourceVersion: "0",
+	})
 	if err != nil {
 		return nil, err
 	}

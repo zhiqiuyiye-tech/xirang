@@ -50,6 +50,7 @@ func main() {
 
 	tk := auth.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
 	eng := tasks.NewEngine(store)
+	eng.SetTaskTimeout(cfg.TaskTimeout)
 	sshm := ssh.NewManager(cipher, cfg.SSHPoolSize, cfg.SSHIdleTimeout)
 	defer sshm.Close() // stop idle-eviction goroutine + close pooled conns on exit
 	ws := workers.NewService(store, cipher, sshm, eng)
@@ -87,7 +88,9 @@ func main() {
 	<-quit
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
 }
 
 func recoverInterrupted(ctx context.Context, store *db.Store) error {

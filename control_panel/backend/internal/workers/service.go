@@ -14,16 +14,23 @@ import (
 )
 
 type CreateReq struct {
-	Name     string
-	Host     string
-	Port     int
-	Username string
+	Name     string `json:"name"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
 }
 type UpdateReq struct {
-	Name     string
-	Host     string
-	Port     int
-	Username string
+	Name     string `json:"name"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+}
+
+func validatePort(p int) error {
+	if p < 1 || p > 65535 {
+		return errors.New("port must be between 1 and 65535")
+	}
+	return nil
 }
 
 type Service struct {
@@ -46,6 +53,9 @@ func (s *Service) Create(ctx context.Context, r CreateReq) (int64, error) {
 	if r.Port == 0 {
 		r.Port = 22
 	}
+	if err := validatePort(r.Port); err != nil {
+		return 0, err
+	}
 	if r.Username == "" {
 		r.Username = "root"
 	}
@@ -62,12 +72,30 @@ func (s *Service) Get(ctx context.Context, id int64) (*db.WorkerNode, error) {
 	return s.store.GetWorker(ctx, id)
 }
 
+// Update applies partial-update semantics: a zero value in the request means
+// "field not provided - keep the existing value". A PUT that omits port
+// therefore cannot zero it (host:0 would break SSH); to change a field the
+// caller must send its new value.
 func (s *Service) Update(ctx context.Context, id int64, r UpdateReq) error {
 	w, err := s.store.GetWorker(ctx, id)
 	if err != nil {
 		return err
 	}
-	w.Name, w.Host, w.Port, w.Username = r.Name, r.Host, r.Port, r.Username
+	if r.Name != "" {
+		w.Name = r.Name
+	}
+	if r.Host != "" {
+		w.Host = r.Host
+	}
+	if r.Port != 0 {
+		if err := validatePort(r.Port); err != nil {
+			return err
+		}
+		w.Port = r.Port
+	}
+	if r.Username != "" {
+		w.Username = r.Username
+	}
 	return s.store.UpdateWorker(ctx, *w)
 }
 

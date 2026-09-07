@@ -41,6 +41,56 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
+// TestCreateRejectsBadPort verifies the port range validation (1-65535).
+func TestCreateRejectsBadPort(t *testing.T) {
+	svc := setup(t)
+	if _, err := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: 99999, Username: "root"}); err == nil {
+		t.Fatal("expected error for out-of-range port")
+	}
+	if _, err := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: -1, Username: "root"}); err == nil {
+		t.Fatal("expected error for negative port")
+	}
+}
+
+// TestUpdatePartialKeepsOmittedFields verifies partial-update semantics: a
+// PUT that only changes the name must NOT zero port/username/host (a zero
+// port would produce host:0 and break SSH entirely).
+func TestUpdatePartialKeepsOmittedFields(t *testing.T) {
+	svc := setup(t)
+	id, _ := svc.Create(context.Background(), CreateReq{Name: "w", Host: "10.0.0.1", Port: 2222, Username: "ops"})
+	if err := svc.Update(context.Background(), id, UpdateReq{Name: "renamed"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := svc.Get(context.Background(), id)
+	if got.Name != "renamed" {
+		t.Fatalf("name=%q want renamed", got.Name)
+	}
+	if got.Host != "10.0.0.1" {
+		t.Fatalf("host=%q, want unchanged 10.0.0.1", got.Host)
+	}
+	if got.Port != 2222 {
+		t.Fatalf("port=%d, want unchanged 2222 (zero value must not clobber)", got.Port)
+	}
+	if got.Username != "ops" {
+		t.Fatalf("username=%q, want unchanged ops", got.Username)
+	}
+}
+
+// TestUpdateRejectsBadPort verifies an explicitly provided invalid port is
+// rejected rather than silently ignored.
+func TestUpdateRejectsBadPort(t *testing.T) {
+	svc := setup(t)
+	id, _ := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	if err := svc.Update(context.Background(), id, UpdateReq{Port: 70000}); err == nil {
+		t.Fatal("expected error for out-of-range port")
+	}
+	// The failed update must not have modified the worker.
+	got, _ := svc.Get(context.Background(), id)
+	if got.Port != 22 {
+		t.Fatalf("port=%d, want unchanged 22", got.Port)
+	}
+}
+
 func TestSetPanelPassword(t *testing.T) {
 	svc := setup(t)
 	id, _ := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})

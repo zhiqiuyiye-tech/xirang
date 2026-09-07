@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/auth"
@@ -28,7 +29,11 @@ func (h *taskHandlers) list(c *gin.Context) {
 }
 
 func (h *taskHandlers) get(c *gin.Context) {
-	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid task id"})
+		return
+	}
 	t, err := h.store.GetTask(c, id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -43,7 +48,11 @@ func (h *taskHandlers) get(c *gin.Context) {
 // is registered on the public group (not behind BearerMiddleware) so the
 // ?token= fallback is reachable; auth is done here instead.
 func (h *taskHandlers) stream(c *gin.Context) {
-	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid task id"})
+		return
+	}
 	// Auth: prefer a Bearer header, fall back to ?token= query param, else 401.
 	// The auth scheme is case-insensitive per RFC 7235 (and matches the
 	// BearerMiddleware on other routes); slice the ORIGINAL header value to
@@ -62,21 +71,34 @@ func (h *taskHandlers) stream(c *gin.Context) {
 		c.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
+	// 404 on an unknown task BEFORE subscribing: otherwise the subscription
+	// would never receive events and the connection would hang until the
+	// client gives up.
+	t, err := h.store.GetTask(c, id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	// Disable proxy response buffering (nginx & co.); without it SSE frames
+	// can sit in the proxy's buffer and the stream appears stalled.
+	c.Header("X-Accel-Buffering", "no")
 	flusher, _ := c.Writer.(http.Flusher)
 
 	ch, cancel := h.eng.Subscribe(id)
 	defer cancel()
 
-	t, _ := h.store.GetTask(c, id)
-	if t != nil {
-		c.SSEvent("task", t)
-		if flusher != nil {
-			flusher.Flush()
-		}
+	c.SSEvent("task", t)
+	if flusher != nil {
+		flusher.Flush()
 	}
+	// Heartbeat: comment frames are ignored by EventSource but keep
+	// intermediaries (proxies / load balancers) from reaping the idle
+	// connection between step events.
+	hb := time.NewTicker(30 * time.Second)
+	defer hb.Stop()
 	for {
 		select {
 		case ev, ok := <-ch:
@@ -84,6 +106,13 @@ func (h *taskHandlers) stream(c *gin.Context) {
 				return
 			}
 			c.SSEvent("step", ev)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case <-hb.C:
+			if _, err := c.Writer.WriteString(": keepalive\n\n"); err != nil {
+				return
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}

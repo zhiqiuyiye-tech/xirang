@@ -16,6 +16,7 @@ type Config struct {
 	SSHPoolSize       int
 	SSHIdleTimeout    time.Duration
 	JWTTTL            time.Duration
+	TaskTimeout       time.Duration
 }
 
 func Load() (Config, error) {
@@ -45,6 +46,9 @@ func Load() (Config, error) {
 	c.SSHPoolSize = envIntOr("SSH_POOL_SIZE", 3)
 	c.SSHIdleTimeout = envDurOr("SSH_IDLE_TIMEOUT", 5*time.Minute)
 	c.JWTTTL = envDurOr("JWT_TTL", 12*time.Hour)
+	// TaskTimeout bounds a single task run (a wedged SSH command must not
+	// hold the task - and its per-worker slot - open forever).
+	c.TaskTimeout = envDurOr("TASK_TIMEOUT", 30*time.Minute)
 	return c, nil
 }
 

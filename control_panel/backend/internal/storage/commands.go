@@ -7,7 +7,15 @@ import (
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_/-]+$`)
+// diskRe limits disk paths to /dev/ + safe characters.
 var diskRe = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
+
+// exportOptsRe limits NFS export option strings (e.g. "*(rw,sync)" or
+// "10.0.0.0/24(rw) host.example.com(ro)") to the punctuation that
+// legitimately appears in client specs and options. Everything that could
+// break out of the single-quoted echo in the exports step - quotes,
+// semicolons, backticks, dollars, backslashes - is outside this set.
+var exportOptsRe = regexp.MustCompile(`^[0-9a-zA-Z*_,()\-.\[\]:=@/ ]*$`)
 
 // ValidateName rejects empty strings, shell metacharacters, and characters
 // outside [a-zA-Z0-9_/-]. It is applied to VGName, LVName, MountPoint, and
@@ -42,6 +50,25 @@ func ValidateDisk(s string) error {
 	return nil
 }
 
+// ValidateExportOpts validates the NFS export options string (the part after
+// the mount point on an /etc/exports line). It is NOT the same charset as
+// ValidateName - legitimate export options contain asterisks, commas, and
+// parentheses - but it still blocks every character that could escape the
+// single-quoted shell command the value is interpolated into. Empty is valid
+// (the caller substitutes a secure default).
+func ValidateExportOpts(s string) error {
+	if s == "" {
+		return nil
+	}
+	if strings.ContainsAny(s, "'\"`;|&$\\<>#!\n\r\t") {
+		return fmt.Errorf("contains shell metacharacters: %q", s)
+	}
+	if !exportOptsRe.MatchString(s) {
+		return fmt.Errorf("invalid characters: %q", s)
+	}
+	return nil
+}
+
 // Step represents a single named shell command in a provision/reclaim sequence.
 type Step struct {
 	Name string
@@ -62,6 +89,11 @@ type ProvisionReq struct {
 // ProvisionSteps builds the 7-step provision sequence:
 // lvcreate, mkfs, mkdir, mount, fstab (idempotent), exports (idempotent),
 // exportfs. If ExportOpts is empty, a secure default is used.
+//
+// The fstab/exports steps dedupe with `sed -i '\#^<key> #d'` before appending.
+// sed -i (unlike grep > tmpfile && mv) preserves the original file's mode and
+// owner, and per-worker task serialization in the engine guarantees two
+// concurrent tasks never interleave these edits.
 func ProvisionSteps(r ProvisionReq) []Step {
 	if r.ExportOpts == "" {
 		r.ExportOpts = "*(rw,sync,no_root_squash,no_subtree_check)"
@@ -72,8 +104,8 @@ func ProvisionSteps(r ProvisionReq) []Step {
 		{"mkfs", fmt.Sprintf("mkfs.%s %s", r.FSType, lvDev)},
 		{"mkdir", fmt.Sprintf("mkdir -p %s", r.MountPoint)},
 		{"mount", fmt.Sprintf("mount %s %s", lvDev, r.MountPoint)},
-		{"fstab", fmt.Sprintf(`grep -v '^%s ' /etc/fstab > /tmp/fstab.cp && mv /tmp/fstab.cp /etc/fstab; echo '%s %s %s defaults 0 0' >> /etc/fstab`, lvDev, lvDev, r.MountPoint, r.FSType)},
-		{"exports", fmt.Sprintf(`grep -v '^%s ' /etc/exports > /tmp/exports.cp && mv /tmp/exports.cp /etc/exports; echo '%s %s' >> /etc/exports`, r.MountPoint, r.MountPoint, r.ExportOpts)},
+		{"fstab", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab && echo '%s %s %s defaults 0 0' >> /etc/fstab`, lvDev, lvDev, r.MountPoint, r.FSType)},
+		{"exports", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports && echo '%s %s' >> /etc/exports`, r.MountPoint, r.MountPoint, r.ExportOpts)},
 		{"exportfs", "exportfs -arv"},
 	}
 }
