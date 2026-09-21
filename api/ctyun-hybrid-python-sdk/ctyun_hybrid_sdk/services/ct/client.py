@@ -298,8 +298,17 @@ class CtClient(CTYunClient):
     def v4_paas_ecs_batch_create_instances(self, v4_paas_ecs_batch_create_instances_request_param):
         """
         /v4/paas/ecs/batch-create-instances
-        多台开通时fixedIP不能进行指定，指定后开通一台后其余会报错。   
-    instanceName在批量开通多台时会按照 001 ，顺序递增。   
+        多台开通时fixedIP不能进行指定，指定后开通一台后其余会报错。
+    instanceName在批量开通多台时会按照 001 ，顺序递增。
     sysVolumeID 此参数暂不支持。
         """
         return self.send(v4_paas_ecs_batch_create_instances_request_param)
+
+    def v4_ecs_flavor_list(self, v4_ecs_flavor_list_request_param):
+        """
+        /v4/ecs/flavor/list
+        查询一个或多个云主机规格资源_PAAS
+    该接口提供用户可用规格列表查询功能，可返回云主机规格的详细信息,并允许用户根据云主机规格的特殊字段进行筛选。
+    注意：如果传了flavorID，则azName为必填；如果只传regionID，则可查询所有数据，azName不是必填的。
+        """
+        return self.send(v4_ecs_flavor_list_request_param)
