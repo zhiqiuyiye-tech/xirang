@@ -26,8 +26,8 @@ func TestProvisionSteps(t *testing.T) {
 		VGName: "vg_data", LVName: "lv_200g", SizeGB: 200, FSType: "xfs",
 		MountPoint: "/data02/nb", ExportOpts: "*(rw,sync,no_root_squash,no_subtree_check)",
 	})
-	if len(steps) != 7 {
-		t.Fatalf("expected 7 steps, got %d", len(steps))
+	if len(steps) != 8 {
+		t.Fatalf("expected 8 steps, got %d", len(steps))
 	}
 	if steps[0].Name != "lvcreate" || steps[0].Cmd != "lvcreate -L 200G -n lv_200g vg_data" {
 		t.Fatalf("step0 wrong: %+v", steps[0])
@@ -45,6 +45,14 @@ func TestProvisionSteps(t *testing.T) {
 	// step5 exports
 	if !contains(steps[5].Cmd, "/data02/nb") || !contains(steps[5].Cmd, "no_root_squash") {
 		t.Fatalf("exports step wrong: %s", steps[5].Cmd)
+	}
+	// step6 ensure_nfs
+	if steps[6].Name != "ensure_nfs" || !contains(steps[6].Cmd, "systemctl") {
+		t.Fatalf("ensure_nfs step wrong: %+v", steps[6])
+	}
+	// step7 exportfs
+	if steps[7].Name != "exportfs" || steps[7].Cmd != "exportfs -arv" {
+		t.Fatalf("exportfs step wrong: %+v", steps[7])
 	}
 }
 

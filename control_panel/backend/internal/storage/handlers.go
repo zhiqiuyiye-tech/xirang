@@ -228,48 +228,76 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 	}
 	out2, _, _, _ := h.runner.Run(ctx, *w, CheckDepsCmd())
 	lvm2, nfs := ParseDepsCheck(out2)
-	if lvm2 && nfs {
+	if !lvm2 || !nfs {
+		st2.Done("succeeded", out2, "", fmt.Sprintf("lvm2=%v nfs=%v, will install", lvm2, nfs))
+
+		// 3. install
+		st3, err := r.Step("install")
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		cmd, err := InstallDepsCmd(pm)
+		if err != nil {
+			st3.Done("failed", "", "", err.Error())
+			r.Fail(err.Error())
+			return err
+		}
+		out3, stderr3, code3, _ := h.runner.Run(ctx, *w, cmd)
+		if code3 != 0 {
+			st3.Done("failed", out3, stderr3, fmt.Sprintf("install failed code=%d", code3))
+			r.Fail(fmt.Sprintf("install failed: %s", stderr3))
+			return fmt.Errorf("install failed")
+		}
+		st3.Done("succeeded", out3, stderr3, "")
+
+		// 4. verify
+		st4, err := r.Step("verify")
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		out4, _, _, _ := h.runner.Run(ctx, *w, CheckDepsCmd())
+		lvm22, nfs2 := ParseDepsCheck(out4)
+		if !lvm22 || !nfs2 {
+			st4.Done("failed", out4, "", "deps still missing after install")
+			r.Fail("install reported success but deps still missing")
+			return fmt.Errorf("verify failed")
+		}
+		st4.Done("succeeded", out4, "", "deps installed and verified")
+	} else {
 		// Idempotent: already installed, skip install + verify
-		st2.Done("succeeded", out2, "", "already installed, skipping")
-		r.Succeed()
-		return nil
+		st2.Done("succeeded", out2, "", "already installed, skipping package install")
 	}
-	st2.Done("succeeded", out2, "", fmt.Sprintf("lvm2=%v nfs=%v, will install", lvm2, nfs))
 
-	// 3. install
-	st3, err := r.Step("install")
+	// 5. configure NFSv4 in /etc/nfs.conf
+	st5, err := r.Step("configure_nfs_v4")
 	if err != nil {
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	cmd, err := InstallDepsCmd(pm)
-	if err != nil {
-		st3.Done("failed", "", "", err.Error())
-		r.Fail(err.Error())
-		return err
+	out5, stderr5, code5, _ := h.runner.Run(ctx, *w, ConfigureNFSv4Cmd())
+	if code5 != 0 {
+		st5.Done("failed", out5, stderr5, fmt.Sprintf("configure_nfs_v4 failed code=%d", code5))
+		r.Fail(fmt.Sprintf("configure nfs.conf failed: %s", stderr5))
+		return fmt.Errorf("configure_nfs_v4 failed")
 	}
-	out3, stderr3, code3, _ := h.runner.Run(ctx, *w, cmd)
-	if code3 != 0 {
-		st3.Done("failed", out3, stderr3, fmt.Sprintf("install failed code=%d", code3))
-		r.Fail(fmt.Sprintf("install failed: %s", stderr3))
-		return fmt.Errorf("install failed")
-	}
-	st3.Done("succeeded", out3, stderr3, "")
+	st5.Done("succeeded", out5, stderr5, "configured /etc/nfs.conf with forced NFSv4")
 
-	// 4. verify
-	st4, err := r.Step("verify")
+	// 6. enable and start NFS service
+	st6, err := r.Step("enable_nfs_service")
 	if err != nil {
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	out4, _, _, _ := h.runner.Run(ctx, *w, CheckDepsCmd())
-	lvm22, nfs2 := ParseDepsCheck(out4)
-	if !lvm22 || !nfs2 {
-		st4.Done("failed", out4, "", "deps still missing after install")
-		r.Fail("install reported success but deps still missing")
-		return fmt.Errorf("verify failed")
+	out6, stderr6, code6, _ := h.runner.Run(ctx, *w, EnableNFSServiceCmd(pm))
+	if code6 != 0 {
+		st6.Done("failed", out6, stderr6, fmt.Sprintf("enable_nfs_service failed code=%d", code6))
+		r.Fail(fmt.Sprintf("enable nfs service failed: %s", stderr6))
+		return fmt.Errorf("enable_nfs_service failed")
 	}
-	st4.Done("succeeded", out4, "", "deps installed and verified")
+	st6.Done("succeeded", out6, stderr6, "nfs service enabled and started")
+
 	r.Succeed()
 	return nil
 }

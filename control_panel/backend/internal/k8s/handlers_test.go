@@ -63,10 +63,13 @@ func TestCreateSvcHandlerCreatesService(t *testing.T) {
 	if steps[0].Name != "create_service" || steps[1].Name != "create_network_policy" {
 		t.Fatalf("step names wrong: %+v", steps)
 	}
-	// The auto-created NetworkPolicy must exist and allow the same port.
+	// The auto-created NetworkPolicy must exist, allow the target port, and have service-name label.
 	nps, _ := ListNetworkPolicies(context.Background(), cs, "ns1")
 	if len(nps) != 1 {
 		t.Fatalf("expected 1 network policy auto-created, got %d", len(nps))
+	}
+	if nps[0].Labels["service-name"] != svc.Name {
+		t.Fatalf("np service-name label wrong: %s vs %s", nps[0].Labels["service-name"], svc.Name)
 	}
 	if len(nps[0].Spec.Ingress) != 1 || len(nps[0].Spec.Ingress[0].Ports) != 1 {
 		t.Fatalf("np ingress ports wrong: %+v", nps[0].Spec.Ingress)
@@ -104,18 +107,29 @@ func TestCreateSvcHandlerBadParamsFails(t *testing.T) {
 	}
 }
 
-// TestDeleteSvcHandlerDeletesService pre-creates a Service, submits a
-// k8s_delete_svc task, and verifies the Service is gone.
+// TestDeleteSvcHandlerDeletesService pre-creates a Service and an associated
+// NetworkPolicy, submits a k8s_delete_svc task, and verifies both are gone.
 func TestDeleteSvcHandlerDeletesService(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	cs := fake.NewSimpleClientset(&corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "s1", Namespace: "ns1",
-			Labels: map[string]string{"managed-by": "control-panel"},
+	cs := fake.NewSimpleClientset(
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "s1", Namespace: "ns1",
+				Labels: map[string]string{"managed-by": "control-panel"},
+			},
 		},
-	})
+		&networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "np1", Namespace: "ns1",
+				Labels: map[string]string{
+					"managed-by":   "control-panel",
+					"service-name": "s1",
+				},
+			},
+		},
+	)
 	RegisterK8sHandlers(eng, cs)
 
 	params := map[string]any{"namespace": "ns1", "name": "s1"}
@@ -131,6 +145,19 @@ func TestDeleteSvcHandlerDeletesService(t *testing.T) {
 	}
 	if len(svcs) != 0 {
 		t.Fatalf("expected 0 svc after delete, got %d", len(svcs))
+	}
+
+	nps, err := ListNetworkPolicies(context.Background(), cs, "ns1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nps) != 0 {
+		t.Fatalf("expected 0 np after delete, got %d", len(nps))
+	}
+
+	steps, _ := store.ListSteps(context.Background(), id)
+	if len(steps) != 2 || steps[0].Name != "delete_service" || steps[1].Name != "delete_network_policy" {
+		t.Fatalf("expected delete_service and delete_network_policy steps, got: %+v", steps)
 	}
 }
 

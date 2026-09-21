@@ -543,7 +543,11 @@
             '<div class="col"><div class="form-field"><label>目标命名空间</label><input type="text" name="namespace" value="' + esc(pod.namespace) + '" readonly></div></div>' +
             '<div class="col"><div class="form-field"><label>Service 暴露模式</label><select name="type"><option value="NodePort">NodePort (主机端口映射)</option><option value="ClusterIP">ClusterIP (集群内网互通)</option></select></div></div>' +
             '</div>' +
-            '<div class="form-field"><label>映射端口 (逗号分隔，如 8080,22 或 外部端口:容器内部端口 如 8080:80)</label><input type="text" name="ports" placeholder="如 8888,22 或 8080:80" required></div>' +
+            '<div class="form-field">' +
+            '<label>映射端口 (逗号分隔，如 31555、8080:80 或 显式指定NodePort 8080:80:31555)</label>' +
+            '<input type="text" name="ports" placeholder="如 31555 或 8080:80 或 8080:80:31555" required>' +
+            '<p class="muted mt-1" style="font-size:12px;">格式说明：端口（如 31555，内外同端口且由K8s分配NodePort）、服务端口:容器端口（如 8080:80）、服务端口:容器端口:NodePort（如 8080:80:31555，指定NodePort 30000-32767）。</p>' +
+            '</div>' +
             '<div class="row mt-2" style="justify-content: flex-end;">' +
             '<button type="button" class="btn btn-outline" id="port-cancel">取消</button>' +
             '<button type="submit" class="btn btn-primary">立即创建映射</button>' +
@@ -556,16 +560,40 @@
         document.getElementById('port-form').addEventListener('submit', async function (e) {
             e.preventDefault();
             var f = e.target;
-            var ports = (f.ports.value || '').split(',').filter(Boolean).map(function (p) {
-                var parts = p.split(':');
+            var msgEl = document.getElementById('port-form-msg');
+            var rawList = (f.ports.value || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+            if (rawList.length === 0) {
+                setMsg(msgEl, '请输入映射端口', 'error');
+                return;
+            }
+            var parseErr = null;
+            var ports = rawList.map(function (p) {
+                var parts = p.split(':').map(function (x) { return x.trim(); });
                 var port = parseInt(parts[0], 10);
-                return { port: port, target_port: parseInt(parts[1] || parts[0], 10), node_port: 0, protocol: 'TCP' };
+                var targetPort = port;
+                var nodePort = 0;
+                if (parts.length === 2) {
+                    targetPort = parseInt(parts[1], 10);
+                } else if (parts.length >= 3) {
+                    targetPort = parseInt(parts[1], 10);
+                    nodePort = parseInt(parts[2], 10);
+                }
+                if (isNaN(port) || port <= 0 || isNaN(targetPort) || targetPort <= 0 || isNaN(nodePort) || nodePort < 0) {
+                    parseErr = '端口输入有误，端口号必须为正整数';
+                }
+                if (nodePort > 0 && (nodePort < 30000 || nodePort > 32767)) {
+                    parseErr = '外部 NodePort (' + nodePort + ') 超出 Kubernetes 默认端口范围 (30000-32767)';
+                }
+                return { port: port, target_port: targetPort, node_port: nodePort, protocol: 'TCP' };
             });
+            if (parseErr) {
+                setMsg(msgEl, '错误: ' + parseErr, 'error');
+                return;
+            }
             var body = {
                 namespace: pod.namespace, pod_name: pod.name, pod_uid: pod.uid,
                 selector: pod.labels || {}, type: f.type.value, ports: ports
             };
-            var msgEl = document.getElementById('port-form-msg');
             try {
                 var r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
                 if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
@@ -678,11 +706,18 @@
 
         var wsel = document.getElementById('st-worker-select');
         var lastInventory = null;
+        var workersMap = {};
 
         try {
             var r = await apiJSON('/workers');
             if (r.resp.ok && Array.isArray(r.data)) {
-                r.data.forEach(function (w) { var o = document.createElement('option'); o.value = w.id; o.textContent = w.name + ' (' + w.host + ')'; wsel.appendChild(o); });
+                r.data.forEach(function (w) {
+                    workersMap[w.id] = w;
+                    var o = document.createElement('option');
+                    o.value = w.id;
+                    o.textContent = w.name + ' (' + w.host + ')';
+                    wsel.appendChild(o);
+                });
             }
         } catch (e) {}
 
@@ -738,6 +773,9 @@
                 } else {
                     lvTbody.innerHTML = lvs.map(function (lv) {
                         var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
+                        var platBtn = lv.mount_point
+                            ? '<button class="btn btn-xs btn-outline" data-act="platform" data-lv=\'' + esc(data) + '\'>平台参数</button>'
+                            : '';
                         return '<tr>' +
                             '<td><strong>' + esc(lv.name) + '</strong></td>' +
                             '<td><span class="font-mono">' + esc(lv.vg_name) + '</span></td>' +
@@ -746,6 +784,7 @@
                             '<td><span class="badge badge-muted">' + esc(lv.fs_type || '-') + '</span></td>' +
                             '<td style="text-align:right;">' +
                             '<div class="actions-cell" style="justify-content: flex-end;">' +
+                            platBtn +
                             '<button class="btn btn-xs btn-outline" data-act="grow" data-lv=\'' + esc(data) + '\'>扩容</button>' +
                             '<button class="btn btn-xs btn-outline" data-act="shrink" data-lv=\'' + esc(data) + '\'>缩容</button>' +
                             '<button class="btn btn-xs btn-danger" data-act="delete" data-lv=\'' + esc(data) + '\'>删除释放</button>' +
@@ -756,8 +795,20 @@
                         btn.addEventListener('click', function () {
                             var lv = JSON.parse(this.getAttribute('data-lv'));
                             var act = this.getAttribute('data-act');
-                            if (act === 'delete') doDeleteLV(content, wid, lv);
-                            else showResizeLVForm(content, wid, lv, act);
+                            if (act === 'platform') {
+                                var curWorker = workersMap[wid] || {};
+                                showPlatformRegistrationModal(content, {
+                                    name: 'nfs-' + lv.name,
+                                    service_address: curWorker.host || '127.0.0.1',
+                                    path: lv.mp || '/data02/notebook_nfs',
+                                    size_gb: lv.size,
+                                    workspace_uuid: ''
+                                });
+                            } else if (act === 'delete') {
+                                doDeleteLV(content, wid, lv);
+                            } else {
+                                showResizeLVForm(content, wid, lv, act);
+                            }
                         });
                     });
                 }
@@ -827,8 +878,25 @@
                     '<td>' + statusBadge(t.status) + '</td>' +
                     '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.created_at)) + '</span></td>' +
                     '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.finished_at)) + '</span></td>' +
-                    '<td style="text-align:right;"><button class="btn btn-xs btn-danger" data-task=\'' + esc(JSON.stringify(t)) + '\'>回收释放</button></td></tr>';
+                    '<td style="text-align:right;">' +
+                    '<div class="actions-cell" style="justify-content: flex-end;">' +
+                    '<button class="btn btn-xs btn-outline" data-reg-task=\'' + esc(JSON.stringify(t)) + '\'>平台参数</button>' +
+                    '<button class="btn btn-xs btn-danger" data-task=\'' + esc(JSON.stringify(t)) + '\'>回收释放</button>' +
+                    '</div>' +
+                    '</td></tr>';
             }).join('');
+            tbody.querySelectorAll('button[data-reg-task]').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var t = JSON.parse(this.getAttribute('data-reg-task'));
+                    var curWorker = workersMap[t.target_id] || {};
+                    showPlatformRegistrationModal(content, {
+                        name: 'nfs-task-' + t.id,
+                        service_address: curWorker.host || '127.0.0.1',
+                        path: '/data02/notebook_nfs',
+                        workspace_uuid: ''
+                    });
+                });
+            });
             tbody.querySelectorAll('button[data-task]').forEach(function (btn) {
                 btn.addEventListener('click', async function () {
                     var t = JSON.parse(this.getAttribute('data-task'));
@@ -842,6 +910,89 @@
             });
         } catch (err) {}
     });
+
+    function genUUID() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    function showPlatformRegistrationModal(content, info) {
+        var uuid = info.uuid || genUUID();
+        var name = info.name || ('nfs-' + (info.size_gb ? info.size_gb + 'g' : 'vol'));
+        var path = info.path || '/data02/notebook_nfs';
+        var addr = info.service_address || '10.0.0.1';
+        var ws = info.workspace_uuid || '';
+
+        function renderSQL(u, n, p, a, w) {
+            return "INSERT INTO esx_tai.file_storage (uuid, name, path, service_address, workspace_uuid, type)\n" +
+                "VALUES ('" + u + "', '" + n + "', '" + p + "', '" + a + "', '" + (w || '<workspace_uuid>') + "', 'EnterprtseAllocate');";
+        }
+
+        var html = '<div class="modal-overlay" id="plat-modal"><div class="modal" style="max-width: 680px;">' +
+            '<h3 class="modal-title">' +
+            '<span>平台存储手动录入参考</span>' +
+            '<span class="badge badge-primary font-mono">' + esc(name) + '</span>' +
+            '</h3>' +
+            '<p class="muted mb-2" style="font-size:12.5px;">该 NFS 共享已由底层系统格式化并持久化导出。由于平台要求在控制台或数据库手动录入，可直接参考以下配置字段或一键复制 SQL 录入：</p>' +
+            '<div class="card" style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;margin-bottom:12px;">' +
+            '<div class="row" style="row-gap:8px;">' +
+            '<div class="col"><span class="muted" style="font-size:12px;">存储 UUID:</span><br><code class="font-mono" id="pl-uuid-val">' + esc(uuid) + '</code></div>' +
+            '<div class="col"><span class="muted" style="font-size:12px;">存储名称 (name):</span><br><strong id="pl-name-val">' + esc(name) + '</strong></div>' +
+            '</div>' +
+            '<div class="row mt-1" style="row-gap:8px;">' +
+            '<div class="col"><span class="muted" style="font-size:12px;">NFS 服务地址 (service_address):</span><br><span class="badge badge-muted font-mono" id="pl-addr-val">' + esc(addr) + '</span></div>' +
+            '<div class="col"><span class="muted" style="font-size:12px;">共享挂载路径 (path):</span><br><span class="font-mono" id="pl-path-val">' + esc(path) + '</span></div>' +
+            '</div>' +
+            '<div class="row mt-1" style="row-gap:8px;">' +
+            '<div class="col"><span class="muted" style="font-size:12px;">存储类型 (type):</span><br><span class="badge badge-success font-mono">EnterprtseAllocate</span></div>' +
+            '<div class="col"><div class="form-field" style="margin-bottom:0;"><label style="font-size:12px;">所属工作区 UUID (workspace_uuid)</label><input type="text" id="pl-ws-input" value="' + esc(ws) + '" placeholder="如 ws-d8t5nq1uma3bg0ocu5cg" style="padding:4px 8px;font-size:12px;"></div></div>' +
+            '</div>' +
+            '</div>' +
+            '<div class="form-field"><label>平台注册 SQL 参考语句 (esx_tai.file_storage)</label>' +
+            '<textarea id="pl-sql-box" class="font-mono" readonly style="width:100%;height:85px;font-size:12px;padding:8px;background:#0f172a;color:#f8fafc;border-radius:6px;resize:none;">' + esc(renderSQL(uuid, name, path, addr, ws)) + '</textarea>' +
+            '</div>' +
+            '<div class="row mt-2" style="justify-content: space-between; align-items: center;">' +
+            '<div><span id="pl-copy-msg" class="text-success" style="font-size:13px;font-weight:600;"></span></div>' +
+            '<div style="display:flex;gap:8px;">' +
+            '<button type="button" class="btn btn-outline" id="pl-cancel">关闭</button>' +
+            '<button type="button" class="btn btn-primary" id="pl-copy-sql">一键复制 SQL</button>' +
+            '</div>' +
+            '</div></div></div>';
+
+        content.insertAdjacentHTML('beforeend', html);
+        var modal = document.getElementById('plat-modal');
+        document.getElementById('pl-cancel').addEventListener('click', function () { modal.remove(); });
+        var wsInput = document.getElementById('pl-ws-input');
+        var sqlBox = document.getElementById('pl-sql-box');
+        var copyBtn = document.getElementById('pl-copy-sql');
+        var copyMsg = document.getElementById('pl-copy-msg');
+
+        wsInput.addEventListener('input', function () {
+            sqlBox.value = renderSQL(uuid, name, path, addr, wsInput.value.trim());
+        });
+
+        copyBtn.addEventListener('click', function () {
+            var text = sqlBox.value;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(function () {
+                    copyMsg.textContent = '✓ SQL 已成功复制到剪贴板！';
+                    setTimeout(function () { copyMsg.textContent = ''; }, 3000);
+                }).catch(function () {
+                    sqlBox.select();
+                    document.execCommand('copy');
+                    copyMsg.textContent = '✓ SQL 已成功复制到剪贴板！';
+                    setTimeout(function () { copyMsg.textContent = ''; }, 3000);
+                });
+            } else {
+                sqlBox.select();
+                document.execCommand('copy');
+                copyMsg.textContent = '✓ SQL 已成功复制到剪贴板！';
+                setTimeout(function () { copyMsg.textContent = ''; }, 3000);
+            }
+        });
+    }
 
     async function showInitVGForm(content, wid, disks, onDone) {
         if (!disks || disks.length === 0) { alert('该节点没有可用未挂载裸盘用于创建 VG 存储池。'); return; }
@@ -1055,7 +1206,30 @@
             '<div class="col"><span class="muted" style="font-size:12px;">启动时间：</span><span class="font-mono" style="font-size:12.5px;">' + esc(fmtTime(task.started_at)) + '</span></div>' +
             '<div class="col"><span class="muted" style="font-size:12px;">结束时间：</span><span class="font-mono" style="font-size:12.5px;">' + esc(fmtTime(task.finished_at)) + '</span></div>' +
             '</div>' +
-            (task.error ? '<div class="error-msg mt-2">' + esc(task.error) + '</div>' : '');
+            (task.error ? '<div class="error-msg mt-2">' + esc(task.error) + '</div>' : '') +
+            (task.type === 'storage_provision_nfs' && task.status === 'succeeded'
+                ? '<div class="mt-2" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;">' +
+                  '<div><strong class="text-success">✓ NFS 存储卷供给完成</strong><span class="muted" style="margin-left:8px;font-size:12px;">已完成底层格式化与网络导出，可直接用于平台注册</span></div>' +
+                  '<button class="btn btn-sm btn-primary" id="btn-plat-from-task">查看/复制平台注册参数</button>' +
+                  '</div>'
+                : '');
+
+        var platBtn = document.getElementById('btn-plat-from-task');
+        if (platBtn) {
+            platBtn.addEventListener('click', async function () {
+                var addr = '127.0.0.1';
+                try {
+                    var wr = await apiJSON('/workers/' + task.target_id);
+                    if (wr.resp.ok && wr.data && wr.data.host) addr = wr.data.host;
+                } catch (e) {}
+                showPlatformRegistrationModal(document.getElementById('content'), {
+                    name: 'nfs-task-' + task.id,
+                    service_address: addr,
+                    path: '/data02/notebook_nfs',
+                    workspace_uuid: ''
+                });
+            });
+        }
     }
 
     function renderStepsFromCache() {

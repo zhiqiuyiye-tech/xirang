@@ -59,3 +59,32 @@ func InstallDepsCmd(pm string) (string, error) {
 		return "", fmt.Errorf("unsupported package manager: %q", pm)
 	}
 }
+
+// NFSServiceName returns the systemd service name for the NFS server.
+// On Debian/Ubuntu (apt) it is nfs-kernel-server; on RHEL/CentOS/Rocky (yum/dnf)
+// it is nfs-server.
+func NFSServiceName(pm string) string {
+	if pm == "apt" {
+		return "nfs-kernel-server"
+	}
+	return "nfs-server"
+}
+
+// ConfigureNFSv4Cmd returns the shell command that enforces NFSv4 (vers4=y,
+// vers2=n, vers3=n) in /etc/nfs.conf. Fixed string, no user input.
+// Uses an idempotent awk script to safely add or update the [nfsd] section
+// while preserving all comments and other sections.
+func ConfigureNFSv4Cmd() string {
+	return `touch /etc/nfs.conf && awk 'BEGIN { in_nfsd=0; done=0 } /^\[nfsd\]/ { print; print "vers2=n\nvers3=n\nvers4=y\nvers4.0=y\nvers4.1=y\nvers4.2=y"; in_nfsd=1; done=1; next } /^\[/ { in_nfsd=0 } in_nfsd && /^vers[234]/ { next } { print } END { if (!done) print "\n[nfsd]\nvers2=n\nvers3=n\nvers4=y\nvers4.0=y\nvers4.1=y\nvers4.2=y" }' /etc/nfs.conf > /etc/nfs.conf.tmp && mv -f /etc/nfs.conf.tmp /etc/nfs.conf`
+}
+
+// EnableNFSServiceCmd returns the shell command to enable and start the NFS service.
+func EnableNFSServiceCmd(pm string) string {
+	return fmt.Sprintf("systemctl enable --now %s", NFSServiceName(pm))
+}
+
+// EnsureNFSServiceCmd returns the shell command to ensure the NFS service is active.
+func EnsureNFSServiceCmd(pm string) string {
+	svc := NFSServiceName(pm)
+	return fmt.Sprintf("systemctl is-active --quiet %s || systemctl start %s", svc, svc)
+}

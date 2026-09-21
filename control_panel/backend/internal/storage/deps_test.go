@@ -81,3 +81,30 @@ func TestCheckDepsCmd(t *testing.T) {
 		t.Fatal("missing probes")
 	}
 }
+
+func TestNFSServiceAndCommands(t *testing.T) {
+	if got := NFSServiceName("apt"); got != "nfs-kernel-server" {
+		t.Fatalf("NFSServiceName(apt) = %s, want nfs-kernel-server", got)
+	}
+	if got := NFSServiceName("yum"); got != "nfs-server" {
+		t.Fatalf("NFSServiceName(yum) = %s, want nfs-server", got)
+	}
+	if got := NFSServiceName("dnf"); got != "nfs-server" {
+		t.Fatalf("NFSServiceName(dnf) = %s, want nfs-server", got)
+	}
+
+	confCmd := ConfigureNFSv4Cmd()
+	if !contains(confCmd, "[nfsd]") || !contains(confCmd, "vers4=y") || !contains(confCmd, "vers2=n") {
+		t.Fatalf("ConfigureNFSv4Cmd missing key elements: %s", confCmd)
+	}
+
+	enableCmd := EnableNFSServiceCmd("yum")
+	if enableCmd != "systemctl enable --now nfs-server" {
+		t.Fatalf("EnableNFSServiceCmd(yum) = %s", enableCmd)
+	}
+
+	ensureCmd := EnsureNFSServiceCmd("apt")
+	if !contains(ensureCmd, "nfs-kernel-server") {
+		t.Fatalf("EnsureNFSServiceCmd(apt) = %s", ensureCmd)
+	}
+}

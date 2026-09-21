@@ -106,6 +106,7 @@ func ProvisionSteps(r ProvisionReq) []Step {
 		{"mount", fmt.Sprintf("mount %s %s", lvDev, r.MountPoint)},
 		{"fstab", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab && echo '%s %s %s defaults 0 0' >> /etc/fstab`, lvDev, lvDev, r.MountPoint, r.FSType)},
 		{"exports", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports && echo '%s %s' >> /etc/exports`, r.MountPoint, r.MountPoint, r.ExportOpts)},
+		{"ensure_nfs", "systemctl is-active --quiet nfs-server || systemctl is-active --quiet nfs-kernel-server || systemctl start nfs-server || systemctl start nfs-kernel-server"},
 		{"exportfs", "exportfs -arv"},
 	}
 }

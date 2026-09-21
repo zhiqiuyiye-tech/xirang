@@ -14,9 +14,10 @@ func TestCreateNetworkPolicySetsOwnerRefAndIngress(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	np, err := CreateNetworkPolicy(context.Background(), cs, CreateNetworkPolicyReq{
 		Namespace:    "ns1",
-		PodName:     "p1",
-		PodUID:      "uid-1",
-		PodSelector: map[string]string{"app": "p1"},
+		ServiceName:  "svc-1",
+		PodName:      "p1",
+		PodUID:       "uid-1",
+		PodSelector:  map[string]string{"app": "p1"},
 		IngressPorts: []IngressPortSpec{{Protocol: "TCP", Port: 31555}},
 	})
 	if err != nil {
@@ -34,7 +35,7 @@ func TestCreateNetworkPolicySetsOwnerRefAndIngress(t *testing.T) {
 	if np.OwnerReferences[0].Controller == nil || !*np.OwnerReferences[0].Controller {
 		t.Fatalf("ownerRef Controller wrong: %+v", np.OwnerReferences[0].Controller)
 	}
-	if np.Labels["managed-by"] != "control-panel" || np.Labels["pod-uid"] != "uid-1" {
+	if np.Labels["managed-by"] != "control-panel" || np.Labels["pod-uid"] != "uid-1" || np.Labels["service-name"] != "svc-1" {
 		t.Fatalf("labels wrong: %+v", np.Labels)
 	}
 	if np.Spec.PodSelector.MatchLabels["app"] != "p1" {
@@ -73,5 +74,39 @@ func TestDeleteNetworkPolicy(t *testing.T) {
 	}
 	if _, err := cs.NetworkingV1().NetworkPolicies("ns1").Get(context.Background(), "np1", metav1.GetOptions{}); err == nil {
 		t.Fatal("expected not found after delete")
+	}
+}
+
+func TestDeleteNetworkPoliciesByService(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "np-svc1",
+				Namespace: "ns1",
+				Labels: map[string]string{
+					"managed-by":   "control-panel",
+					"service-name": "svc1",
+				},
+			},
+		},
+		&networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "np-svc2",
+				Namespace: "ns1",
+				Labels: map[string]string{
+					"managed-by":   "control-panel",
+					"service-name": "svc2",
+				},
+			},
+		},
+	)
+	if err := DeleteNetworkPoliciesByService(context.Background(), cs, "ns1", "svc1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies("ns1").Get(context.Background(), "np-svc1", metav1.GetOptions{}); err == nil {
+		t.Fatal("expected np-svc1 to be deleted")
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies("ns1").Get(context.Background(), "np-svc2", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected np-svc2 to remain, got err: %v", err)
 	}
 }

@@ -47,8 +47,8 @@ func TestProvisionHandlerSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	if len(mr.calls) != 7 {
-		t.Fatalf("expected 7 calls, got %d: %v", len(mr.calls), mr.calls)
+	if len(mr.calls) != 8 {
+		t.Fatalf("expected 8 calls, got %d: %v", len(mr.calls), mr.calls)
 	}
 }
 
@@ -197,6 +197,8 @@ func TestInstallDeps_AllAlreadyInstalled(t *testing.T) {
 	sr := newScriptRunner()
 	sr.add("echo yum", scriptResult{stdout: "yum\n"})
 	sr.add("echo lvm2_ok", scriptResult{stdout: "lvm2_ok\nnfs_ok\n"})
+	sr.add("nfs.conf", scriptResult{stdout: ""})
+	sr.add("systemctl enable", scriptResult{stdout: ""})
 	RegisterStorageHandlers(eng, sr, store)
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
@@ -208,9 +210,22 @@ func TestInstallDeps_AllAlreadyInstalled(t *testing.T) {
 	waitFor(t, store, id, "succeeded", 2*time.Second)
 	// Idempotent: install command must NOT be called (already installed -> skip)
 	for _, c := range sr.calls {
-		if strings.Contains(c, "install") {
-			t.Fatalf("install command should not be called; calls=%v", sr.calls)
+		if strings.Contains(c, "install") && !strings.Contains(c, "systemctl") {
+			t.Fatalf("package install command should not be called; calls=%v", sr.calls)
 		}
+	}
+	// Verify NFSv4 config and systemctl enable steps were executed
+	hasConf, hasEnable := false, false
+	for _, c := range sr.calls {
+		if strings.Contains(c, "nfs.conf") {
+			hasConf = true
+		}
+		if strings.Contains(c, "systemctl enable") {
+			hasEnable = true
+		}
+	}
+	if !hasConf || !hasEnable {
+		t.Fatalf("expected nfs.conf and systemctl enable steps, calls=%v", sr.calls)
 	}
 }
 
@@ -226,6 +241,8 @@ func TestInstallDeps_InstallSuccess(t *testing.T) {
 		scriptResult{stdout: "lvm2_ok\nnfs_ok\n"},
 	)
 	sr.add("yum install", scriptResult{stdout: ""})
+	sr.add("nfs.conf", scriptResult{stdout: ""})
+	sr.add("systemctl enable", scriptResult{stdout: ""})
 	RegisterStorageHandlers(eng, sr, store)
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
@@ -235,9 +252,9 @@ func TestInstallDeps_InstallSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	// 4 commands: detect_pm, check_deps, install, verify
-	if len(sr.calls) != 4 {
-		t.Fatalf("expected 4 calls, got %d: %v", len(sr.calls), sr.calls)
+	// 6 commands: detect_pm, check_deps, install, verify, configure_nfs_v4, enable_nfs_service
+	if len(sr.calls) != 6 {
+		t.Fatalf("expected 6 calls, got %d: %v", len(sr.calls), sr.calls)
 	}
 }
 

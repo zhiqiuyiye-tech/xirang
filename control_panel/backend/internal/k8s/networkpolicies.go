@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -18,6 +19,7 @@ type IngressPortSpec struct {
 // CreateNetworkPolicyReq is the input to CreateNetworkPolicy.
 type CreateNetworkPolicyReq struct {
 	Namespace    string
+	ServiceName  string
 	PodName      string
 	PodUID       string
 	PodSelector  map[string]string
@@ -26,7 +28,8 @@ type CreateNetworkPolicyReq struct {
 
 // CreateNetworkPolicy creates a NetworkPolicy owned by the given Pod that
 // allows ingress traffic to the selected pods on the listed ports. The policy
-// is labelled with managed-by=control-panel and pod-uid=<uid>.
+// is labelled with managed-by=control-panel and pod-uid=<uid>, plus
+// service-name=<serviceName> when provided so it can be cascade-deleted.
 func CreateNetworkPolicy(ctx context.Context, client kubernetes.Interface, req CreateNetworkPolicyReq) (*networkingv1.NetworkPolicy, error) {
 	ports := make([]networkingv1.NetworkPolicyPort, 0, len(req.IngressPorts))
 	for _, p := range req.IngressPorts {
@@ -36,14 +39,18 @@ func CreateNetworkPolicy(ctx context.Context, client kubernetes.Interface, req C
 			Port:     &portVal,
 		})
 	}
+	labels := map[string]string{
+		"managed-by": "control-panel",
+		"pod-uid":    req.PodUID,
+	}
+	if req.ServiceName != "" {
+		labels["service-name"] = req.ServiceName
+	}
 	np := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "cp-np-",
 			Namespace:    req.Namespace,
-			Labels: map[string]string{
-				"managed-by": "control-panel",
-				"pod-uid":    req.PodUID,
-			},
+			Labels:       labels,
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "v1",
 				Kind:       "Pod",
@@ -71,6 +78,23 @@ func CreateNetworkPolicy(ctx context.Context, client kubernetes.Interface, req C
 // DeleteNetworkPolicy deletes a NetworkPolicy by name.
 func DeleteNetworkPolicy(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
 	return client.NetworkingV1().NetworkPolicies(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+}
+
+// DeleteNetworkPoliciesByService deletes any NetworkPolicy in the given namespace
+// managed by the control panel that is labelled with service-name=<serviceName>.
+func DeleteNetworkPoliciesByService(ctx context.Context, client kubernetes.Interface, namespace, serviceName string) error {
+	list, err := client.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("managed-by=control-panel,service-name=%s", serviceName),
+	})
+	if err != nil {
+		return err
+	}
+	for _, np := range list.Items {
+		if err := client.NetworkingV1().NetworkPolicies(namespace).Delete(ctx, np.Name, metav1.DeleteOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ListNetworkPolicies returns the NetworkPolicies in the namespace that are

@@ -97,15 +97,22 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 	}
 	st.Done("succeeded", svc.Name, "", "")
 
-	// Auto-create a NetworkPolicy that allows ingress on the same ports as the
-	// Service. The NP uses the pod selector + ownerReferences so it is GC'd
+	// Auto-create a NetworkPolicy that allows ingress on the target ports of the
+	// Service (the ports the pod containers are actually listening on).
+	// The NP uses the pod selector + ownerReferences so it is GC'd
 	// with the pod and stays in sync with the exposed ports - the admin only
 	// picks ports once, the firewall rule follows automatically.
+	// We also record the service-name so the NP can be cascade-deleted when the
+	// service is deleted.
 	ingressPorts := make([]IngressPortSpec, 0, len(ports))
 	for _, pp := range ports {
+		targetPort := pp.TargetPort
+		if targetPort <= 0 {
+			targetPort = pp.Port
+		}
 		ingressPorts = append(ingressPorts, IngressPortSpec{
 			Protocol: string(pp.Protocol),
-			Port:     pp.Port,
+			Port:     targetPort,
 		})
 	}
 	st2, err := r.Step("create_network_policy")
@@ -114,7 +121,7 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return err
 	}
 	np, err := CreateNetworkPolicy(ctx, h.client, CreateNetworkPolicyReq{
-		Namespace: p.Namespace, PodName: p.PodName, PodUID: p.PodUID,
+		Namespace: p.Namespace, ServiceName: svc.Name, PodName: p.PodName, PodUID: p.PodUID,
 		PodSelector: p.Selector, IngressPorts: ingressPorts,
 	})
 	if err != nil {
@@ -156,6 +163,16 @@ func (h *deleteSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return err
 	}
 	st.Done("succeeded", p.Name, "", "")
+
+	// Cascade delete associated NetworkPolicy created by control-panel for this service
+	st2, err := r.Step("delete_network_policy")
+	if err == nil {
+		if err := DeleteNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name); err != nil {
+			st2.Done("failed", "", err.Error(), fmt.Sprintf("delete network policy for service %s: %v", p.Name, err))
+		} else {
+			st2.Done("succeeded", p.Name, "", "")
+		}
+	}
 	r.Succeed()
 	return nil
 }
