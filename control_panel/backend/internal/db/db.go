@@ -28,11 +28,14 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{db: d}
-	if _, err := d.Exec(migration0001); err != nil {
+	if err := runMigrations(d); err != nil {
 		d.Close()
-		return nil, fmt.Errorf("migration 0001: %w", err)
+		return nil, fmt.Errorf("migrations: %w", err)
 	}
 	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// Ping verifies that the underlying database connection is still alive.
+func (s *Store) Ping() error { return s.db.Ping() }

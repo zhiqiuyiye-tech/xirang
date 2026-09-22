@@ -21,16 +21,22 @@ the control panel into a cluster.
 |------|---------|
 | `rbac.yaml` | Namespace, ServiceAccount, ClusterRole (least privilege), ClusterRoleBinding |
 | `pvc.yaml` | PersistentVolumeClaim (1Gi) for the SQLite database |
-| `deployment.yaml` | Deployment: single pod, env from Secret, PVC mount, probes, resources |
+| `deployment.yaml` | Deployment: single pod, non-root user (10001), PVC mount, probes, resources |
 | `service.yaml` | Service: NodePort 30180 exposing :8080 |
 | `secret.yaml.template` | Placeholder Secret template (real `secret.yaml` is git-ignored) |
 | `install.sh` | Interactive installer: generates secrets, applies all manifests |
 | `README.md` | This file |
 
+## Critical Storage Requirements (SQLite)
+
+> **CRITICAL**: The PVC backing `/data` **MUST** use a block-based storage class or local storage (e.g. `local-path`, `hostPath`, Ceph RBD, Longhorn).
+> **DO NOT USE REGULAR NFS FOR THE CONTROL PANEL PVC.**
+> The backend SQLite database operates in WAL (Write-Ahead Logging) mode, which relies on POSIX shared-memory primitives (`.db-shm`). Network file systems (such as NFS) do not reliably support POSIX locking and shared memory, which can lead to `database is locked` errors or database corruption.
+
 ## Prerequisites
 
 1. **Target Kubernetes cluster** with:
-   - A default `StorageClass` that can provision a 1Gi PVC (or edit `pvc.yaml`).
+   - A default block/local `StorageClass` that can provision a 1Gi PVC (or edit `pvc.yaml`).
    - Nodes reachable on the NodePort range (default 30180).
 
 2. **Worker nodes** where storage/LVM operations run must have:
@@ -74,9 +80,7 @@ docker login registry-xirang.jxslpt.cn:30443
 ```
 
 `deployment.yaml` uses `imagePullPolicy: Always`, so each pod restart pulls the
-latest pushed image. The cluster nodes must be able to reach the registry
-(`registry-xirang.jxslpt.cn:30443`) - if they need credentials, create an
-`imagePullSecret` and add `imagePullSecrets:` to the deployment spec.
+latest pushed image.
 
 ## Install
 
@@ -98,13 +102,7 @@ cd control_panel/deploy
 
 The script is **idempotent and upgrade-safe**: re-running it when the Secret
 `control-panel-secrets` already exists **reuses** its values
-(`AES_KEY`/`JWT_SECRET`/`ADMIN_INIT_PASSWORD`) unchanged, so the admin password
-(bcrypt-hashed in the SQLite DB on the PVC) and the AES-encrypted per-worker SSH
-credentials keep working. Only `secret.yaml` is re-rendered (a no-op on the
-cluster) and the other manifests are re-applied (picking up any image/deployment
-changes). Pass `--reset-secrets` to force regeneration - this invalidates
-existing encrypted worker credentials and the retrievable admin password, so
-back up first.
+(`AES_KEY`/`JWT_SECRET`/`ADMIN_INIT_PASSWORD`) unchanged.
 
 ## Upgrade (after a new image push)
 
@@ -125,12 +123,6 @@ Or, to update the image without touching the Secret at all:
 kubectl -n control-panel set image deployment/control-panel \
     control-panel=registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:<new-tag>
 ```
-
-Because the admin password lives in the SQLite DB (PVC-backed) and the worker
-credentials are encrypted with the reused `AES_KEY`, both keep working after the
-upgrade. The `ADMIN_INIT_PASSWORD` in the Secret is only used to seed the admin
-account on first startup; it is not consulted afterwards, so reusing it keeps
-the `kubectl get secret ... | base64 -d` retrieval command accurate.
 
 ## Access
 
@@ -172,27 +164,20 @@ preserve it.
 
 ## Security Notes
 
-- **Secret management**: `AES_KEY`, `JWT_SECRET`, and `ADMIN_INIT_PASSWORD` are
-  delivered to the pod via a Kubernetes Secret (`control-panel-secrets`) and
-  consumed as env vars (`secretKeyRef`). The generated `secret.yaml` is
-  git-ignored; only `secret.yaml.template` (with placeholder values) is
-  committed.
-- **RBAC least privilege**: the control panel's ServiceAccount can only manage
-  `services` and `networkpolicies` (full CRUD) and read `pods` (get/list/watch
-  for ownerReferences UID lookup). It has **no** access to `secrets`,
-  `configmaps`, or other sensitive resources.
-- **Per-worker SSH private keys are NOT mounted as a file.** The backend stores
-  them AES-encrypted in SQLite; operators upload each worker's private key
-  through the web UI (SetPrivateKey API) after first login. There is no
-  `/app/ssh_keys/id_rsa` volume mount in the Deployment - the original spec's
-  SSH-key Secret mount was omitted because the backend does not read from the
-  filesystem. See `internal/ssh` for the decryption path.
-- **Internal-only exposure**: NodePort 30180 is intended for internal-network
-  access. Use an Ingress with TLS for any production exposure.
-- **Pod security**: the Deployment sets `seccompProfile: RuntimeDefault`. The
-  container currently runs as root (required to write to the PVC-mounted
-  `/data` without a chown init container); this is a known hardening item - a
-  future revision should run as a non-root user with proper volume ownership.
+- **Pod Security Hardening**: The container runs as non-root (`UID:GID 10001:10001`) with `fsGroup: 10001`, a read-only root filesystem, `allowPrivilegeEscalation: false`, all Linux capabilities dropped (`drop: ["ALL"]`), and `seccompProfile: RuntimeDefault`.
+- **HttpOnly Cookies & CSRF Protection**: Browser sessions authenticate via `HttpOnly` same-origin cookies and double-submit CSRF tokens. Sensitive tokens are never stored in browser `localStorage` or transmitted via URL query parameters.
+- **Session Revocation & Rate Limiting**: Administrative password changes automatically bump `auth_version` in the database, immediately invalidating any older active sessions and tokens. Login attempts are rate-limited to prevent brute-force attacks.
+- **Secret management**: `AES_KEY`, `JWT_SECRET`, and `ADMIN_INIT_PASSWORD` are delivered to the pod via Kubernetes Secret (`control-panel-secrets`).
+- **RBAC least privilege**: the control panel's ServiceAccount only manages `services` and `networkpolicies` (full CRUD) and reads `pods` and `nodes` (read-only). It has **no** access to `secrets`, `configmaps`, or `pods/exec`.
+- **Per-worker SSH credentials**: stored AES-encrypted in SQLite; operators upload credentials through the web UI after first login.
+- **SSH Host Key Policy**: Currently uses `InsecureIgnoreHostKey()` for trusted internal network deployment. In production environments, verify that SSH connections from the control panel Pod to worker nodes route through a dedicated, trusted management network.
+
+## Pre-flight Checklist
+
+- [ ] **Pod egress to Kubernetes API**: Pod must be able to reach Kubernetes API (TCP 443 / 6443).
+- [ ] **Pod egress to Worker Nodes on TCP 22**: Verify node firewalls (`iptables` / `firewalld`) do not block traffic from the Pod CIDR to worker nodes on port 22.
+- [ ] **StorageClass**: Verify StorageClass is local or block-based (not NFS).
+- [ ] **Ingress Network Restriction**: If exposed to corporate LAN, configure source IP range restrictions or NetworkPolicy.
 
 ## RBAC Permissions Reference
 
@@ -201,21 +186,7 @@ preserve it.
 | `services` | `""` (core) | get, list, watch, create, update, delete |
 | `networkpolicies` | `networking.k8s.io` | get, list, watch, create, update, delete |
 | `pods` | `""` (core) | get, list, watch (read-only) |
+| `nodes` | `""` (core) | get, list, watch (read-only) |
 
 No `secrets`, `configmaps`, `pods/exec`, or `pods/portforward` permissions are
 granted.
-
-## Troubleshooting
-
-- **Pod fails to start with `config: AES_KEY env var is required`**: the Secret
-  was not applied, or the key is missing. Check:
-  `kubectl -n control-panel get secret control-panel-secrets -o yaml`.
-- **Pod fails with `AES_KEY must decode to 32 bytes`**: the `AES_KEY` value is
-  not a base64 encoding of 32 bytes. Re-run `install.sh` to regenerate.
-- **K8s API calls return 403 Forbidden**: the ServiceAccount's ClusterRole is
-  not applied, or the ClusterRoleBinding is missing. Check:
-  `kubectl -n control-panel describe serviceaccount control-panel`.
-- **PVC stuck Pending**: no StorageClass can provision a volume, or the node is
-  out of space. Check: `kubectl -n control-panel describe pvc control-panel-data`.
-- **NodePort 30180 not reachable**: check node firewalls and that the port
-  range allows 30180 (default NodePort range is 30000-32767).

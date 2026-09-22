@@ -67,24 +67,21 @@ func TestListTasks(t *testing.T) {
 	}
 }
 
-// TestStreamTokenQueryFallback verifies the ?token= query fallback is
-// reachable: an EventSource client (no Authorization header) passing a valid
-// JWT as ?token= gets a 200 text/event-stream response with at least the
-// initial "task" SSE frame. The stream route is on the public group precisely
-// so this fallback is not pre-empted by BearerMiddleware.
-func TestStreamTokenQueryFallback(t *testing.T) {
+// TestStreamCookieAuth verifies the cookie auth path: an EventSource client
+// sending a valid session cookie gets a 200 text/event-stream response with
+// at least the initial "task" SSE frame.
+func TestStreamCookieAuth(t *testing.T) {
 	r, ws, _, tk := newRouter(t)
 	wid, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 	time.Sleep(100 * time.Millisecond)
 
 	tok, _ := tk.Issue(1, "admin")
-	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream?token=" + tok
-	// Bound the request so the looping SSE handler exits when the context
-	// times out (it emits the initial "task" frame before entering the loop).
+	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream"
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	req := httptest.NewRequest("GET", url, nil).WithContext(ctx)
+	req.AddCookie(&http.Cookie{Name: "cp_session", Value: tok})
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -99,20 +96,22 @@ func TestStreamTokenQueryFallback(t *testing.T) {
 	}
 }
 
-// TestStreamTokenQueryBogus verifies that a bogus ?token= (with no
-// Authorization header) is rejected with 401.
-func TestStreamTokenQueryBogus(t *testing.T) {
-	r, ws, _, _ := newRouter(t)
+// TestStreamTokenQueryRejected locks in the removal of ?token= query parameter
+// authentication: passing ?token= without a valid cookie or Bearer header must
+// be rejected with 401 Unauthorized to prevent tokens leaking into access logs.
+func TestStreamTokenQueryRejected(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
 	wid, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 
-	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream?token=bogus"
+	tok, _ := tk.Issue(1, "admin")
+	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream?token=" + tok
 	req := httptest.NewRequest("GET", url, nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("code=%d, want 401", w.Code)
+		t.Fatalf("code=%d, want 401 (?token= query must be rejected)", w.Code)
 	}
 }
 

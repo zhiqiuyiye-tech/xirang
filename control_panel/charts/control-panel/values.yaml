@@ -3,44 +3,87 @@
 # install via randAlphaNum - no manual setup needed. Override image/port/storage
 # here if your environment differs.
 
-# Container image (private registry). The master node must be able to pull this.
 image:
   repository: registry-xirang.jxslpt.cn:30443/tai-dev/control-panel
   tag: latest
   pullPolicy: Always
-  # If the registry requires auth, create an imagePullSecret and set its name:
   # imagePullSecrets:
   #   - name: my-registry-secret
 
-# Namespace is set by `helm install -n <ns> --create-namespace`, not here.
-# This value is kept only for reference; templates use .Release.Namespace.
 namespace: control-panel
 
-# Service exposure. NodePort is the default for internal admin access.
+# Service exposure. NodePort or ClusterIP (recommended when Ingress is enabled).
 service:
   type: NodePort
   port: 8080
   nodePort: 30180
 
-# Persistent storage for the SQLite database (worker creds, tasks, audit log).
+# Ingress configuration (recommended for production HTTPS deployment)
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+  hosts:
+    - host: control-panel.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: control-panel-tls
+    #   hosts:
+    #     - control-panel.local
+
+# NetworkPolicy for internal network isolation and boundary defense
+networkPolicy:
+  enabled: false
+  # CIDRs allowed to access the control panel UI / API
+  ingressCIDRs: []
+    # - 10.0.0.0/8
+    # - 192.168.0.0/16
+
+# Security context for pod and container
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Application environment configuration
+config:
+  requireK8s: true
+  cookieSecure: false  # Set to true when accessed over HTTPS
+  cookieSameSite: "Lax"
+  trustedProxies: []
+  rateLimitMaxFailures: 5
+  rateLimitLockoutDuration: "15m"
+
+# Persistent storage for the SQLite database.
+# MUST use a block-based or local StorageClass (local-path, hostPath, Ceph RBD, Longhorn).
+# DO NOT use regular NFS for WAL-mode SQLite database!
 persistence:
   enabled: true
   size: 1Gi
   storageClassName: "local-path"  # K3s default; set to "" for cluster default
 
-# Secrets auto-generated on install. To pin them (e.g. for upgrades preserving
-# encrypted data), set these - otherwise randAlphaNum generates fresh values.
+# Secrets auto-generated on install.
 secrets:
   aesKey: ""         # leave empty to auto-generate (base64 32-byte)
   jwtSecret: ""      # leave empty to auto-generate (base64)
   adminPassword: ""  # leave empty to auto-generate (retrieve after install)
 
-# Scheduling: by default no constraints - the pod follows its PVC (local-path
-# binds the volume to whichever node first scheduled the pod, and the pod must
-# stay on that node). Pinning to a specific node (e.g. control-plane) conflicts
-# with a PVC already bound elsewhere and leaves the pod Pending. Set these only
-# if you use a ReadWriteMany / networked storageClass or accept re-creating the
-# PVC on the target node.
 scheduling:
   nodeSelector: {}
   tolerations: []

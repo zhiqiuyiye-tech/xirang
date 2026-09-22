@@ -1,28 +1,44 @@
 /* Xirang Control Panel - Frontend SPA
  * Native HTML/CSS/JS - no build tools, no frameworks.
- * Hash-based routing, localStorage token, SSE via EventSource.
+ * Hash-based routing, HttpOnly Cookie session, CSRF double-submit, SSE via EventSource.
  */
 
 (function () {
     'use strict';
 
-    // ===== Token Management =====
-    function getToken() { return localStorage.getItem('cp_token'); }
-    function setToken(t) { localStorage.setItem('cp_token', t); }
-    function clearToken() { localStorage.removeItem('cp_token'); }
+    var isAuthenticated = false;
+
+    // ===== CSRF & Cookie Management =====
+    function getCSRFToken() {
+        var match = document.cookie.match(/(?:^|;\s*)cp_csrf=([^;]+)/);
+        return match ? decodeURIComponent(match[1]) : '';
+    }
+
+    function clearLegacyTokens() {
+        try { localStorage.removeItem('cp_token'); } catch (e) {}
+    }
 
     // ===== API Helper =====
     async function apiFetch(path, opts) {
         opts = opts || {};
         opts.headers = opts.headers || {};
-        opts.headers['Authorization'] = 'Bearer ' + getToken();
+        opts.credentials = 'same-origin';
+
+        var method = (opts.method || 'GET').toUpperCase();
+        if (method !== 'GET' && method !== 'HEAD') {
+            var csrf = getCSRFToken();
+            if (csrf) {
+                opts.headers['X-CSRF-Token'] = csrf;
+            }
+        }
         if (opts.body && !opts.headers['Content-Type']) {
             opts.headers['Content-Type'] = 'application/json';
         }
         var resp = await fetch('/api/v1' + path, opts);
         if (resp.status === 401) {
-            clearToken();
-            showLogin();
+            isAuthenticated = false;
+            clearLegacyTokens();
+            showLogin('会话已失效或未登录，请重新登录');
             throw new Error('未授权');
         }
         return resp;
@@ -38,12 +54,18 @@
     }
 
     // ===== View Management =====
-    function showLogin() {
+    function showLogin(msg) {
+        isAuthenticated = false;
         document.getElementById('login-view').style.display = 'flex';
         document.getElementById('app-view').style.display = 'none';
+        var errEl = document.getElementById('login-error');
+        if (errEl) {
+            errEl.textContent = msg || '';
+        }
     }
 
     function showApp() {
+        isAuthenticated = true;
         document.getElementById('login-view').style.display = 'none';
         document.getElementById('app-view').style.display = 'block';
         handleRoute();
@@ -56,30 +78,95 @@
         var password = document.getElementById('login-password').value;
         var errEl = document.getElementById('login-error');
         errEl.textContent = '';
+        var submitBtn = e.target.querySelector('button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = true;
 
         try {
             var resp = await fetch('/api/v1/auth/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
                 body: JSON.stringify({ username: username, password: password })
             });
             if (!resp.ok) {
-                var d = await resp.json();
+                var d = await resp.json().catch(function () { return {}; });
                 errEl.textContent = d.error || '登录失败，请检查账号密码';
                 return;
             }
-            var data = await resp.json();
-            setToken(data.token);
+            clearLegacyTokens();
             showApp();
         } catch (err) {
             errEl.textContent = '网络连接异常: ' + err.message;
+        } finally {
+            if (submitBtn) submitBtn.disabled = false;
         }
     }
 
     // ===== Logout =====
-    function handleLogout() {
-        clearToken();
+    async function handleLogout() {
+        try {
+            await apiFetch('/auth/logout', { method: 'POST' });
+        } catch (e) { /* ignore */ }
+        clearLegacyTokens();
         showLogin();
+    }
+
+    // ===== Change Password Modal =====
+    function showChangePasswordModal() {
+        var existing = document.getElementById('pwd-modal');
+        if (existing) existing.remove();
+
+        var html = '<div class="modal-overlay" id="pwd-modal">' +
+            '<div class="modal" style="max-width: 460px;">' +
+            '<h3 class="modal-title">修改管理员密码</h3>' +
+            '<form id="pwd-form">' +
+            '<div class="form-field"><label>当前密码</label><input type="password" name="old_password" required placeholder="请输入当前管理员密码"></div>' +
+            '<div class="form-field"><label>新密码 (12-72 字符)</label><input type="password" name="new_password" required minlength="12" maxlength="72" placeholder="请输入至少 12 位新密码"></div>' +
+            '<div class="form-field"><label>确认新密码</label><input type="password" name="confirm_password" required minlength="12" maxlength="72" placeholder="再次输入新密码"></div>' +
+            '<div id="pwd-error" class="error-msg"></div>' +
+            '<div class="modal-actions">' +
+            '<button type="button" class="btn btn-secondary" id="pwd-cancel">取消</button>' +
+            '<button type="submit" class="btn btn-primary">保存修改</button>' +
+            '</div>' +
+            '</form>' +
+            '</div></div>';
+
+        document.body.insertAdjacentHTML('beforeend', html);
+        var modal = document.getElementById('pwd-modal');
+        document.getElementById('pwd-cancel').addEventListener('click', function () { modal.remove(); });
+
+        document.getElementById('pwd-form').addEventListener('submit', async function (e) {
+            e.preventDefault();
+            var errEl = document.getElementById('pwd-error');
+            errEl.textContent = '';
+            var oldP = e.target.old_password.value;
+            var newP = e.target.new_password.value;
+            var confirmP = e.target.confirm_password.value;
+
+            if (newP !== confirmP) {
+                errEl.textContent = '两次输入的新密码不一致';
+                return;
+            }
+            if (newP.length < 12 || newP.length > 72) {
+                errEl.textContent = '新密码长度必须在 12 到 72 位之间';
+                return;
+            }
+
+            try {
+                var res = await apiJSON('/auth/password', {
+                    method: 'PUT',
+                    body: JSON.stringify({ old_password: oldP, new_password: newP })
+                });
+                if (!res.resp.ok) {
+                    errEl.textContent = (res.data && res.data.error) || '修改失败，请重试';
+                    return;
+                }
+                modal.remove();
+                alert('管理员密码修改成功，新会话已更新！');
+            } catch (err) {
+                errEl.textContent = '操作异常: ' + err.message;
+            }
+        });
     }
 
     // ===== Utility =====
@@ -1277,10 +1364,9 @@
     }
 
     function subscribeSSE(taskID) {
-        var token = getToken();
-        if (!token) return;
-        var url = '/api/v1/tasks/' + taskID + '/stream?token=' + encodeURIComponent(token);
-        var es = new EventSource(url);
+        if (!isAuthenticated) return;
+        var url = '/api/v1/tasks/' + taskID + '/stream';
+        var es = new EventSource(url, { withCredentials: true });
         currentSSE = es;
 
         es.addEventListener('task', function (e) {
@@ -1344,20 +1430,129 @@
         } catch (err) {}
     });
 
+    // ====================================================================
+    // SECURITY & PASSWORD PAGE
+    // ====================================================================
+
+    registerRoute('/security', async function (content) {
+        content.innerHTML = '<div class="page-header">' +
+            '<div>' +
+            '<h2 class="page-title">系统安全与凭证管理</h2>' +
+            '<p class="page-subtitle">修改管理员访问密码、查看会话安全状态与加固策略</p>' +
+            '</div>' +
+            '</div>' +
+            '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-top:16px;">' +
+            '<div class="card">' +
+            '<h3 class="card-title" style="margin-bottom:14px;">修改管理员密码</h3>' +
+            '<form id="page-pwd-form">' +
+            '<div class="form-field"><label>当前密码</label><input type="password" name="old_password" required placeholder="请输入当前管理员密码"></div>' +
+            '<div class="form-field"><label>新密码 (12-72 字符)</label><input type="password" name="new_password" required minlength="12" maxlength="72" placeholder="请输入至少 12 位新密码"></div>' +
+            '<div class="form-field"><label>确认新密码</label><input type="password" name="confirm_password" required minlength="12" maxlength="72" placeholder="再次输入新密码"></div>' +
+            '<div id="page-pwd-msg" class="error-msg" style="margin-bottom:12px;"></div>' +
+            '<button type="submit" class="btn btn-primary" style="width:100%;">保存并更新密码</button>' +
+            '</form>' +
+            '</div>' +
+            '<div class="card">' +
+            '<h3 class="card-title" style="margin-bottom:14px;">系统安全防护状态</h3>' +
+            '<div style="display:flex;flex-direction:column;gap:12px;font-size:0.9rem;">' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">当前登录账号</span><strong id="sec-user">admin</strong></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">凭证存储机制</span><span class="badge badge-success">bcrypt + 动态盐</span></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">会话隔离机制</span><span class="badge badge-success">HttpOnly + SameSite Cookie</span></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">跨站请求伪造</span><span class="badge badge-success">CSRF 双提交 Cookie + 同源校验</span></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">暴力破解防御</span><span class="badge badge-success">连续 5 次失败封禁 15 分钟</span></div>' +
+            '<div style="display:flex;justify-content:space-between;"><span class="muted">会话认证版本</span><span id="sec-version" class="badge-mono font-mono">-</span></div>' +
+            '</div>' +
+            '</div>' +
+            '</div>';
+
+        try {
+            var meResp = await apiJSON('/auth/me');
+            if (meResp.resp.ok && meResp.data) {
+                var uEl = document.getElementById('sec-user');
+                var vEl = document.getElementById('sec-version');
+                if (uEl) uEl.textContent = meResp.data.username || 'admin';
+                if (vEl) vEl.textContent = 'v' + (meResp.data.auth_version || 1);
+            }
+        } catch (e) {}
+
+        var form = document.getElementById('page-pwd-form');
+        if (form) {
+            form.addEventListener('submit', async function (e) {
+                e.preventDefault();
+                var msgEl = document.getElementById('page-pwd-msg');
+                msgEl.style.color = 'var(--danger)';
+                msgEl.textContent = '';
+                var oldP = form.old_password.value;
+                var newP = form.new_password.value;
+                var confirmP = form.confirm_password.value;
+
+                if (newP !== confirmP) {
+                    msgEl.textContent = '两次输入的新密码不一致';
+                    return;
+                }
+                if (newP.length < 12 || newP.length > 72) {
+                    msgEl.textContent = '新密码长度必须在 12 到 72 位之间';
+                    return;
+                }
+
+                try {
+                    var res = await apiJSON('/auth/password', {
+                        method: 'PUT',
+                        body: JSON.stringify({ old_password: oldP, new_password: newP })
+                    });
+                    if (!res.resp.ok) {
+                        msgEl.textContent = (res.data && res.data.error) || '修改失败，请检查原密码';
+                        return;
+                    }
+                    form.reset();
+                    msgEl.style.color = '#10b981';
+                    msgEl.textContent = '密码修改成功！旧会话已全部失效，当前会话已刷新。';
+                    try {
+                        var r2 = await apiJSON('/auth/me');
+                        if (r2.resp.ok && r2.data) {
+                            var vEl2 = document.getElementById('sec-version');
+                            if (vEl2) vEl2.textContent = 'v' + (r2.data.auth_version || 1);
+                        }
+                    } catch (err) {}
+                } catch (err) {
+                    msgEl.textContent = '操作异常: ' + err.message;
+                }
+            });
+        }
+    });
+
     // ===== Init =====
+    async function checkAuth() {
+        try {
+            var resp = await fetch('/api/v1/auth/me', { credentials: 'same-origin' });
+            if (resp.ok) {
+                var adminInfo = await resp.json().catch(function () { return null; });
+                if (adminInfo && adminInfo.username) {
+                    var nameEl = document.querySelector('.user-name');
+                    if (nameEl) nameEl.textContent = adminInfo.username;
+                }
+                showApp();
+                return;
+            }
+        } catch (e) {}
+        showLogin();
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         document.getElementById('login-form').addEventListener('submit', handleLogin);
         document.getElementById('logout-btn').addEventListener('click', handleLogout);
+
+        var chgBtn = document.getElementById('change-pwd-btn');
+        if (chgBtn) {
+            chgBtn.addEventListener('click', showChangePasswordModal);
+        }
+
         window.addEventListener('hashchange', function () {
             closeSSE();
-            if (getToken()) handleRoute();
+            if (isAuthenticated) handleRoute();
         });
 
-        if (getToken()) {
-            showApp();
-        } else {
-            showLogin();
-        }
+        checkAuth();
     });
 
     window.addEventListener('beforeunload', closeSSE);

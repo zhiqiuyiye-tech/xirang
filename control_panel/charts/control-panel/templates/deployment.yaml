@@ -23,9 +23,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        runAsNonRoot: false
-        seccompProfile:
-          type: RuntimeDefault
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.scheduling.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -38,6 +36,8 @@ spec:
         - name: control-panel
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -62,13 +62,30 @@ spec:
               value: /data/control_panel.db
             - name: LISTEN_ADDR
               value: ":{{ .Values.service.port }}"
+            - name: REQUIRE_K8S
+              value: "{{ .Values.config.requireK8s }}"
+            - name: COOKIE_SECURE
+              value: "{{ .Values.config.cookieSecure }}"
+            - name: COOKIE_SAMESITE
+              value: "{{ .Values.config.cookieSameSite }}"
+            {{- if .Values.config.trustedProxies }}
+            - name: TRUSTED_PROXIES
+              value: "{{ join "," .Values.config.trustedProxies }}"
+            {{- end }}
+            - name: LOGIN_RATE_LIMIT_MAX_FAILURES
+              value: "{{ .Values.config.rateLimitMaxFailures }}"
+            - name: LOGIN_RATE_LIMIT_LOCKOUT_DURATION
+              value: "{{ .Values.config.rateLimitLockoutDuration }}"
           volumeMounts:
             - name: data
               mountPath: /data
               readOnly: false
+            - name: tmp
+              mountPath: /tmp
+              readOnly: false
           readinessProbe:
             httpGet:
-              path: /
+              path: /health/ready
               port: http
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
@@ -76,7 +93,7 @@ spec:
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /
+              path: /health/live
               port: http
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
@@ -92,3 +109,5 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        - name: tmp
+          emptyDir: {}
