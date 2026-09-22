@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -88,6 +89,7 @@ func startTestSSHd(t *testing.T, rootPassword string) (addr string, testPrivKey 
 								break
 							}
 						}
+						_, _ = io.Copy(io.Discard, ch)
 						ch.Write([]byte("hello\n"))
 						ch.SendRequest("exit-status", false, xssh.Marshal(struct{ C uint32 }{0}))
 					}(ch, reqs)

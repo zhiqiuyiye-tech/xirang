@@ -6,6 +6,7 @@ type Admin struct {
 	ID           int64     `json:"id"`
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"-"`
+	AuthVersion  int64     `json:"auth_version"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 

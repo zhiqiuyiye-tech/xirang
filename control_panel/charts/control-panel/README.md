@@ -4,6 +4,19 @@ One-command deployment of the Agentless K8s + storage control panel. All
 secrets (AES_KEY, JWT_SECRET, ADMIN_INIT_PASSWORD) are auto-generated on install
 - no manual setup.
 
+## Architecture & Security Highlights
+
+- **Pod Security Hardening**: Runs as non-root user (`UID:GID 10001:10001`), read-only root filesystem, `allowPrivilegeEscalation: false`, all Linux capabilities dropped (`drop: ["ALL"]`), seccomp profile `RuntimeDefault`.
+- **HttpOnly Cookie & CSRF**: Web UI authenticates via same-origin `HttpOnly` session cookies and double-submit CSRF tokens. Sensitive tokens are not exposed in browser `localStorage` or URL query strings.
+- **Session Revocation & Rate Limiting**: Administrative password change automatically increments `auth_version` and invalidates all previous sessions. Login attempts are rate-limited (default 5 failed attempts triggers 15-minute temporary lockout).
+- **Health Probes**: Dedicated `/health/live` (process health) and `/health/ready` (SQLite & Kubernetes API readiness) endpoints.
+
+## Critical Storage Requirements (SQLite)
+
+> **CRITICAL**: The PVC backing `/data` **MUST** use a block-based storage class or local storage (e.g. `local-path`, `hostPath`, Ceph RBD, Longhorn).
+> **DO NOT USE REGULAR NFS FOR THE CONTROL PANEL PVC.**
+> The backend SQLite database operates in WAL (Write-Ahead Logging) mode, which relies on POSIX shared-memory primitives (`.db-shm`). Network file systems (such as NFS) do not reliably support POSIX locking and shared memory, which can lead to `database is locked` errors or database corruption.
+
 ## Prerequisites
 
 1. **Private registry image pushed** (the master must be able to pull it):
@@ -14,7 +27,7 @@ secrets (AES_KEY, JWT_SECRET, ADMIN_INIT_PASSWORD) are auto-generated on install
    If the registry needs auth or uses a self-signed cert, configure the cluster
    nodes (insecure-registries / CA) or set `image.imagePullSecrets` in values.
 
-2. **Cluster has a default StorageClass** (for the 1Gi PVC), or set
+2. **Cluster has a block/local StorageClass** (for the 1Gi PVC), e.g. `local-path` or set
    `persistence.storageClassName`.
 
 3. **Helm >= 3.8** installed on the master (OCI support), and `kubectl` configured.
@@ -41,24 +54,14 @@ The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-p
 
 ## Install
 
-### From the OCI registry (any machine)
-
-```bash
-helm install control-panel oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel \
-  --version 0.4.0 --create-namespace -n control-panel
-```
-
-### From a local chart checkout
+### 1. Standard Internal Deployment (NodePort)
 
 ```bash
 helm install control-panel ./control_panel/charts/control-panel \
   --create-namespace -n control-panel
 ```
 
-That's it. Helm prints the access URL and the command to retrieve the
-auto-generated admin password (also see `NOTES.txt`).
-
-Retrieve the admin password:
+Retrieve the initial admin password:
 
 ```bash
 kubectl -n control-panel get secret control-panel-secrets \
@@ -68,72 +71,103 @@ kubectl -n control-panel get secret control-panel-secrets \
 Access the web UI (NodePort 30180 by default):
 
 ```
-http://<any-node-ip>:30180/
+http://<node-ip>:30180/
 ```
 
-Login with username `admin` + the retrieved password.
+### 2. Production Deployment (HTTPS Ingress + ClusterIP)
 
-## Upgrade (after a new image push)
+Create a custom `values-prod.yaml`:
+
+```yaml
+service:
+  type: ClusterIP
+  port: 8080
+
+config:
+  cookieSecure: true # enforces Secure flag on session cookies
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+  hosts:
+    - host: control-panel.internal.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: control-panel-tls
+      hosts:
+        - control-panel.internal.example.com
+```
+
+Deploy with:
 
 ```bash
-helm upgrade control-panel ./control_panel/charts/control-panel -n control-panel
-# or, to bump just the image tag:
-helm upgrade control-panel ./control_panel/charts/control-panel -n control-panel \
-  --set image.tag=v2
+helm install control-panel ./control_panel/charts/control-panel \
+  --create-namespace -n control-panel -f values-prod.yaml
 ```
 
-`imagePullPolicy: Always` makes the pod pull the latest image on restart.
+## Secrets Lifecycle
 
-Passwords survive the upgrade: the admin login password (bcrypt-hashed in the
-SQLite DB on the PVC) and the per-worker SSH credentials (AES-encrypted in the
-same DB) are never touched by `helm upgrade`. The Secret values
-(`AES_KEY`/`JWT_SECRET`/`ADMIN_INIT_PASSWORD`) are reused from the existing
-deployed Secret via the `lookup` function (see `templates/_helpers.tpl`), so the
-key that decrypts worker creds and the password retrievable via `kubectl get
-secret ... ADMIN_INIT_PASSWORD | base64 -d` both stay stable across upgrades.
+- **`AES_KEY`**: Master encryption key (AES-256-GCM) for worker SSH passwords and private keys stored in SQLite. **Must remain unchanged across upgrades**; regenerating it makes stored worker credentials unreadable.
+- **`JWT_SECRET`**: HS256 signing secret for session tokens.
+- **`ADMIN_INIT_PASSWORD`**: Seeded into the SQLite database **only on the very first boot**. Once the admin logs in and updates their password via the web UI ("修改密码"), the new bcrypt hash in SQLite is authoritative.
 
-## Pin secrets across upgrades
+## Backup, Restore & Rollback
 
-By default the three Secret values are generated once on first install and
-reused on every upgrade via `lookup`. To explicitly pin them (e.g. to set your
-own admin password or to force a rotation), set them in values or `--set`:
+### Backup
+
+Before performing major upgrades:
 
 ```bash
-helm install control-panel ./control_panel/charts/control-panel -n control-panel \
-  --create-namespace \
-  --set secrets.adminPassword=yourpass \
-  --set secrets.aesKey=$(openssl rand 32 | base64) \
-  --set secrets.jwtSecret=$(openssl rand 32 | base64)
+# 1. Backup Kubernetes secrets
+kubectl -n control-panel get secret control-panel-secrets -o yaml > control-panel-secrets-backup.yaml
+
+# 2. Backup SQLite database safely using SQLite online backup
+kubectl -n control-panel exec -it deployment/control-panel -- cp /data/control_panel.db /tmp/control_panel_backup.db
+kubectl -n control-panel cp control-panel-xxxx:/tmp/control_panel_backup.db ./control_panel_backup.db
 ```
 
-Note: pinning `secrets.aesKey`/`secrets.jwtSecret` on a `helm upgrade` of an
-existing release WILL rotate them (pinned values win over `lookup`), which
-invalidates existing encrypted worker credentials and login sessions. Only pin
-on first install, or when you intend to rotate.
-
-## Uninstall
+### Rollback
 
 ```bash
-helm uninstall control-panel -n control-panel
-kubectl delete namespace control-panel   # also removes the PVC (SQLite data)
+helm rollback control-panel -n control-panel
 ```
 
-## Configuration
+The database schema migrations are backwards-compatible, so rolling back to the previous image version remains supported.
+
+## Pre-flight Checklist
+
+- [ ] **Pod egress to Kubernetes API**: Pod must be able to contact Kubernetes API (TCP 443 / 6443).
+- [ ] **Pod egress to Worker Nodes on TCP 22**: Worker management & LVM/NFS automation require the Pod to establish SSH connections to worker nodes on port 22. Verify node firewalls (`iptables` / `firewalld`) do not block traffic from the Pod CIDR.
+- [ ] **StorageClass**: Ensure StorageClass is `local-path`, `hostPath`, or a block CSI (not NFS).
+- [ ] **Ingress Network Restriction**: If exposed to corporate LAN, configure `whitelist-source-range` on Ingress or enable `networkPolicy`.
+
+## Configuration Reference
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `image.repository` | `registry-xirang.jxslpt.cn:30443/tai-dev/control-panel` | Image repo |
 | `image.tag` | `latest` | Image tag |
 | `image.pullPolicy` | `Always` | Pull policy |
-| `image.imagePullSecrets` | `[]` | Registry auth secrets |
 | `namespace` | `control-panel` | Namespace |
-| `service.type` | `NodePort` | Service type |
-| `service.port` | `8080` | Container/service port |
-| `service.nodePort` | `30180` | NodePort |
-| `persistence.enabled` | `true` | PVC for SQLite |
-| `persistence.size` | `1Gi` | PVC size |
-| `persistence.storageClassName` | `""` | StorageClass (default if empty) |
+| `service.type` | `NodePort` | Service type (`NodePort` or `ClusterIP`) |
+| `service.port` | `8080` | Container port |
+| `service.nodePort` | `30180` | NodePort (when type is NodePort) |
+| `ingress.enabled` | `false` | Enable Ingress resource |
+| `config.requireK8s` | `true` | Fail fast on pod start if k8s client fails |
+| `config.cookieSecure` | `false` | Set `Secure` on cookies (set `true` with HTTPS) |
+| `config.rateLimitMaxFailures` | `5` | Failed logins before temporary lockout |
+| `config.rateLimitLockoutDuration` | `15m` | Duration of login lockout |
+| `podSecurityContext.runAsNonRoot` | `true` | Enforce non-root execution |
+| `podSecurityContext.runAsUser` | `10001` | Non-root UID |
+| `persistence.enabled` | `true` | PVC for SQLite database |
+| `persistence.storageClassName` | `"local-path"` | StorageClass (must be block or local) |
 | `secrets.aesKey` | `""` (auto) | Pin AES_KEY (base64 32-byte) |
 | `secrets.jwtSecret` | `""` (auto) | Pin JWT_SECRET (base64) |
-| `secrets.adminPassword` | `""` (auto) | Pin admin password (plaintext) |
-| `resources` | req 100m/128Mi, lim 500m/512Mi | Pod resources |
+| `secrets.adminPassword` | `""` (auto) | Pin initial admin password |

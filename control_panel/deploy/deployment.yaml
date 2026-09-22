@@ -9,8 +9,6 @@
 # it first (run on a host with docker):
 #   docker build -t registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest control_panel/backend
 #   docker push registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
-# If the registry uses a self-signed/HTTP-only cert, the cluster nodes must trust
-# it (configure insecure-registries or install the CA) or use an imagePullSecret.
 #
 # Apply with: kubectl apply -f deployment.yaml
 
@@ -35,13 +33,22 @@ spec:
     spec:
       serviceAccountName: control-panel
       securityContext:
-        runAsNonRoot: false
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: control-panel
           image: registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: 8080
@@ -71,9 +78,12 @@ spec:
             - name: data
               mountPath: /data
               readOnly: false
+            - name: tmp
+              mountPath: /tmp
+              readOnly: false
           readinessProbe:
             httpGet:
-              path: /
+              path: /health/ready
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
@@ -81,7 +91,7 @@ spec:
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /
+              path: /health/live
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
@@ -98,3 +108,5 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: control-panel-data
+        - name: tmp
+          emptyDir: {}

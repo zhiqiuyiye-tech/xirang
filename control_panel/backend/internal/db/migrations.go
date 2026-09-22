@@ -1,5 +1,12 @@
 package db
 
+import (
+	"database/sql"
+	"fmt"
+)
+
+const pendingInitHash = "__PENDING_INIT__"
+
 const migration0001 = `
 CREATE TABLE IF NOT EXISTS admin (
   id            INTEGER PRIMARY KEY,
@@ -60,4 +67,90 @@ INSERT OR IGNORE INTO admin (id, username, password_hash, created_at)
   VALUES (1, 'admin', '__PENDING_INIT__', '1970-01-01 00:00:00');
 `
 
-const pendingInitHash = "__PENDING_INIT__"
+type migration struct {
+	version int
+	apply   func(tx *sql.Tx) error
+}
+
+func runMigrations(db *sql.DB) error {
+	_, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version     INTEGER PRIMARY KEY,
+  applied_at  TIMESTAMP NOT NULL
+);`)
+	if err != nil {
+		return fmt.Errorf("init schema_migrations: %w", err)
+	}
+
+	migrations := []migration{
+		{
+			version: 1,
+			apply: func(tx *sql.Tx) error {
+				if _, err := tx.Exec(migration0001); err != nil {
+					return err
+				}
+				return nil
+			},
+		},
+		{
+			version: 2,
+			apply: func(tx *sql.Tx) error {
+				rows, err := tx.Query("PRAGMA table_info(admin)")
+				if err != nil {
+					return err
+				}
+				defer rows.Close()
+
+				hasCol := false
+				for rows.Next() {
+					var cid int
+					var name, ctype string
+					var notnull, pk int
+					var dfltValue sql.NullString
+					if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+						return err
+					}
+					if name == "auth_version" {
+						hasCol = true
+						break
+					}
+				}
+				if !hasCol {
+					if _, err := tx.Exec("ALTER TABLE admin ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1;"); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, m := range migrations {
+		var exists int
+		err := db.QueryRow("SELECT COUNT(1) FROM schema_migrations WHERE version=?", m.version).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("check migration %d: %w", m.version, err)
+		}
+		if exists > 0 {
+			continue
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %d: %w", m.version, err)
+		}
+		if err := m.apply(tx); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply migration %d: %w", m.version, err)
+		}
+		if _, err := tx.Exec("INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))", m.version); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %d: %w", m.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %d: %w", m.version, err)
+		}
+	}
+
+	return nil
+}

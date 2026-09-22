@@ -13,9 +13,10 @@ import (
 )
 
 type taskHandlers struct {
-	store *db.Store
-	eng   *tasks.Engine
-	tk    *auth.Tokens
+	store      *db.Store
+	eng        *tasks.Engine
+	tk         *auth.Tokens
+	cookieName string
 }
 
 func (h *taskHandlers) list(c *gin.Context) {
@@ -43,34 +44,47 @@ func (h *taskHandlers) get(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": t.ID, "task": t, "steps": steps})
 }
 
-// stream: SSE. EventSource cannot set headers, so in addition to a Bearer
-// header it also accepts ?token=<jwt> as a fallback auth mechanism. This route
-// is registered on the public group (not behind BearerMiddleware) so the
-// ?token= fallback is reachable; auth is done here instead.
+// stream: SSE. Authenticated via HttpOnly Cookie (EventSource default) or
+// Authorization: Bearer <jwt> header. Query-parameter tokens are prohibited
+// to prevent tokens leaking into access logs or browser history.
 func (h *taskHandlers) stream(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid task id"})
 		return
 	}
-	// Auth: prefer a Bearer header, fall back to ?token= query param, else 401.
-	// The auth scheme is case-insensitive per RFC 7235 (and matches the
-	// BearerMiddleware on other routes); slice the ORIGINAL header value to
-	// preserve the token's exact casing.
+
+	cookieName := h.cookieName
+	if cookieName == "" {
+		cookieName = "cp_session"
+	}
+
 	tok := ""
 	if ah := c.GetHeader("Authorization"); strings.HasPrefix(strings.ToLower(ah), "bearer ") {
 		tok = ah[7:]
-	} else if q := c.Query("token"); q != "" {
-		tok = q
+	} else if cookieVal, err := c.Cookie(cookieName); err == nil && cookieVal != "" {
+		tok = cookieVal
 	}
+
 	if tok == "" {
 		c.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
-	if _, err := h.tk.Parse(tok); err != nil {
+
+	cl, err := h.tk.Parse(tok)
+	if err != nil {
 		c.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
+
+	if h.store != nil {
+		curVer, err := h.store.GetAdminAuthVersion(c.Request.Context(), cl.AdminID)
+		if err != nil || curVer != cl.AuthVersion {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+	}
+
 	// 404 on an unknown task BEFORE subscribing: otherwise the subscription
 	// would never receive events and the connection would hang until the
 	// client gives up.

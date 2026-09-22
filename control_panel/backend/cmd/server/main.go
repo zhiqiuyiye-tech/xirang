@@ -48,20 +48,26 @@ func main() {
 		log.Fatalf("seed admin: %v", err)
 	}
 
-	tk := auth.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
+	tk := auth.NewTokens(cfg.JWTSecret, cfg.JWTTTL,
+		auth.WithIssuer(cfg.JWTIssuer),
+		auth.WithAudience(cfg.JWTAudience),
+	)
+	limiter := auth.NewRateLimiter(cfg.RateLimitMaxFailures, cfg.RateLimitLockoutDuration, cfg.RateLimitWindow)
+	defer limiter.Close()
+
 	eng := tasks.NewEngine(store)
 	eng.SetTaskTimeout(cfg.TaskTimeout)
 	sshm := ssh.NewManager(cipher, cfg.SSHPoolSize, cfg.SSHIdleTimeout)
 	defer sshm.Close() // stop idle-eviction goroutine + close pooled conns on exit
 	ws := workers.NewService(store, cipher, sshm, eng)
 
-	// K8s client: in-cluster only. Failure is non-fatal - the control panel
-	// can run outside a cluster (local dev) with the k8s endpoints returning
-	// 503 Service Unavailable. The task handlers are still registered so the
-	// engine knows the type names (and would surface a clear error if a k8s
-	// task were somehow submitted with a nil client).
+	// K8s client: in-cluster only. Failure is fatal if REQUIRE_K8S is true.
+	// Otherwise it is non-fatal for local development with k8s endpoints returning 503.
 	k8sClient, err := k8s.NewClient()
 	if err != nil {
+		if cfg.RequireK8s {
+			log.Fatalf("fatal: k8s client init failed (REQUIRE_K8S=true): %v", err)
+		}
 		log.Printf("warn: k8s client: %v (k8s endpoints disabled)", err)
 		k8sClient = nil
 	}
@@ -73,7 +79,16 @@ func main() {
 	storage.RegisterStorageHandlers(eng, sshm, store)
 
 	gin.SetMode(gin.ReleaseMode)
-	r := api.NewRouter(tk, ws, store, eng, k8sClient, sshm)
+	r := api.NewRouter(tk, ws, store, eng, k8sClient, sshm,
+		api.WithRateLimiter(limiter),
+		api.WithCookieName(cfg.CookieName),
+		api.WithCookieSecure(cfg.CookieSecure),
+		api.WithCookieSameSite(cfg.CookieSameSite),
+		api.WithCSRFCookieName(cfg.CSRFCookieName),
+		api.WithCSRFHeaderName(cfg.CSRFHeaderName),
+		api.WithRequireK8s(cfg.RequireK8s),
+		api.WithTrustedProxies(cfg.TrustedProxies),
+	)
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: r}
 	go func() {

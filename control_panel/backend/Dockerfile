@@ -7,13 +7,18 @@ ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/server ./cmd/server
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/server ./cmd/server
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates tzdata && \
+    addgroup -g 10001 appgroup && \
+    adduser -u 10001 -G appgroup -s /sbin/nologin -D appuser && \
+    mkdir -p /data /tmp && \
+    chown -R appuser:appgroup /data /tmp
+
 WORKDIR /app
-COPY --from=build /out/server /app/server
-RUN mkdir -p /data
+COPY --from=build --chown=appuser:appgroup /out/server /app/server
+USER 10001:10001
 ENV DB_PATH=/data/control_panel.db
 ENV LISTEN_ADDR=:8080
 EXPOSE 8080
