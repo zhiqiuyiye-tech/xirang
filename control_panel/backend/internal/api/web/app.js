@@ -1430,6 +1430,97 @@
         } catch (err) {}
     });
 
+    // ====================================================================
+    // SECURITY & PASSWORD PAGE
+    // ====================================================================
+
+    registerRoute('/security', async function (content) {
+        content.innerHTML = '<div class="page-header">' +
+            '<div>' +
+            '<h2 class="page-title">系统安全与凭证管理</h2>' +
+            '<p class="page-subtitle">修改管理员访问密码、查看会话安全状态与加固策略</p>' +
+            '</div>' +
+            '</div>' +
+            '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-top:16px;">' +
+            '<div class="card">' +
+            '<h3 class="card-title" style="margin-bottom:14px;">修改管理员密码</h3>' +
+            '<form id="page-pwd-form">' +
+            '<div class="form-field"><label>当前密码</label><input type="password" name="old_password" required placeholder="请输入当前管理员密码"></div>' +
+            '<div class="form-field"><label>新密码 (12-72 字符)</label><input type="password" name="new_password" required minlength="12" maxlength="72" placeholder="请输入至少 12 位新密码"></div>' +
+            '<div class="form-field"><label>确认新密码</label><input type="password" name="confirm_password" required minlength="12" maxlength="72" placeholder="再次输入新密码"></div>' +
+            '<div id="page-pwd-msg" class="error-msg" style="margin-bottom:12px;"></div>' +
+            '<button type="submit" class="btn btn-primary" style="width:100%;">保存并更新密码</button>' +
+            '</form>' +
+            '</div>' +
+            '<div class="card">' +
+            '<h3 class="card-title" style="margin-bottom:14px;">系统安全防护状态</h3>' +
+            '<div style="display:flex;flex-direction:column;gap:12px;font-size:0.9rem;">' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">当前登录账号</span><strong id="sec-user">admin</strong></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">凭证存储机制</span><span class="badge badge-success">bcrypt + 动态盐</span></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">会话隔离机制</span><span class="badge badge-success">HttpOnly + SameSite Cookie</span></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">跨站请求伪造</span><span class="badge badge-success">CSRF 双提交 Cookie + 同源校验</span></div>' +
+            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">暴力破解防御</span><span class="badge badge-success">连续 5 次失败封禁 15 分钟</span></div>' +
+            '<div style="display:flex;justify-content:space-between;"><span class="muted">会话认证版本</span><span id="sec-version" class="badge-mono font-mono">-</span></div>' +
+            '</div>' +
+            '</div>' +
+            '</div>';
+
+        try {
+            var meResp = await apiJSON('/auth/me');
+            if (meResp.resp.ok && meResp.data) {
+                var uEl = document.getElementById('sec-user');
+                var vEl = document.getElementById('sec-version');
+                if (uEl) uEl.textContent = meResp.data.username || 'admin';
+                if (vEl) vEl.textContent = 'v' + (meResp.data.auth_version || 1);
+            }
+        } catch (e) {}
+
+        var form = document.getElementById('page-pwd-form');
+        if (form) {
+            form.addEventListener('submit', async function (e) {
+                e.preventDefault();
+                var msgEl = document.getElementById('page-pwd-msg');
+                msgEl.style.color = 'var(--danger)';
+                msgEl.textContent = '';
+                var oldP = form.old_password.value;
+                var newP = form.new_password.value;
+                var confirmP = form.confirm_password.value;
+
+                if (newP !== confirmP) {
+                    msgEl.textContent = '两次输入的新密码不一致';
+                    return;
+                }
+                if (newP.length < 12 || newP.length > 72) {
+                    msgEl.textContent = '新密码长度必须在 12 到 72 位之间';
+                    return;
+                }
+
+                try {
+                    var res = await apiJSON('/auth/password', {
+                        method: 'PUT',
+                        body: JSON.stringify({ old_password: oldP, new_password: newP })
+                    });
+                    if (!res.resp.ok) {
+                        msgEl.textContent = (res.data && res.data.error) || '修改失败，请检查原密码';
+                        return;
+                    }
+                    form.reset();
+                    msgEl.style.color = '#10b981';
+                    msgEl.textContent = '密码修改成功！旧会话已全部失效，当前会话已刷新。';
+                    try {
+                        var r2 = await apiJSON('/auth/me');
+                        if (r2.resp.ok && r2.data) {
+                            var vEl2 = document.getElementById('sec-version');
+                            if (vEl2) vEl2.textContent = 'v' + (r2.data.auth_version || 1);
+                        }
+                    } catch (err) {}
+                } catch (err) {
+                    msgEl.textContent = '操作异常: ' + err.message;
+                }
+            });
+        }
+    });
+
     // ===== Init =====
     async function checkAuth() {
         try {
