@@ -2,7 +2,7 @@ apiVersion: v2
 name: control-panel
 description: Agentless K8s + storage control panel (LVM/NFS + SVC/NetworkPolicy orchestration over SSH)
 type: application
-version: 0.4.0
+version: 0.5.0
 appVersion: "0.1.0"
 keywords:
   - kubernetes

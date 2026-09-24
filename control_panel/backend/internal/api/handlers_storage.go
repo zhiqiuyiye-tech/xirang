@@ -125,6 +125,28 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 	c.JSON(http.StatusOK, inv)
 }
 
+// listNFSHosts: GET /api/v1/storage/nfs-hosts?all=true|false
+// Returns status for hosts where NFS is enabled (or all hosts if all=true),
+// including physical disks count & remaining capacities, allocated virtual
+// disks (LVs), their mount points, used/free space, and NFS export details.
+func (h *storageHandlers) listNFSHosts(c *gin.Context) {
+	workers, err := h.store.ListWorkers(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	nfsOnly := c.Query("all") != "true"
+	hosts, err := storage.ListNFSHosts(c, h.runner, workers, nfsOnly)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if hosts == nil {
+		hosts = []storage.NFSHostStatus{}
+	}
+	c.JSON(http.StatusOK, hosts)
+}
+
 // createVG: POST /api/v1/storage/vg
 // Body: {worker_id, vg_name?, disks[]}. Submits storage_create_vg (pvcreate each
 // disk + vgcreate/vgextend). Responds 202 + {task_id}.

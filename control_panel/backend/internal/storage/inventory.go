@@ -6,21 +6,26 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/ssh"
 )
 
-// LVInfo is a logical volume on a worker node, with its size, mount point, and
-// filesystem type. Includes LVs NOT created by the control panel so the admin
-// can see and manage all existing LVM capacity.
+// LVInfo is a logical volume on a worker node, with its size, mount point,
+// filesystem type, disk space usage, and NFS export status.
 type LVInfo struct {
-	VGName     string  `json:"vg_name"`
-	Name       string  `json:"name"`
-	SizeGB     float64 `json:"size_gb"`
-	Path       string  `json:"path"`        // /dev/<vg>/<lv> (lv_path)
-	MountPoint string  `json:"mount_point"` // from lsblk join; empty if unmounted
-	FSType     string  `json:"fs_type"`     // from lsblk (reads superblock, works unmounted)
+	VGName       string  `json:"vg_name"`
+	Name         string  `json:"name"`
+	SizeGB       float64 `json:"size_gb"`
+	UsedGB       float64 `json:"used_gb"`       // used space in GB (from df); 0 if unmounted
+	FreeGB       float64 `json:"free_gb"`       // remaining free space in GB (from df)
+	UsePct       string  `json:"use_pct"`       // usage percentage, e.g. "5%"
+	Path         string  `json:"path"`          // /dev/<vg>/<lv> (lv_path)
+	MountPoint   string  `json:"mount_point"`   // from lsblk join; empty if unmounted
+	FSType       string  `json:"fs_type"`       // from lsblk (reads superblock, works unmounted)
+	IsNFSExport  bool    `json:"is_nfs_export"` // true if exported via NFS
+	NFSExportOpt string  `json:"nfs_export_opt"`// export options e.g. "*(rw,sync)"
 }
 
 // DiskInfo is an unused whole disk discovered on the worker - not mounted, has
@@ -31,23 +36,44 @@ type DiskInfo struct {
 	SizeGB float64 `json:"size_gb"`
 }
 
-// InventoryInfo is the full LVM/block-device picture of a worker, returned by
-// the inventory endpoint so the storage UI can render VGs, LVs (editable),
-// and unused disks (creatable into a VG pool) in one round trip.
-type InventoryInfo struct {
-	VGs         []VGInfo   `json:"vgs"`
-	LVs         []LVInfo    `json:"lvs"`
-	UnusedDisks []DiskInfo `json:"unused_disks"`
+// PhysicalDiskInfo represents a physical hard drive on the worker node,
+// with its total capacity, remaining allocatable capacity, and role.
+type PhysicalDiskInfo struct {
+	Name   string  `json:"name"`    // /dev/sda, /dev/sdb
+	SizeGB float64 `json:"size_gb"` // total capacity in GB
+	FreeGB float64 `json:"free_gb"` // remaining capacity in GB
+	Role   string  `json:"role"`    // "lvm", "unused", "system"
+	VGName string  `json:"vg_name"` // VG name if role is "lvm"
 }
 
-// inventoryCmd runs every LVM/block probe in a single SSH round trip, with
+// NFSStatusInfo represents the state of NFS services and exported shares on a worker.
+type NFSStatusInfo struct {
+	Active  bool     `json:"active"`  // true if NFS server is active or has active exports
+	Exports []string `json:"exports"` // active exported directory paths
+}
+
+// InventoryInfo is the full LVM/block-device and NFS picture of a worker, returned
+// by the inventory endpoint so the storage UI can render VGs, LVs (with usage and
+// NFS status), physical disks, and unused disks in one round trip.
+type InventoryInfo struct {
+	NFS           NFSStatusInfo      `json:"nfs"`
+	VGs           []VGInfo           `json:"vgs"`
+	LVs           []LVInfo           `json:"lvs"`
+	PhysicalDisks []PhysicalDiskInfo `json:"physical_disks"`
+	UnusedDisks   []DiskInfo         `json:"unused_disks"`
+}
+
+// inventoryCmd runs every LVM/block/NFS probe in a single SSH round trip, with
 // section markers so the output can be split in Go. Every subcommand suppresses
-// its own stderr so a missing dep (lvm2 not installed yet) yields an empty
-// section rather than aborting the whole probe; lsblk (util-linux, always
-// present) runs last so the overall exit code reflects it.
+// its own stderr so a missing dep yields an empty section rather than aborting
+// the whole probe; lsblk (util-linux, always present) runs last so the overall
+// exit code reflects it.
 const inventoryCmd = "echo '###VGS###'; vgs --units g --noheadings --nosuffix --separator , -o vg_name,vg_size,vg_free 2>/dev/null; " +
 	"echo '###LVS###'; lvs --units g --noheadings --nosuffix --separator , -o vg_name,lv_name,lv_size,lv_path 2>/dev/null; " +
-	"echo '###PVS###'; pvs --noheadings --nosuffix --separator , -o pv_name,vg_name 2>/dev/null; " +
+	"echo '###PVS###'; pvs --units g --noheadings --nosuffix --separator , -o pv_name,pv_size,pv_free,vg_name 2>/dev/null; " +
+	"echo '###DF###'; df -B1 -P 2>/dev/null; " +
+	"echo '###NFS###'; (systemctl is-active nfs-server 2>/dev/null || systemctl is-active nfs-kernel-server 2>/dev/null || echo inactive); " +
+	"echo '###EXPORTS###'; (exportfs -v 2>/dev/null || cat /etc/exports 2>/dev/null); " +
 	"echo '###LSBLK###'; lsblk -b -P -n -o NAME,TYPE,SIZE,MOUNTPOINT,FSTYPE,PKNAME 2>/dev/null"
 
 // lsblkRow is one parsed lsblk -P line.
@@ -74,13 +100,109 @@ func ListInventory(ctx context.Context, runner ssh.Runner, w db.WorkerNode) (*In
 	return parseInventory(out), nil
 }
 
+type pvDetail struct {
+	SizeGB float64
+	FreeGB float64
+	VGName string
+}
+
+type dfDetail struct {
+	UsedBytes  int64
+	AvailBytes int64
+	Capacity   string
+}
+
+// NFSHostStatus represents an overall summary of a worker host running NFS,
+// detailing its physical disks, remaining capacities, allocated virtual disks,
+// their mount points and space utilization, and NFS export configuration.
+type NFSHostStatus struct {
+	WorkerID      int64              `json:"worker_id"`
+	WorkerName    string             `json:"worker_name"`
+	Host          string             `json:"host"`
+	Port          int                `json:"port"`
+	Status        string             `json:"status"`
+	NFSActive     bool               `json:"nfs_active"`
+	TotalDisks    int                `json:"total_disks"`
+	PhysicalDisks []PhysicalDiskInfo `json:"physical_disks"`
+	VirtualDisks  []LVInfo           `json:"virtual_disks"`
+	NFSExports    []string           `json:"nfs_exports"`
+	ErrorMessage  string             `json:"error_message,omitempty"`
+}
+
+// ListNFSHosts probes workers and returns the NFS host status. If nfsOnly is true,
+// it filters only nodes where NFS is active or has NFS exports; if false, it returns
+// all accessible worker nodes with their NFS and disk status.
+func ListNFSHosts(ctx context.Context, runner ssh.Runner, workers []db.WorkerNode, nfsOnly bool) ([]NFSHostStatus, error) {
+	results := make([]NFSHostStatus, len(workers))
+	var wg sync.WaitGroup
+
+	for i, w := range workers {
+		wg.Add(1)
+		go func(idx int, node db.WorkerNode) {
+			defer wg.Done()
+			st := NFSHostStatus{
+				WorkerID:      node.ID,
+				WorkerName:    node.Name,
+				Host:          node.Host,
+				Port:          node.Port,
+				Status:        node.Status,
+				PhysicalDisks: []PhysicalDiskInfo{},
+				VirtualDisks:  []LVInfo{},
+				NFSExports:    []string{},
+			}
+			inv, err := ListInventory(ctx, runner, node)
+			if err != nil {
+				st.ErrorMessage = err.Error()
+				results[idx] = st
+				return
+			}
+			st.NFSActive = inv.NFS.Active
+			st.PhysicalDisks = inv.PhysicalDisks
+			st.TotalDisks = len(inv.PhysicalDisks)
+			st.VirtualDisks = inv.LVs
+			st.NFSExports = inv.NFS.Exports
+			results[idx] = st
+		}(i, w)
+	}
+	wg.Wait()
+
+	if !nfsOnly {
+		return results, nil
+	}
+
+	var filtered []NFSHostStatus
+	for _, res := range results {
+		hasExportedLV := false
+		for _, lv := range res.VirtualDisks {
+			if lv.IsNFSExport {
+				hasExportedLV = true
+				break
+			}
+		}
+		if res.NFSActive || len(res.NFSExports) > 0 || hasExportedLV {
+			filtered = append(filtered, res)
+		}
+	}
+	return filtered, nil
+}
+
 // parseInventory splits the sectioned command output and joins LVs with lsblk
-// (for mount point + filesystem) and computes unused disks. Exported to tests
-// via the package so parseInventory can be unit-tested with fixture output.
+// (for mount point + filesystem), df (for space usage), exports (for NFS status),
+// and computes physical disks and unused disks. Exported to tests via the package
+// so parseInventory can be unit-tested with fixture output.
 func parseInventory(out string) *InventoryInfo {
-	inv := &InventoryInfo{VGs: []VGInfo{}, LVs: []LVInfo{}, UnusedDisks: []DiskInfo{}}
+	inv := &InventoryInfo{
+		NFS:           NFSStatusInfo{Active: false, Exports: []string{}},
+		VGs:           []VGInfo{},
+		LVs:           []LVInfo{},
+		PhysicalDisks: []PhysicalDiskInfo{},
+		UnusedDisks:   []DiskInfo{},
+	}
 	var lsblkRows []lsblkRow
 	pvSet := map[string]bool{}
+	pvMap := map[string]pvDetail{}
+	dfMap := map[string]dfDetail{}
+	exportsMap := map[string]string{}
 	section := ""
 	for _, raw := range strings.Split(out, "\n") {
 		line := strings.TrimSpace(raw)
@@ -101,11 +223,53 @@ func parseInventory(out string) *InventoryInfo {
 				inv.LVs = append(inv.LVs, lv)
 			}
 		case "pvs":
-			// pvs -o pv_name,vg_name -> "/dev/sdb,vg_data" (vg may be empty)
+			// pvs -o pv_name,pv_size,pv_free,vg_name
+			// e.g. "/dev/sdb,3500.00g,2300.00g,vg_data" or "/dev/sdb,vg_data"
 			parts := strings.Split(line, ",")
 			if len(parts) >= 1 {
-				if pv := strings.TrimSpace(parts[0]); pv != "" {
+				pv := strings.TrimSpace(parts[0])
+				if pv != "" {
 					pvSet[pv] = true
+					d := pvDetail{}
+					if len(parts) >= 4 {
+						sGB, _ := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(parts[1]), "g"), 64)
+						fGB, _ := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(parts[2]), "g"), 64)
+						d.SizeGB = sGB
+						d.FreeGB = fGB
+						d.VGName = strings.TrimSpace(parts[3])
+					} else if len(parts) >= 2 {
+						d.VGName = strings.TrimSpace(parts[1])
+					}
+					pvMap[pv] = d
+				}
+			}
+		case "df":
+			// df -B1 -P output: Filesystem 1024-blocks Used Available Capacity Mounted on
+			fields := strings.Fields(line)
+			if len(fields) >= 6 && fields[0] != "Filesystem" {
+				usedB, _ := strconv.ParseInt(fields[2], 10, 64)
+				availB, _ := strconv.ParseInt(fields[3], 10, 64)
+				cap := fields[4]
+				mp := strings.Join(fields[5:], " ")
+				dfMap[mp] = dfDetail{UsedBytes: usedB, AvailBytes: availB, Capacity: cap}
+			}
+		case "nfs":
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, "active") && !strings.Contains(lower, "inactive") {
+				inv.NFS.Active = true
+			}
+		case "exports":
+			if !strings.HasPrefix(line, "#") {
+				fields := strings.Fields(line)
+				if len(fields) >= 1 && strings.HasPrefix(fields[0], "/") {
+					expPath := fields[0]
+					opts := ""
+					if len(fields) > 1 {
+						opts = strings.Join(fields[1:], " ")
+					}
+					exportsMap[expPath] = opts
+					inv.NFS.Exports = append(inv.NFS.Exports, expPath)
+					inv.NFS.Active = true
 				}
 			}
 		case "lsblk":
@@ -116,9 +280,6 @@ func parseInventory(out string) *InventoryInfo {
 	}
 
 	// Join LVs with lsblk lvm rows by device-mapper name for mount + fstype.
-	// lsblk NAME for an LVM device is the dm name = vg+"-"+lv with every "-" in
-	// vg/lv doubled to "--" (LVM escaping). dmName reproduces that so the join
-	// matches even when vg or lv contain hyphens.
 	lvmByName := map[string]lsblkRow{}
 	for _, r := range lsblkRows {
 		if r.Type == "lvm" {
@@ -126,23 +287,36 @@ func parseInventory(out string) *InventoryInfo {
 		}
 	}
 	for i := range inv.LVs {
-		if r, ok := lvmByName[dmName(inv.LVs[i].VGName, inv.LVs[i].Name)]; ok {
-			inv.LVs[i].MountPoint = r.Mountpoint
-			inv.LVs[i].FSType = r.Fstype
+		lv := &inv.LVs[i]
+		if r, ok := lvmByName[dmName(lv.VGName, lv.Name)]; ok {
+			lv.MountPoint = r.Mountpoint
+			lv.FSType = r.Fstype
+		}
+		if lv.MountPoint != "" {
+			if df, ok := dfMap[lv.MountPoint]; ok {
+				lv.UsedGB = bytesToGB(df.UsedBytes)
+				lv.FreeGB = bytesToGB(df.AvailBytes)
+				lv.UsePct = df.Capacity
+			}
+			if opt, ok := exportsMap[lv.MountPoint]; ok {
+				lv.IsNFSExport = true
+				lv.NFSExportOpt = opt
+			}
+		}
+		if lv.FreeGB == 0 && lv.UsedGB == 0 {
+			lv.FreeGB = lv.SizeGB
 		}
 	}
 
 	// Unused disks: TYPE=disk with no children (no lsblk row has PKNAME==disk),
-	// no filesystem, no mountpoint, and not already a PV. This excludes the OS
-	// disk (has mounted partitions) and PV disks (have LV children, or are in
-	// pvSet for an empty VG). Disks with a partition table are excluded by the
-	// "no children" rule so we never wipe a partition table.
+	// no filesystem, no mountpoint, and not already a PV.
 	childrenOf := map[string]bool{}
 	for _, r := range lsblkRows {
 		if r.Pkname != "" {
 			childrenOf[r.Pkname] = true
 		}
 	}
+	unusedMap := map[string]bool{}
 	for _, r := range lsblkRows {
 		if r.Type != "disk" {
 			continue
@@ -156,11 +330,58 @@ func parseInventory(out string) *InventoryInfo {
 		if pvSet["/dev/"+r.Name] {
 			continue
 		}
+		dName := "/dev/" + r.Name
 		inv.UnusedDisks = append(inv.UnusedDisks, DiskInfo{
-			Name:   "/dev/" + r.Name,
+			Name:   dName,
 			SizeGB: bytesToGB(r.SizeBytes),
 		})
+		unusedMap[dName] = true
 	}
+
+	// Physical disks: all TYPE=disk block devices (excluding virtual loops/rams)
+	for _, r := range lsblkRows {
+		if r.Type != "disk" {
+			continue
+		}
+		if strings.HasPrefix(r.Name, "loop") || strings.HasPrefix(r.Name, "ram") || strings.HasPrefix(r.Name, "zram") || strings.HasPrefix(r.Name, "sr") {
+			continue
+		}
+		devName := "/dev/" + r.Name
+		sizeGB := bytesToGB(r.SizeBytes)
+		disk := PhysicalDiskInfo{
+			Name:   devName,
+			SizeGB: sizeGB,
+		}
+		if pv, ok := pvMap[devName]; ok {
+			disk.Role = "lvm"
+			disk.VGName = pv.VGName
+			disk.FreeGB = pv.FreeGB
+			if disk.FreeGB == 0 && pv.VGName != "" {
+				for _, v := range inv.VGs {
+					if v.Name == pv.VGName {
+						disk.FreeGB = v.FreeGB
+						break
+					}
+				}
+			}
+		} else if unusedMap[devName] {
+			disk.Role = "unused"
+			disk.FreeGB = sizeGB
+		} else {
+			disk.Role = "system"
+			var partBytes int64
+			for _, p := range lsblkRows {
+				if p.Pkname == r.Name {
+					partBytes += p.SizeBytes
+				}
+			}
+			if r.SizeBytes > partBytes {
+				disk.FreeGB = bytesToGB(r.SizeBytes - partBytes)
+			}
+		}
+		inv.PhysicalDisks = append(inv.PhysicalDisks, disk)
+	}
+
 	return inv
 }
 

@@ -127,6 +127,78 @@ func TestParseInventory_HyphenNamesJoin(t *testing.T) {
 	}
 }
 
+func TestParseInventory_NFS_DF_PhysicalDisks(t *testing.T) {
+	const out = "###VGS###\n" +
+		"vg_data,3500.00g,2300.00g\n" +
+		"###LVS###\n" +
+		"vg_data,lv_notebook_200g,200.00g,/dev/vg_data/lv_notebook_200g\n" +
+		"###PVS###\n" +
+		"/dev/sdb,3500.00g,2300.00g,vg_data\n" +
+		"###DF###\n" +
+		"Filesystem 1024-blocks Used Available Capacity Mounted on\n" +
+		"/dev/mapper/vg_data-lv_notebook_200g 214748364800 10737418240 204010946560 5% /data02/notebook_a_200g\n" +
+		"###NFS###\n" +
+		"active\n" +
+		"###EXPORTS###\n" +
+		"/data02/notebook_a_200g *(rw,sync,no_root_squash,no_subtree_check)\n" +
+		"###LSBLK###\n" +
+		`NAME="sda" TYPE="disk" SIZE="858993459200" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sda1" TYPE="part" SIZE="1073741824" MOUNTPOINT="/boot" FSTYPE="ext4" PKNAME="sda"` + "\n" +
+		`NAME="sda2" TYPE="part" SIZE="751619276800" MOUNTPOINT="/" FSTYPE="ext4" PKNAME="sda"` + "\n" +
+		`NAME="sdb" TYPE="disk" SIZE="3758096384000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="vg_data-lv_notebook_200g" TYPE="lvm" SIZE="214748364800" MOUNTPOINT="/data02/notebook_a_200g" FSTYPE="ext4" PKNAME="sdb"` + "\n" +
+		`NAME="sdc" TYPE="disk" SIZE="1073741824000" MOUNTPOINT="" FSTYPE="" PKNAME=""`
+
+	inv := parseInventory(out)
+
+	// Check NFS
+	if !inv.NFS.Active {
+		t.Fatal("expected NFS to be active")
+	}
+	if len(inv.NFS.Exports) != 1 || inv.NFS.Exports[0] != "/data02/notebook_a_200g" {
+		t.Fatalf("unexpected exports: %+v", inv.NFS.Exports)
+	}
+
+	// Check Physical Disks
+	if len(inv.PhysicalDisks) != 3 {
+		t.Fatalf("expected 3 physical disks (sda, sdb, sdc), got %d: %+v", len(inv.PhysicalDisks), inv.PhysicalDisks)
+	}
+	sda := inv.PhysicalDisks[0]
+	if sda.Name != "/dev/sda" || sda.Role != "system" {
+		t.Fatalf("sda wrong: %+v", sda)
+	}
+	sdb := inv.PhysicalDisks[1]
+	if sdb.Name != "/dev/sdb" || sdb.Role != "lvm" || sdb.FreeGB != 2300.00 || sdb.VGName != "vg_data" {
+		t.Fatalf("sdb wrong: %+v", sdb)
+	}
+	sdc := inv.PhysicalDisks[2]
+	if sdc.Name != "/dev/sdc" || sdc.Role != "unused" || sdc.FreeGB < 1073.0 {
+		t.Fatalf("sdc wrong: %+v", sdc)
+	}
+
+	// Check Virtual Disk (LV)
+	if len(inv.LVs) != 1 {
+		t.Fatalf("expected 1 lv, got %d", len(inv.LVs))
+	}
+	lv := inv.LVs[0]
+	if lv.Name != "lv_notebook_200g" || lv.MountPoint != "/data02/notebook_a_200g" {
+		t.Fatalf("lv metadata wrong: %+v", lv)
+	}
+	if !lv.IsNFSExport {
+		t.Fatal("expected LV to be flagged as NFS export")
+	}
+	if lv.UsedGB < 10.73 || lv.UsedGB > 10.75 {
+		t.Fatalf("lv used gb wrong: %v", lv.UsedGB)
+	}
+	if lv.FreeGB < 204.0 || lv.FreeGB > 204.1 {
+		t.Fatalf("lv free gb wrong: %v", lv.FreeGB)
+	}
+	if lv.UsePct != "5%" {
+		t.Fatalf("lv use pct wrong: %v", lv.UsePct)
+	}
+}
+
+
 // TestListInventory_Run verifies the SSH round-trip: the runner's output is fed
 // to parseInventory unchanged.
 func TestListInventory_Run(t *testing.T) {

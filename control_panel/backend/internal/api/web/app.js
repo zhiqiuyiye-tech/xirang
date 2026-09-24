@@ -737,6 +737,20 @@
             '<p class="page-subtitle">节点磁盘资源发现、卷组 (VG) 与逻辑卷 (LV) 容量伸缩、NFS 共享目录生命周期管理</p>' +
             '</div>' +
             '</div>' +
+            // Block 0: Active NFS Hosts & Virtual Disks Overview
+            '<div class="card mb-3" id="st-nfs-overview-card">' +
+            '<div class="card-header" style="justify-content:space-between;align-items:center;">' +
+            '<div>' +
+            '<div class="section-title" style="margin-bottom:0;">当前已开启 NFS 的主机概览</div>' +
+            '<span class="muted" style="font-size:12px;">展示已开启 NFS 的主机硬件磁盘分布、剩余可用容量、划分的虚拟盘及其挂载目录与空间占用</span>' +
+            '</div>' +
+            '<button class="btn btn-outline btn-xs" id="btn-refresh-nfs-hosts">刷新监控状态</button>' +
+            '</div>' +
+            '<div id="st-nfs-hosts-container" style="padding-top:10px;">' +
+            '<div class="muted">正在探测已开启 NFS 的主机情况...</div>' +
+            '</div>' +
+            '</div>' +
+            // Worker Selector
             '<div class="card">' +
             '<div class="card-header">' +
             '<div class="section-title" style="margin-bottom:0;">目标 Worker 存储节点</div>' +
@@ -748,11 +762,12 @@
             // Block A: VG pool management
             '<div class="card mt-2">' +
             '<div class="card-header">' +
-            '<div class="section-title" style="margin-bottom:0;">存储池 (VG) 管理</div>' +
+            '<div class="section-title" style="margin-bottom:0;">存储池 (VG) 与物理硬盘</div>' +
             '<div style="display:flex;align-items:center;gap:12px;">' +
             '<span id="st-vg-summary" class="muted" style="font-size:12.5px;"></span>' +
             '<button class="btn btn-primary btn-sm" id="btn-init-vg" disabled>初始化 VG 池 (从未挂载裸盘)</button>' +
             '</div></div>' +
+            '<div id="st-disks-container" style="margin-bottom:12px;"></div>' +
             '<div class="table-responsive">' +
             '<table class="data-table" id="st-vg-table"><thead><tr><th>VG 卷组名称</th><th>总容量</th><th>剩余可用容量</th></tr></thead>' +
             '<tbody id="st-vg-tbody"><tr><td colspan="3" class="muted">请在上方选择 Worker 节点以获取 VG 存储池状态。</td></tr></tbody></table>' +
@@ -760,12 +775,12 @@
             // Block B: LV management
             '<div class="card mt-2">' +
             '<div class="card-header">' +
-            '<div class="section-title" style="margin-bottom:0;">逻辑卷 (LV) 管理</div>' +
-            '<span class="muted" style="font-size:12px;">包含全部底层识别的 LV 卷，支持动态扩容、缩容及卸载释放空间</span>' +
+            '<div class="section-title" style="margin-bottom:0;">逻辑卷 (虚拟盘) 管理</div>' +
+            '<span class="muted" style="font-size:12px;">包含全部底层识别的 LV 虚拟盘，实时监控挂载目录、空间已用/剩余与 NFS 导出状态</span>' +
             '</div>' +
             '<div class="table-responsive">' +
-            '<table class="data-table" id="st-lv-table"><thead><tr><th>LV 卷名称</th><th>所属 VG</th><th>容量 (GB)</th><th>挂载点</th><th>文件系统</th><th style="text-align:right;">操作</th></tr></thead>' +
-            '<tbody id="st-lv-tbody"><tr><td colspan="6" class="muted">请先在上方选择 Worker 节点。</td></tr></tbody></table>' +
+            '<table class="data-table" id="st-lv-table"><thead><tr><th>虚拟盘名称</th><th>所属 VG</th><th>总容量</th><th>挂载目录</th><th>已用空间</th><th>剩余可用</th><th>使用率</th><th>NFS 导出</th><th style="text-align:right;">操作</th></tr></thead>' +
+            '<tbody id="st-lv-tbody"><tr><td colspan="9" class="muted">请先在上方选择 Worker 节点。</td></tr></tbody></table>' +
             '</div></div>' +
             // Block C: create NFS share
             '<div class="card mt-2">' +
@@ -795,6 +810,124 @@
         var lastInventory = null;
         var workersMap = {};
 
+        async function loadNFSHosts() {
+            var container = document.getElementById('st-nfs-hosts-container');
+            if (!container) return;
+            container.innerHTML = '<div class="muted">正在查询已开启 NFS 的主机状态...</div>';
+            try {
+                var r = await apiJSON('/storage/nfs-hosts');
+                if (!r.resp.ok) {
+                    container.innerHTML = '<div class="error-msg">获取已开启 NFS 主机失败: ' + esc((r.data && r.data.error) || '请求异常') + '</div>';
+                    return;
+                }
+                var hosts = r.data || [];
+                if (hosts.length === 0) {
+                    container.innerHTML = '<div class="muted" style="padding:8px 0;">当前暂无运行中或配置有 NFS 共享的主机。可在下方选择 Worker 节点创建并导出 NFS 共享。</div>';
+                    return;
+                }
+
+                container.innerHTML = hosts.map(function (h) {
+                    var disks = h.physical_disks || [];
+                    var vdisks = h.virtual_disks || [];
+                    var exports = h.nfs_exports || [];
+
+                    var disksHtml = disks.length === 0 ? '<span class="muted">暂未检测到物理硬盘信息</span>' : disks.map(function (d) {
+                        var roleTag = d.role === 'lvm' ? '<span class="badge badge-muted" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>' :
+                            (d.role === 'unused' ? '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>' : '<span class="badge badge-muted" style="font-size:11px;">系统盘</span>');
+                        return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:8px 12px;min-width:180px;">' +
+                            '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">' +
+                            '<strong>' + esc(d.name) + '</strong>' + roleTag +
+                            '</div>' +
+                            '<div style="font-size:12px;color:var(--text-muted);margin-top:4px;">' +
+                            '总计: <span class="font-mono">' + (d.size_gb || 0).toFixed(1) + ' GB</span>' +
+                            '<br>剩余: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>' +
+                            '</div>' +
+                            '</div>';
+                    }).join('');
+
+                    var vdisksHtml = '';
+                    if (vdisks.length === 0) {
+                        vdisksHtml = '<div class="muted" style="padding:6px 0;font-size:12px;">该主机暂无划分的虚拟盘。</div>';
+                    } else {
+                        vdisksHtml = '<div class="table-responsive" style="margin-top:8px;">' +
+                            '<table class="data-table" style="font-size:12px;">' +
+                            '<thead><tr><th>虚拟盘名称</th><th>挂载目录</th><th>总容量</th><th>已用空间</th><th>剩余空间</th><th>使用率</th><th>NFS 状态</th><th>操作</th></tr></thead>' +
+                            '<tbody>' +
+                            vdisks.map(function (lv) {
+                                var pctNum = parseInt(lv.use_pct || '0', 10) || 0;
+                                var pctColor = pctNum > 85 ? 'var(--danger)' : (pctNum > 60 ? 'var(--warning, #f59e0b)' : 'var(--success)');
+                                var nfsBadge = lv.is_nfs_export
+                                    ? '<span class="badge badge-success" title="' + esc(lv.nfs_export_opt || '') + '">✓ NFS 已导出</span>'
+                                    : '<span class="badge badge-muted">未导出</span>';
+                                var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
+                                var platBtn = lv.mount_point
+                                    ? '<button class="btn btn-xs btn-outline" data-act="platform" data-wid="' + h.worker_id + '" data-host="' + esc(h.host) + '" data-lv=\'' + esc(data) + '\'>平台参数</button>'
+                                    : '-';
+                                return '<tr>' +
+                                    '<td><strong>' + esc(lv.name) + '</strong></td>' +
+                                    '<td><span class="font-mono">' + esc(lv.mount_point || '(未挂载)') + '</span></td>' +
+                                    '<td><span class="font-mono">' + (lv.size_gb || 0).toFixed(1) + ' GB</span></td>' +
+                                    '<td><span class="font-mono">' + (lv.mount_point ? (lv.used_gb || 0).toFixed(1) + ' GB' : '-') + '</span></td>' +
+                                    '<td><span class="font-mono">' + (lv.mount_point ? '<strong style="color:var(--success);">' + (lv.free_gb || 0).toFixed(1) + ' GB</strong>' : '-') + '</span></td>' +
+                                    '<td>' +
+                                    (lv.mount_point ? '<div style="display:flex;align-items:center;gap:6px;">' +
+                                        '<div style="flex:1;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;min-width:50px;">' +
+                                        '<div style="width:' + Math.min(pctNum, 100) + '%;height:100%;background:' + pctColor + ';"></div>' +
+                                        '</div>' +
+                                        '<span style="font-size:11px;min-width:30px;">' + esc(lv.use_pct || '0%') + '</span>' +
+                                        '</div>' : '-') +
+                                    '</td>' +
+                                    '<td>' + nfsBadge + '</td>' +
+                                    '<td>' + platBtn + '</td>' +
+                                    '</tr>';
+                            }).join('') +
+                            '</tbody></table></div>';
+                    }
+
+                    return '<div style="border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:12px;background:rgba(255,255,255,0.015);">' +
+                        '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:10px;margin-bottom:10px;">' +
+                        '<div style="display:flex;align-items:center;gap:10px;">' +
+                        '<strong style="font-size:14px;">' + esc(h.worker_name) + '</strong>' +
+                        '<span class="badge badge-muted font-mono">' + esc(h.host) + ':' + h.port + '</span>' +
+                        '<span class="badge badge-success"><span class="badge-dot"></span>NFS 服务运行中</span>' +
+                        '</div>' +
+                        '<div style="font-size:12px;color:var(--text-muted);">' +
+                        '物理硬盘: <strong class="font-mono">' + (h.total_disks || disks.length) + '</strong> 块 · 虚拟盘: <strong class="font-mono">' + vdisks.length + '</strong> 个 · 导出路径: <strong class="font-mono">' + exports.length + '</strong> 个' +
+                        '</div>' +
+                        '</div>' +
+                        '<div style="margin-bottom:10px;">' +
+                        '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">物理硬盘情况 (分别有 ' + (h.total_disks || disks.length) + ' 块硬盘，及其剩余容量)：</div>' +
+                        '<div style="display:flex;flex-wrap:wrap;gap:8px;">' + disksHtml + '</div>' +
+                        '</div>' +
+                        '<div>' +
+                        '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:4px;">划分的虚拟盘与挂载状态 (挂载目录、空间已用与剩余)：</div>' +
+                        vdisksHtml +
+                        '</div>' +
+                        '</div>';
+                }).join('');
+
+                container.querySelectorAll('button[data-act="platform"]').forEach(function (btn) {
+                    btn.addEventListener('click', function () {
+                        var lv = JSON.parse(this.getAttribute('data-lv'));
+                        var wid = this.getAttribute('data-wid');
+                        var host = this.getAttribute('data-host') || '127.0.0.1';
+                        showPlatformRegistrationModal(content, {
+                            name: 'nfs-' + lv.name,
+                            service_address: host,
+                            path: lv.mp || '/data02/notebook_nfs',
+                            size_gb: lv.size,
+                            workspace_uuid: ''
+                        });
+                    });
+                });
+            } catch (e) {
+                container.innerHTML = '<div class="error-msg">加载异常: ' + esc(e.message) + '</div>';
+            }
+        }
+
+        document.getElementById('btn-refresh-nfs-hosts').addEventListener('click', loadNFSHosts);
+        loadNFSHosts();
+
         try {
             var r = await apiJSON('/workers');
             if (r.resp.ok && Array.isArray(r.data)) {
@@ -817,19 +950,21 @@
             var btnInit = document.getElementById('btn-init-vg');
             var btnNfs = document.getElementById('btn-nfs-create');
             var summary = document.getElementById('st-vg-summary');
+            var disksContainer = document.getElementById('st-disks-container');
 
             btnInit.disabled = true; btnNfs.disabled = true; vsel.disabled = true;
             vsel.innerHTML = '<option value="">正在分析节点存储...</option>';
             vfree.textContent = ''; summary.textContent = '';
+            if (disksContainer) disksContainer.innerHTML = '';
             vgTbody.innerHTML = '<tr><td colspan="3" class="muted">正在获取存储池 (VG) 数据...</td></tr>';
-            lvTbody.innerHTML = '<tr><td colspan="6" class="muted">正在获取逻辑卷 (LV) 数据...</td></tr>';
+            lvTbody.innerHTML = '<tr><td colspan="9" class="muted">正在获取逻辑卷 (虚拟盘) 数据...</td></tr>';
             try {
                 var r = await apiJSON('/storage/inventory?worker_id=' + encodeURIComponent(wid));
                 if (!r.resp.ok) {
                     var err = (r.data && r.data.error) || '加载失败';
                     setMsg(invMsg, '加载存储清单失败: ' + err + ' (若未安装 lvm2/nfs,请先在 Worker 页面点击「安装依赖」)', 'error');
                     vgTbody.innerHTML = '<tr><td colspan="3" class="muted">存储池清单获取失败</td></tr>';
-                    lvTbody.innerHTML = '<tr><td colspan="6" class="muted">逻辑卷清单获取失败</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="9" class="muted">逻辑卷清单获取失败</td></tr>';
                     vsel.innerHTML = '<option value="">-- 加载失败 --</option>';
                     return;
                 }
@@ -846,6 +981,24 @@
                     }).join('');
                 }
 
+                var pdisks = inv.physical_disks || [];
+                if (disksContainer) {
+                    if (pdisks.length === 0) {
+                        disksContainer.innerHTML = '';
+                    } else {
+                        disksContainer.innerHTML = '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">节点物理硬盘列表 (共 ' + pdisks.length + ' 块物理硬盘)：</div>' +
+                            '<div style="display:flex;flex-wrap:wrap;gap:8px;">' +
+                            pdisks.map(function (d) {
+                                var roleTag = d.role === 'lvm' ? '<span class="badge badge-muted" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>' :
+                                    (d.role === 'unused' ? '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>' : '<span class="badge badge-muted" style="font-size:11px;">系统盘</span>');
+                                return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;min-width:160px;">' +
+                                    '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;"><strong>' + esc(d.name) + '</strong>' + roleTag + '</div>' +
+                                    '<div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">总计: ' + (d.size_gb || 0).toFixed(1) + ' GB · 剩余: <strong style="color:var(--success);">' + (d.free_gb || 0).toFixed(1) + ' GB</strong></div>' +
+                                    '</div>';
+                            }).join('') + '</div>';
+                    }
+                }
+
                 var disks = inv.unused_disks || [];
                 if (disks.length > 0) {
                     btnInit.disabled = false;
@@ -856,19 +1009,31 @@
 
                 var lvs = inv.lvs || [];
                 if (lvs.length === 0) {
-                    lvTbody.innerHTML = '<tr><td colspan="6" class="muted">该节点当前无逻辑卷。</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="9" class="muted">该节点当前无划分的虚拟盘。</td></tr>';
                 } else {
                     lvTbody.innerHTML = lvs.map(function (lv) {
                         var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
                         var platBtn = lv.mount_point
                             ? '<button class="btn btn-xs btn-outline" data-act="platform" data-lv=\'' + esc(data) + '\'>平台参数</button>'
                             : '';
+                        var pctNum = parseInt(lv.use_pct || '0', 10) || 0;
+                        var pctColor = pctNum > 85 ? 'var(--danger)' : (pctNum > 60 ? 'var(--warning, #f59e0b)' : 'var(--success)');
+                        var nfsBadge = lv.is_nfs_export
+                            ? '<span class="badge badge-success" title="' + esc(lv.nfs_export_opt || '') + '">✓ 已导出</span>'
+                            : '<span class="badge badge-muted">未导出</span>';
+                        var usedCol = lv.mount_point ? (lv.used_gb || 0).toFixed(1) + ' GB' : '-';
+                        var freeCol = lv.mount_point ? '<strong style="color:var(--success);">' + (lv.free_gb || 0).toFixed(1) + ' GB</strong>' : '-';
+                        var pctCol = lv.mount_point ? ('<div style="display:flex;align-items:center;gap:6px;"><div style="flex:1;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;min-width:40px;"><div style="width:' + Math.min(pctNum, 100) + '%;height:100%;background:' + pctColor + ';"></div></div><span style="font-size:11px;min-width:28px;">' + esc(lv.use_pct || '0%') + '</span></div>') : '-';
+
                         return '<tr>' +
                             '<td><strong>' + esc(lv.name) + '</strong></td>' +
                             '<td><span class="font-mono">' + esc(lv.vg_name) + '</span></td>' +
                             '<td><span class="font-mono">' + (lv.size_gb || 0).toFixed(1) + ' GB</span></td>' +
                             '<td><span class="font-mono">' + esc(lv.mount_point || '-') + '</span></td>' +
-                            '<td><span class="badge badge-muted">' + esc(lv.fs_type || '-') + '</span></td>' +
+                            '<td><span class="font-mono">' + usedCol + '</span></td>' +
+                            '<td><span class="font-mono">' + freeCol + '</span></td>' +
+                            '<td>' + pctCol + '</td>' +
+                            '<td>' + nfsBadge + '</td>' +
                             '<td style="text-align:right;">' +
                             '<div class="actions-cell" style="justify-content: flex-end;">' +
                             platBtn +
@@ -932,6 +1097,7 @@
             if (!wsel.value || !lastInventory) return;
             showInitVGForm(content, parseInt(wsel.value, 10), lastInventory.unused_disks || [], function () {
                 loadInventory(wsel.value);
+                loadNFSHosts();
             });
         });
 

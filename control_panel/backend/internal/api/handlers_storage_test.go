@@ -194,6 +194,46 @@ func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
+// TestListNFSHostsViaAPI verifies GET /api/v1/storage/nfs-hosts returns 200
+// with an array of NFS host summaries.
+func TestListNFSHostsViaAPI(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	// Empty case
+	req := httptest.NewRequest("GET", "/api/v1/storage/nfs-hosts", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var hosts []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &hosts); err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 0 {
+		t.Fatalf("expected 0 hosts, got %d", len(hosts))
+	}
+
+	// With a worker and all=true
+	_, _ = ws.Create(context.Background(), workers.CreateReq{
+		Name: "w-test", Host: "127.0.0.1", Port: 22, Username: "root",
+	})
+	req2 := httptest.NewRequest("GET", "/api/v1/storage/nfs-hosts?all=true", nil)
+	req2.Header.Set("Authorization", authHeader(t, tk))
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w2.Code, w2.Body.String())
+	}
+	var hosts2 []map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &hosts2); err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts2) != 1 {
+		t.Fatalf("expected 1 host with all=true, got %d", len(hosts2))
+	}
+}
+
 // TestListStorageTasksViaAPI verifies GET /api/v1/storage returns 200 and the
 // filtered list of tasks with target_kind='storage'. A provision task is
 // submitted first so the list has at least one storage task; the async task

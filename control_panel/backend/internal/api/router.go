@@ -194,6 +194,7 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.GET("/storage", sh.list)
 		authed.GET("/storage/vgs", sh.listVgs)
 		authed.GET("/storage/inventory", sh.listInventory)
+		authed.GET("/storage/nfs-hosts", sh.listNFSHosts)
 		authed.POST("/storage/vg", sh.createVG)
 		authed.POST("/storage/lv/resize", sh.resizeLV)
 		authed.POST("/storage/lv/delete", sh.deleteLV)
