@@ -108,6 +108,21 @@ func (h *taskHandlers) stream(c *gin.Context) {
 	if flusher != nil {
 		flusher.Flush()
 	}
+	if t.Status == "succeeded" || t.Status == "failed" {
+		for {
+			select {
+			case ev, ok := <-ch:
+				if ok && ev.Seq > 0 {
+					c.SSEvent("step", ev)
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+			default:
+				return
+			}
+		}
+	}
 	// Heartbeat: comment frames are ignored by EventSource but keep
 	// intermediaries (proxies / load balancers) from reaping the idle
 	// connection between step events.
@@ -119,9 +134,22 @@ func (h *taskHandlers) stream(c *gin.Context) {
 			if !ok {
 				return
 			}
-			c.SSEvent("step", ev)
-			if flusher != nil {
-				flusher.Flush()
+			if ev.Seq == 0 {
+				curTask, err := h.store.GetTask(c, id)
+				if err == nil {
+					c.SSEvent("task", curTask)
+					if flusher != nil {
+						flusher.Flush()
+					}
+					if curTask.Status == "succeeded" || curTask.Status == "failed" {
+						return
+					}
+				}
+			} else {
+				c.SSEvent("step", ev)
+				if flusher != nil {
+					flusher.Flush()
+				}
 			}
 		case <-hb.C:
 			if _, err := c.Writer.WriteString(": keepalive\n\n"); err != nil {

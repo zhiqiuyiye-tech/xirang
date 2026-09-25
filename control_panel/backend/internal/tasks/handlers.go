@@ -16,9 +16,12 @@ type Handler interface {
 // StepEvent is emitted by the engine whenever a step (or the task itself)
 // transitions state. Subscribers receive these on their channel.
 type StepEvent struct {
-	TaskID int64
-	StepID int64
-	Seq    int
-	Name   string
-	Status string
+	TaskID int64  `json:"task_id"`
+	StepID int64  `json:"step_id"`
+	Seq    int    `json:"seq"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
+	Error  string `json:"error,omitempty"`
 }

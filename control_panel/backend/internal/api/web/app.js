@@ -265,14 +265,38 @@
         el.textContent = msg;
     }
 
-    // ===== Hash Router =====
+    // ===== Hash Router & Stream Lifecycles =====
     var routes = {};
+    var currentSSE = null;
+    var taskPollTimer = null;
+    var tasksListTimer = null;
+
+    function closeSSE() {
+        if (currentSSE) {
+            try { currentSSE.close(); } catch (e) {}
+            currentSSE = null;
+        }
+        if (taskPollTimer) {
+            clearInterval(taskPollTimer);
+            taskPollTimer = null;
+        }
+    }
+
+    function clearTasksListTimer() {
+        if (tasksListTimer) {
+            clearInterval(tasksListTimer);
+            tasksListTimer = null;
+        }
+    }
 
     function registerRoute(path, handler) {
         routes[path] = handler;
     }
 
     function handleRoute() {
+        closeSSE();
+        clearTasksListTimer();
+
         var hash = window.location.hash.slice(1) || '/workers';
         var links = document.querySelectorAll('.nav-link');
         links.forEach(function (l) {
@@ -1384,17 +1408,7 @@
             '</div>' +
             '<button class="btn btn-primary" id="btn-nfs-create" disabled>创建并导出 NFS 共享</button>' +
             '<div id="st-nfs-msg" class="error-msg"></div>' +
-            '</div>' +
-            // Block D: NFS shares list
-            '<div class="card mt-2">' +
-            '<div class="card-header">' +
-            '<div class="section-title" style="margin-bottom:0;">NFS 共享列表 (最近编排记录)</div>' +
-            '<span class="muted" style="font-size:12px;">由控制面板调度的持久化 NFS 共享目录状态</span>' +
-            '</div>' +
-            '<div class="table-responsive">' +
-            '<table class="data-table" id="st-storage-table"><thead><tr><th>任务 ID</th><th>编排类型</th><th>目标 Worker</th><th>状态</th><th>发起时间</th><th>完成时间</th><th style="text-align:right;">操作</th></tr></thead>' +
-            '<tbody id="st-storage-tbody"><tr><td colspan="7" class="muted">正在加载历史存储共享任务...</td></tr></tbody></table>' +
-            '</div></div>';
+            '</div>';
 
         var wsel = document.getElementById('st-worker-select');
         var lastInventory = null;
@@ -1857,56 +1871,6 @@
                 window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
             } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
         });
-
-        try {
-            var r2 = await apiJSON('/storage');
-            var tbody = document.getElementById('st-storage-tbody');
-            if (!r2.resp.ok) { tbody.innerHTML = '<tr><td colspan="7" class="muted">加载失败</td></tr>'; return; }
-            var tasks = r2.data || [];
-            var shares = tasks.filter(function (t) { return t.type === 'storage_provision_nfs' && t.status === 'succeeded'; });
-            if (shares.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无已完成创建的 NFS 共享任务记录。</td></tr>'; return; }
-            tbody.innerHTML = shares.map(function (t) {
-                return '<tr>' +
-                    '<td><span class="badge-mono font-mono">' + esc(t.id) + '</span></td>' +
-                    '<td><span class="badge badge-muted font-mono">' + esc(t.type) + '</span></td>' +
-                    '<td><span class="font-mono">Worker #' + esc(t.target_id) + '</span></td>' +
-                    '<td>' + statusBadge(t.status) + '</td>' +
-                    '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.created_at)) + '</span></td>' +
-                    '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.finished_at)) + '</span></td>' +
-                    '<td style="text-align:right;">' +
-                    '<div class="actions-cell" style="justify-content: flex-end;">' +
-                    '<button class="btn btn-xs btn-outline" data-reg-task=\'' + esc(JSON.stringify(t)) + '\'>平台参数</button>' +
-                    '<button class="btn btn-xs btn-danger" data-task=\'' + esc(JSON.stringify(t)) + '\'>回收释放</button>' +
-                    '</div>' +
-                    '</td></tr>';
-            }).join('');
-            tbody.querySelectorAll('button[data-reg-task]').forEach(function (btn) {
-                btn.addEventListener('click', function () {
-                    var t = JSON.parse(this.getAttribute('data-reg-task'));
-                    var curWorker = workersMap[t.target_id] || {};
-                    var p = {};
-                    try { p = JSON.parse(t.params_json || '{}'); } catch (e) {}
-                    showPlatformRegistrationModal(content, {
-                        name: 'nfs-' + (p.lv_name || ('task-' + t.id)),
-                        service_address: curWorker.host || '127.0.0.1',
-                        path: p.mount_point || '/data02/notebook_nfs',
-                        size_gb: p.size_gb || 0,
-                        workspace_uuid: ''
-                    });
-                });
-            });
-            tbody.querySelectorAll('button[data-task]').forEach(function (btn) {
-                btn.addEventListener('click', async function () {
-                    var t = JSON.parse(this.getAttribute('data-task'));
-                    if (!confirm('确认回收该 NFS 共享 (任务 #' + t.id + ')？\n空间将安全归还底层 VG 卷组。')) return;
-                    try {
-                        var rr = await apiJSON('/storage/reclaim', { method: 'POST', body: JSON.stringify({ task_id: t.id }) });
-                        if (!rr.resp.ok) { alert('错误: ' + (rr.data && rr.data.error)); return; }
-                        window.location.hash = '#/tasks/' + (rr.data && rr.data.task_id);
-                    } catch (err) { alert('错误: ' + err.message); }
-                });
-            });
-        } catch (err) {}
     });
 
     function genUUID() {
@@ -2088,6 +2052,8 @@
     // ====================================================================
 
     registerRoute('/tasks', async function (content) {
+        clearTasksListTimer();
+
         content.innerHTML = '<div class="page-header">' +
             '<div>' +
             '<h2 class="page-title">系统任务作业</h2>' +
@@ -2100,37 +2066,59 @@
             '</tr></thead><tbody id="tasks-tbody"><tr><td colspan="7" class="muted">正在加载任务列表...</td></tr></tbody></table>' +
             '</div>';
 
-        try {
-            var r = await apiJSON('/tasks');
-            if (!r.resp.ok) { return; }
-            var tasks = r.data || [];
-            var tbody = document.getElementById('tasks-tbody');
-            if (tasks.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="muted">当前系统暂无执行任务。</td></tr>';
-                return;
-            }
-            tbody.innerHTML = tasks.map(function (t) {
-                return '<tr style="cursor:pointer" data-href="#/tasks/' + t.id + '">' +
-                    '<td><span class="badge-mono font-mono">' + esc(t.id) + '</span></td>' +
-                    '<td><span class="badge badge-muted font-mono">' + esc(t.type) + '</span></td>' +
-                    '<td><span class="font-mono">' + esc(t.target_kind) + '/' + esc(t.target_id) + '</span></td>' +
-                    '<td>' + statusBadge(t.status) + '</td>' +
-                    '<td>' + esc(t.error ? (t.error.length > 50 ? t.error.substring(0, 50) + '...' : t.error) : '-') + '</td>' +
-                    '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.created_at)) + '</span></td>' +
-                    '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.finished_at)) + '</span></td>' +
-                    '</tr>';
-            }).join('');
-            tbody.querySelectorAll('tr[data-href]').forEach(function (tr) {
-                tr.addEventListener('click', function () { window.location.hash = this.getAttribute('data-href'); });
-            });
-        } catch (err) {}
+        async function loadTasks() {
+            try {
+                var r = await apiJSON('/tasks');
+                if (!r.resp.ok) { return; }
+                var tasks = r.data || [];
+                var tbody = document.getElementById('tasks-tbody');
+                if (!tbody) return;
+                if (tasks.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="muted">当前系统暂无执行任务。</td></tr>';
+                    clearTasksListTimer();
+                    return;
+                }
+                tbody.innerHTML = tasks.map(function (t) {
+                    return '<tr style="cursor:pointer" data-href="#/tasks/' + t.id + '">' +
+                        '<td><span class="badge-mono font-mono">' + esc(t.id) + '</span></td>' +
+                        '<td><span class="badge badge-muted font-mono">' + esc(t.type) + '</span></td>' +
+                        '<td><span class="font-mono">' + esc(t.target_kind) + '/' + esc(t.target_id) + '</span></td>' +
+                        '<td>' + statusBadge(t.status) + '</td>' +
+                        '<td>' + esc(t.error ? (t.error.length > 50 ? t.error.substring(0, 50) + '...' : t.error) : '-') + '</td>' +
+                        '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.created_at)) + '</span></td>' +
+                        '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(t.finished_at)) + '</span></td>' +
+                        '</tr>';
+                }).join('');
+                tbody.querySelectorAll('tr[data-href]').forEach(function (tr) {
+                    tr.addEventListener('click', function () { window.location.hash = this.getAttribute('data-href'); });
+                });
+                var hasActive = tasks.some(function (t) { return t.status === 'pending' || t.status === 'running'; });
+                if (hasActive && !tasksListTimer) {
+                    tasksListTimer = setInterval(loadTasks, 3000);
+                } else if (!hasActive && tasksListTimer) {
+                    clearTasksListTimer();
+                }
+            } catch (err) {}
+        }
+
+        await loadTasks();
     });
 
-    var currentSSE = null;
     var stepsData = {};
 
-    function closeSSE() {
-        if (currentSSE) { currentSSE.close(); currentSSE = null; }
+    function updateSSEBadge(status) {
+        var el = document.getElementById('task-sse-badge');
+        if (!el) return;
+        if (status === 'succeeded') {
+            el.className = 'badge badge-succeeded';
+            el.textContent = '已完成';
+        } else if (status === 'failed') {
+            el.className = 'badge badge-failed';
+            el.textContent = '已终止';
+        } else if (status === 'running') {
+            el.className = 'badge badge-running';
+            el.innerHTML = '<span class="badge-dot"></span>正在执行';
+        }
     }
 
     registerRoute('/tasks/', async function (content, hash) {
@@ -2151,7 +2139,7 @@
             '<div class="card">' +
             '<div class="card-header">' +
             '<div class="section-title" style="margin-bottom:0;">执行步骤与控制台输出</div>' +
-            '<span class="badge badge-running"><span class="badge-dot"></span>SSE 实时通信中</span>' +
+            '<span class="badge badge-running" id="task-sse-badge"><span class="badge-dot"></span>SSE 实时通信中</span>' +
             '</div>' +
             '<div id="steps-container"></div></div>' +
             '<div id="task-error" class="error-msg"></div>';
@@ -2167,11 +2155,13 @@
             var steps = result.steps || [];
 
             renderTaskInfo(task);
-            steps.forEach(function (s) { stepsData[s.seq] = s; });
+            steps.forEach(function (s) { upsertStep(s); });
             renderStepsFromCache();
 
             if (task.status === 'pending' || task.status === 'running') {
                 subscribeSSE(id);
+            } else {
+                updateSSEBadge(task.status);
             }
         } catch (err) {
             document.getElementById('task-error').textContent = '获取任务详情失败: ' + err.message;
@@ -2256,29 +2246,48 @@
     }
 
     function upsertStep(s) {
-        if (!s || !s.seq) return;
-        var prev = stepsData[s.seq] || {};
-        stepsData[s.seq] = {
-            seq: s.seq,
-            name: s.name || prev.name || '',
-            status: s.status || prev.status || '',
-            stdout: (s.stdout != null && s.stdout !== '') ? s.stdout : (prev.stdout || ''),
-            stderr: (s.stderr != null && s.stderr !== '') ? s.stderr : (prev.stderr || ''),
-            error: (s.error != null && s.error !== '') ? s.error : (prev.error || '')
+        if (!s) return;
+        var seq = s.seq != null ? s.seq : s.Seq;
+        if (!seq) return;
+        var prev = stepsData[seq] || {};
+        var stdout = (s.stdout != null && s.stdout !== '') ? s.stdout : ((s.Stdout != null && s.Stdout !== '') ? s.Stdout : (prev.stdout || ''));
+        var stderr = (s.stderr != null && s.stderr !== '') ? s.stderr : ((s.Stderr != null && s.Stderr !== '') ? s.Stderr : (prev.stderr || ''));
+        var errMsg = (s.error != null && s.error !== '') ? s.error : ((s.Error != null && s.Error !== '') ? s.Error : (prev.error || ''));
+        stepsData[seq] = {
+            seq: seq,
+            name: s.name || s.Name || prev.name || '',
+            status: s.status || s.Status || prev.status || '',
+            stdout: stdout,
+            stderr: stderr,
+            error: errMsg
         };
     }
 
-    function fetchFinalSteps(taskID) {
-        apiJSON('/tasks/' + taskID).then(function (r) {
-            if (r.resp.ok && r.data && r.data.steps) {
-                r.data.steps.forEach(function (s) { upsertStep(s); });
+    async function fetchTaskInfo(taskID) {
+        try {
+            var r = await apiJSON('/tasks/' + taskID);
+            if (r.resp.ok && r.data) {
+                var task = r.data.task || r.data;
+                var steps = r.data.steps || [];
+                renderTaskInfo(task);
+                steps.forEach(function (s) { upsertStep(s); });
                 renderStepsFromCache();
+                if (task.status !== 'pending' && task.status !== 'running') {
+                    updateSSEBadge(task.status);
+                    closeSSE();
+                }
             }
-        }).catch(function () {});
+        } catch (e) {}
+    }
+
+    function fetchFinalSteps(taskID) {
+        fetchTaskInfo(taskID);
     }
 
     function subscribeSSE(taskID) {
         if (!isAuthenticated) return;
+        closeSSE();
+
         var url = '/api/v1/tasks/' + taskID + '/stream';
         var es = new EventSource(url, { withCredentials: true });
         currentSSE = es;
@@ -2288,6 +2297,7 @@
                 var task = JSON.parse(e.data);
                 renderTaskInfo(task);
                 if (task.status !== 'pending' && task.status !== 'running') {
+                    updateSSEBadge(task.status);
                     fetchFinalSteps(taskID);
                     closeSSE();
                 }
@@ -2297,12 +2307,26 @@
         es.addEventListener('step', function (e) {
             try {
                 var step = JSON.parse(e.data);
+                var seq = step.seq != null ? step.seq : step.Seq;
+                if (!seq) {
+                    if (step.status || step.Status) {
+                        fetchTaskInfo(taskID);
+                    }
+                    return;
+                }
                 upsertStep(step);
                 renderStepsFromCache();
             } catch (err) {}
         });
 
-        es.onerror = function () {};
+        es.onerror = function () {
+            // Keep polling fallback active if SSE is interrupted
+        };
+
+        // Fallback polling: guarantees updates even if SSE is interrupted or proxy-buffered
+        taskPollTimer = setInterval(function () {
+            fetchTaskInfo(taskID);
+        }, 2000);
     }
 
     // ====================================================================

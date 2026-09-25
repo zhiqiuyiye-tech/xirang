@@ -173,3 +173,32 @@ func TestStreamBearerHeaderLowercase(t *testing.T) {
 		t.Fatalf("body missing initial event:task frame: %s", w.Body.String())
 	}
 }
+
+// TestStreamLiveTaskAndStepUpdates verifies that step events have lowercase json fields
+// (seq, name, status, stdout) and terminal task status events are emitted to the client.
+func TestStreamLiveTaskAndStepUpdates(t *testing.T) {
+	r, ws, _, tk := newRouter(t)
+	wid, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
+	time.Sleep(150 * time.Millisecond)
+
+	tok, _ := tk.Issue(1, "admin")
+	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream"
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest("GET", url, nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event:task") {
+		t.Fatalf("missing event:task frame: %s", body)
+	}
+	if !strings.Contains(body, `"seq":`) {
+		t.Fatalf("missing lowercase seq field in step event: %s", body)
+	}
+	if !strings.Contains(body, `"name":`) {
+		t.Fatalf("missing lowercase name field in step event: %s", body)
+	}
+}

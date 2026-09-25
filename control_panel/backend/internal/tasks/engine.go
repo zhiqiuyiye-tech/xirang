@@ -199,6 +199,7 @@ func (e *Engine) run(id int64, targetKind string, targetID int64, h Handler) {
 	}()
 
 	_ = e.store.SetTaskStatus(context.Background(), id, "running", false)
+	e.emit(StepEvent{TaskID: id, Status: "running"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), e.timeout())
 	defer cancel()
@@ -231,8 +232,27 @@ func (e *Engine) Subscribe(taskID int64) (<-chan StepEvent, func()) {
 	e.subsMu.Unlock()
 	if steps, err := e.store.ListSteps(context.Background(), taskID); err == nil {
 		for _, st := range steps {
+			var stdout, stderr, errMsg string
+			if st.Stdout != nil {
+				stdout = *st.Stdout
+			}
+			if st.Stderr != nil {
+				stderr = *st.Stderr
+			}
+			if st.Error != nil {
+				errMsg = *st.Error
+			}
 			select {
-			case ch <- StepEvent{TaskID: taskID, StepID: st.ID, Seq: st.Seq, Name: st.Name, Status: st.Status}:
+			case ch <- StepEvent{
+				TaskID: taskID,
+				StepID: st.ID,
+				Seq:    st.Seq,
+				Name:   st.Name,
+				Status: st.Status,
+				Stdout: stdout,
+				Stderr: stderr,
+				Error:  errMsg,
+			}:
 			default:
 			}
 		}

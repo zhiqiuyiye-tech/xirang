@@ -38,6 +38,7 @@ func (r *Reporter) Step(name string) (*StepHandle, error) {
 	if err != nil {
 		return nil, err
 	}
+	r.engine.emit(StepEvent{TaskID: r.taskID, StepID: id, Seq: r.seq, Name: name, Status: "running"})
 	return &StepHandle{r: r, id: id, seq: r.seq, name: name}, nil
 }
 
@@ -49,7 +50,16 @@ func (s *StepHandle) WriteStdout(_ string) {}
 // to subscribers.
 func (s *StepHandle) Done(status, stdout, stderr, errMsg string) {
 	_ = s.r.store.UpdateStep(context.Background(), s.id, status, stdout, stderr, errMsg, true)
-	s.r.engine.emit(StepEvent{TaskID: s.r.taskID, StepID: s.id, Seq: s.seq, Name: s.name, Status: status})
+	s.r.engine.emit(StepEvent{
+		TaskID: s.r.taskID,
+		StepID: s.id,
+		Seq:    s.seq,
+		Name:   s.name,
+		Status: status,
+		Stdout: stdout,
+		Stderr: stderr,
+		Error:  errMsg,
+	})
 }
 
 // Succeed marks the task succeeded (finished) and emits a terminal StepEvent.
