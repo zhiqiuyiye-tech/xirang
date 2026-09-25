@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>息壤 控制面板 · Xirang Console</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%232563eb'/><path d='M8 20L16 8l8 12H8z' fill='%23ffffff'/><circle cx='16' cy='18' r='3' fill='%2360a5fa'/></svg>">
-    <link rel="stylesheet" href="/static/styles.css?v=0.7.0">
+    <link rel="stylesheet" href="/static/styles.css?v=0.7.1">
 </head>
 <body>
     <!-- Login View -->
@@ -33,14 +33,14 @@
                 <h1 class="login-title">息壤 控制面板</h1>
                 <p class="login-subtitle">云原生算力与分布式存储基础设施管控系统</p>
             </div>
-            <form id="login-form">
+            <form id="login-form" method="POST" action="javascript:void(0);" onsubmit="return false;">
                 <div class="form-field">
                     <label for="login-username">管理员账号</label>
                     <div class="input-icon-wrapper">
                         <svg class="input-icon" viewBox="0 0 20 20" fill="currentColor">
                             <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
                         </svg>
-                        <input type="text" id="login-username" name="username" placeholder="请输入管理员用户名" required autocomplete="username">
+                        <input type="text" id="login-username" placeholder="请输入管理员用户名" required autocomplete="username">
                     </div>
                 </div>
                 <div class="form-field">
@@ -49,7 +49,7 @@
                         <svg class="input-icon" viewBox="0 0 20 20" fill="currentColor">
                             <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd" />
                         </svg>
-                        <input type="password" id="login-password" name="password" placeholder="请输入访问密钥或密码" required autocomplete="current-password">
+                        <input type="password" id="login-password" placeholder="请输入访问密钥或密码" required autocomplete="current-password">
                     </div>
                 </div>
                 <button type="submit" class="btn btn-primary btn-block btn-lg">
@@ -93,7 +93,7 @@
                         <div class="brand-text-group">
                             <span class="brand-name">息壤 控制面板</span>
                             <span class="brand-tag">XIRANG CONSOLE</span>
-                            <span class="brand-version">v0.7.0</span>
+                            <span class="brand-version">v0.7.1</span>
                         </div>
                     </div>
 
@@ -173,6 +173,6 @@
         </main>
     </div>
 
-    <script src="/static/app.js?v=0.7.0"></script>
+    <script src="/static/app.js?v=0.7.1"></script>
 </body>
 </html>

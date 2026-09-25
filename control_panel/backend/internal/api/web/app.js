@@ -6,6 +6,44 @@
 (function () {
     'use strict';
 
+    // ===== URL Credentials Sanitizer (Security Guard) =====
+    // If user enters with credentials in query params (e.g. from accidental form GET submissions),
+    // immediately strip them from address bar & browser history, while safely filling into inputs.
+    (function sanitizeUrlCredentials() {
+        try {
+            if (!window.location.search) return;
+            var search = window.location.search;
+            if (search.indexOf('password=') === -1 && search.indexOf('username=') === -1) return;
+
+            var params = new URLSearchParams(search);
+            var u = params.get('username') || '';
+            var p = params.get('password') || '';
+            params.delete('password');
+            params.delete('username');
+
+            var remaining = params.toString();
+            var cleanUrl = window.location.pathname + (remaining ? '?' + remaining : '') + window.location.hash;
+            window.history.replaceState(null, document.title, cleanUrl);
+
+            function fillCredentials() {
+                if (u) {
+                    var uInput = document.getElementById('login-username');
+                    if (uInput && !uInput.value) uInput.value = u;
+                }
+                if (p) {
+                    var pInput = document.getElementById('login-password');
+                    if (pInput && !pInput.value) pInput.value = p;
+                }
+            }
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', fillCredentials);
+            } else {
+                fillCredentials();
+            }
+        } catch (e) {}
+    })();
+
     var isAuthenticated = false;
 
     // ===== CSRF & Cookie Management =====
@@ -1341,19 +1379,6 @@
                             '<td>' + disksCol + '</td>' +
                             '<td><span class="font-mono">' + (lv.size_gb || 0).toFixed(1) + ' GB</span></td>' +
                             '<td><span class="font-mono">' + esc(lv.mount_point || '-') + '</span></td>' +
-                            '<td><span class="font-mono">' + usedCol + '</span></td>' +
-                            '<td><span class="font-mono">' + freeCol + '</span></td>' +
-                            '<td>' + pctCol + '</td>' +
-                            '<td>' + nfsBadge + '</td>' +
-                            '<td style="text-align:right;">' +
-                            '<div class="actions-cell" style="justify-content: flex-end;">' +
-                            platBtn +
-                            '<button class="btn btn-xs btn-outline" data-act="grow" data-lv=\'' + esc(data) + '\'>扩容</button>' +
-                            '<button class="btn btn-xs btn-outline" data-act="shrink" data-lv=\'' + esc(data) + '\'>缩容</button>' +
-                            '<button class="btn btn-xs btn-danger" data-act="delete" data-lv=\'' + esc(data) + '\'>删除释放</button>' +
-                            '</div>' +
-                            '</td></tr>';
-                    }).join('');
                             '<td><span class="font-mono">' + usedCol + '</span></td>' +
                             '<td><span class="font-mono">' + freeCol + '</span></td>' +
                             '<td>' + pctCol + '</td>' +
