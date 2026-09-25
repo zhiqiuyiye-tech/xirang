@@ -21,7 +21,7 @@ the control panel into a cluster.
 |------|---------|
 | `rbac.yaml` | Namespace, ServiceAccount, ClusterRole (least privilege), ClusterRoleBinding |
 | `pvc.yaml` | PersistentVolumeClaim (1Gi) for the SQLite database |
-| `deployment.yaml` | Deployment: single pod, non-root user (10001), PVC mount, probes, resources |
+| `deployment.yaml` | Deployment: single pod, root execution supported, PVC mount, probes, resources |
 | `service.yaml` | Service: NodePort 30180 exposing :8080 |
 | `secret.yaml.template` | Placeholder Secret template (real `secret.yaml` is git-ignored) |
 | `install.sh` | Interactive installer: generates secrets, applies all manifests |
@@ -164,7 +164,7 @@ preserve it.
 
 ## Security Notes
 
-- **Pod Security Hardening**: The container runs as non-root (`UID:GID 10001:10001`) with `fsGroup: 10001`, a read-only root filesystem, `allowPrivilegeEscalation: false`, all Linux capabilities dropped (`drop: ["ALL"]`), and `seccompProfile: RuntimeDefault`.
+- **Pod Deployment & Permissions**: The container runs as root by default to ensure complete compatibility with host storage permissions (e.g. `local-path` / `hostPath` volumes owned by root:root) and arbitrary persistent volume mount points. Can be restricted via `securityContext` if desired.
 - **HttpOnly Cookies & CSRF Protection**: Browser sessions authenticate via `HttpOnly` same-origin cookies and double-submit CSRF tokens. Sensitive tokens are never stored in browser `localStorage` or transmitted via URL query parameters.
 - **Session Revocation & Rate Limiting**: Administrative password changes automatically bump `auth_version` in the database, immediately invalidating any older active sessions and tokens. Login attempts are rate-limited to prevent brute-force attacks.
 - **Secret management**: `AES_KEY`, `JWT_SECRET`, and `ADMIN_INIT_PASSWORD` are delivered to the pod via Kubernetes Secret (`control-panel-secrets`).

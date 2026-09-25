@@ -45,21 +45,15 @@ networkPolicy:
     # - 10.0.0.0/8
     # - 192.168.0.0/16
 
-# Security context for pod and container
-podSecurityContext:
-  runAsNonRoot: true
-  runAsUser: 10001
-  runAsGroup: 10001
-  fsGroup: 10001
-  seccompProfile:
-    type: RuntimeDefault
+# Security context for pod and container.
+# Defaults allow running as root to ensure full compatibility with root-owned persistent volumes.
+podSecurityContext: {}
+  # runAsNonRoot: false
+  # seccompProfile:
+  #   type: RuntimeDefault
 
-securityContext:
-  allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: true
-  capabilities:
-    drop:
-      - ALL
+securityContext: {}
+  # allowPrivilegeEscalation: false
 
 # Application environment configuration
 config:

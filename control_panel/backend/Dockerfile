@@ -13,14 +13,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-s -w
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -g 10001 appgroup && \
-    adduser -u 10001 -G appgroup -s /sbin/nologin -D appuser && \
-    mkdir -p /data /tmp && \
-    chown -R appuser:appgroup /data /tmp
+    mkdir -p /data /tmp /app
 
 WORKDIR /app
-COPY --from=build --chown=appuser:appgroup /out/server /app/server
-USER 10001:10001
+COPY --from=build /out/server /app/server
 ENV DB_PATH=/data/control_panel.db
 ENV LISTEN_ADDR=:8080
 EXPOSE 8080

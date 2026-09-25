@@ -6,7 +6,7 @@ secrets (AES_KEY, JWT_SECRET, ADMIN_INIT_PASSWORD) are auto-generated on install
 
 ## Architecture & Security Highlights
 
-- **Pod Security Hardening**: Runs as non-root user (`UID:GID 10001:10001`), read-only root filesystem, `allowPrivilegeEscalation: false`, all Linux capabilities dropped (`drop: ["ALL"]`), seccomp profile `RuntimeDefault`.
+- **Pod Deployment & Permissions**: Runs as root by default to ensure complete compatibility with host storage permissions (e.g. `local-path` / `hostPath` volumes owned by root:root) and arbitrary persistent volume mount points. Can be restricted via `podSecurityContext` if desired.
 - **HttpOnly Cookie & CSRF**: Web UI authenticates via same-origin `HttpOnly` session cookies and double-submit CSRF tokens. Sensitive tokens are not exposed in browser `localStorage` or URL query strings.
 - **Session Revocation & Rate Limiting**: Administrative password change automatically increments `auth_version` and invalidates all previous sessions. Login attempts are rate-limited (default 5 failed attempts triggers 15-minute temporary lockout).
 - **Health Probes**: Dedicated `/health/live` (process health) and `/health/ready` (SQLite & Kubernetes API readiness) endpoints.
@@ -164,8 +164,8 @@ The database schema migrations are backwards-compatible, so rolling back to the 
 | `config.cookieSecure` | `false` | Set `Secure` on cookies (set `true` with HTTPS) |
 | `config.rateLimitMaxFailures` | `5` | Failed logins before temporary lockout |
 | `config.rateLimitLockoutDuration` | `15m` | Duration of login lockout |
-| `podSecurityContext.runAsNonRoot` | `true` | Enforce non-root execution |
-| `podSecurityContext.runAsUser` | `10001` | Non-root UID |
+| `podSecurityContext` | `{}` | Pod security context (empty allows root deployment) |
+| `securityContext` | `{}` | Container security context |
 | `persistence.enabled` | `true` | PVC for SQLite database |
 | `persistence.storageClassName` | `"local-path"` | StorageClass (must be block or local) |
 | `secrets.aesKey` | `""` (auto) | Pin AES_KEY (base64 32-byte) |

@@ -32,23 +32,10 @@ spec:
         app.kubernetes.io/name: control-panel
     spec:
       serviceAccountName: control-panel
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
       containers:
         - name: control-panel
           image: registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
           imagePullPolicy: Always
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
           ports:
             - name: http
               containerPort: 8080
