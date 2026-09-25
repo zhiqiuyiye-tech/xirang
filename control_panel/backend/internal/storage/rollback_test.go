@@ -16,4 +16,20 @@ func TestRollbackReverses(t *testing.T) {
 	if rb[1].Name != "rollback:lvcreate" || !contains(rb[1].Cmd, "lvremove") {
 		t.Fatalf("rb1 wrong: %+v", rb[1])
 	}
+
+	// Full rollback when exports and fstab were completed: exports before umount
+	doneFull := []string{"lvcreate", "mkfs", "mkdir", "mount", "fstab", "exports"}
+	rbFull := RollbackFor(req, doneFull)
+	if len(rbFull) != 5 {
+		t.Fatalf("expected 5 rollback steps, got %d: %+v", len(rbFull), rbFull)
+	}
+	if rbFull[0].Name != "rollback:exports" || rbFull[1].Name != "rollback:exportfs" {
+		t.Fatalf("exports/exportfs must be undone first, got %s, %s", rbFull[0].Name, rbFull[1].Name)
+	}
+	if rbFull[2].Name != "rollback:mount" {
+		t.Fatalf("mount must be undone after exports, got %s", rbFull[2].Name)
+	}
+	if rbFull[3].Name != "rollback:fstab" || rbFull[4].Name != "rollback:lvcreate" {
+		t.Fatalf("fstab/lvcreate wrong order: %+v", rbFull)
+	}
 }

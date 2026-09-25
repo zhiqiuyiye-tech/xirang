@@ -249,6 +249,54 @@ func TestParseInventory_MapsLVToPhysicalDisks(t *testing.T) {
 	}
 }
 
+func TestParseInventory_UnmountedFilesystemIsCandidate(t *testing.T) {
+	// A disk or partition with a preexisting unmounted filesystem (e.g. ext4 or xfs)
+	// that is not mounted, not system, and not reserved must be recognized as an
+	// unused initialization candidate so the panel can format it into a VG.
+	const out = "###VGS###\n###LVS###\n###PVS###\n###DF###\n" +
+		"Filesystem 1024-blocks Used Available Capacity Mounted on\n" +
+		"/dev/sda1 100000000000 10000000000 90000000000 10% /\n" +
+		"###NFS###\ninactive\n###EXPORTS###\n###LSBLK###\n" +
+		`NAME="sda" TYPE="disk" SIZE="100000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sda1" TYPE="part" SIZE="100000000000" MOUNTPOINT="/" FSTYPE="ext4" PKNAME="sda"` + "\n" +
+		`NAME="sdb" TYPE="disk" SIZE="200000000000" MOUNTPOINT="" FSTYPE="ext4" PKNAME=""` + "\n" +
+		`NAME="sdc" TYPE="disk" SIZE="200000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sdc1" TYPE="part" SIZE="200000000000" MOUNTPOINT="" FSTYPE="xfs" PKNAME="sdc"`
+
+	inv := parseInventory(out)
+	if len(inv.UnusedDisks) != 2 {
+		t.Fatalf("expected 2 unused disks, got %d: %+v", len(inv.UnusedDisks), inv.UnusedDisks)
+	}
+	names := []string{inv.UnusedDisks[0].Name, inv.UnusedDisks[1].Name}
+	if names[0] != "/dev/sdb" || names[1] != "/dev/sdc1" {
+		t.Fatalf("expected /dev/sdb and /dev/sdc1 as candidates, got %v", names)
+	}
+
+	byName := map[string]PhysicalDiskInfo{}
+	for _, disk := range inv.PhysicalDisks {
+		byName[disk.Name] = disk
+	}
+	if byName["/dev/sdb"].Role != "unused" {
+		t.Fatalf("expected sdb role to be unused, got %s", byName["/dev/sdb"].Role)
+	}
+	if byName["/dev/sdc"].Role != "unused" {
+		t.Fatalf("expected sdc role to be unused, got %s", byName["/dev/sdc"].Role)
+	}
+}
+
+func TestParseInventory_OrphanedPVIsCandidate(t *testing.T) {
+	// A device that was previously initialized with pvcreate but does not belong
+	// to any active VG must be recognized as an unused candidate.
+	const out = "###VGS###\n###LVS###\n###PVS###\n/dev/sdb,100.00g,100.00g,\n###DF###\n" +
+		"###NFS###\ninactive\n###EXPORTS###\n###LSBLK###\n" +
+		`NAME="sdb" TYPE="disk" SIZE="107374182400" MOUNTPOINT="" FSTYPE="LVM2_member" PKNAME=""`
+
+	inv := parseInventory(out)
+	if len(inv.UnusedDisks) != 1 || inv.UnusedDisks[0].Name != "/dev/sdb" {
+		t.Fatalf("expected orphaned PV to be unused candidate: %+v", inv.UnusedDisks)
+	}
+}
+
 // TestListInventory_Run verifies the SSH round-trip: the runner's output is fed
 // to parseInventory unchanged.
 func TestListInventory_Run(t *testing.T) {

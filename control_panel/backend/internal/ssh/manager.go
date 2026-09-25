@@ -111,6 +111,19 @@ func (m *Manager) Close() {
 	}
 }
 
+// EvictWorker closes and removes all pooled connections for the specified worker ID.
+// Safe to call when a worker is deleted or its credentials are changed.
+func (m *Manager) EvictWorker(wID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if pool, ok := m.pools[wID]; ok {
+		for _, pc := range pool {
+			pc.client.Close()
+		}
+		delete(m.pools, wID)
+	}
+}
+
 // buildAuth constructs auth methods in priority order: private key first
 // (if EncPrivateKey set + decrypts + parses), then password (if EncPassword
 // set + decrypts). Key-first, password-fallback. If neither produces a

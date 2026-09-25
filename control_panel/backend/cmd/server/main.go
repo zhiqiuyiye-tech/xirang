@@ -106,6 +106,8 @@ func main() {
 
 	gin.SetMode(gin.ReleaseMode)
 	r := api.NewRouter(tk, ws, store, eng, k8sClient, sshm,
+		api.WithCollector(inventoryCollector),
+		api.WithStaleAfter(cfg.StorageStaleAfter),
 		api.WithRateLimiter(limiter),
 		api.WithCookieName(cfg.CookieName),
 		api.WithCookieSecure(cfg.CookieSecure),

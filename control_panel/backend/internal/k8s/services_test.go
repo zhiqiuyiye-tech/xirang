@@ -180,11 +180,30 @@ func TestSelectorMatches(t *testing.T) {
 }
 
 func TestDeleteService(t *testing.T) {
-	cs := fake.NewSimpleClientset(&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "s1", Namespace: "ns1"}})
+	cs := fake.NewSimpleClientset(&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "s1",
+		Namespace: "ns1",
+		Labels:    map[string]string{"managed-by": "control-panel"},
+	}})
 	if err := DeleteService(context.Background(), cs, "ns1", "s1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := cs.CoreV1().Services("ns1").Get(context.Background(), "s1", metav1.GetOptions{}); err == nil {
 		t.Fatal("expected not found after delete")
+	}
+
+	// External service must be rejected
+	if _, err := cs.CoreV1().Services("ns1").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: "ns1"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteService(context.Background(), cs, "ns1", "ext"); err == nil {
+		t.Fatal("expected error deleting external service")
+	}
+
+	// Protected namespace must be rejected
+	if err := DeleteService(context.Background(), cs, "kube-system", "kube-dns"); err == nil {
+		t.Fatal("expected error deleting in protected namespace")
 	}
 }

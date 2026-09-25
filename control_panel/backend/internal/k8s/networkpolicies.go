@@ -32,6 +32,12 @@ type CreateNetworkPolicyReq struct {
 // is labelled with managed-by=control-panel and pod-uid=<uid>, plus
 // service-name=<serviceName> when provided so it can be cascade-deleted.
 func CreateNetworkPolicy(ctx context.Context, client kubernetes.Interface, req CreateNetworkPolicyReq) (*networkingv1.NetworkPolicy, error) {
+	if isProtectedNamespace(req.Namespace) {
+		return nil, fmt.Errorf("cannot create network policy in protected namespace %q", req.Namespace)
+	}
+	if len(req.PodSelector) == 0 {
+		return nil, fmt.Errorf("pod selector cannot be empty")
+	}
 	ports := make([]networkingv1.NetworkPolicyPort, 0, len(req.IngressPorts))
 	for _, p := range req.IngressPorts {
 		portVal := intOrString(p.Port)
@@ -82,8 +88,18 @@ func CreateNetworkPolicy(ctx context.Context, client kubernetes.Interface, req C
 	return created, nil
 }
 
-// DeleteNetworkPolicy deletes a NetworkPolicy by name.
+// DeleteNetworkPolicy deletes a NetworkPolicy by name after verifying it is managed by the control panel.
 func DeleteNetworkPolicy(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+	if isProtectedNamespace(namespace) {
+		return fmt.Errorf("cannot delete network policy in protected namespace %q", namespace)
+	}
+	np, err := client.NetworkingV1().NetworkPolicies(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if np.Labels["managed-by"] != "control-panel" {
+		return fmt.Errorf("cannot delete externally managed network policy %s/%s", namespace, name)
+	}
 	return client.NetworkingV1().NetworkPolicies(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 

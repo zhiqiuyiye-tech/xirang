@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 )
@@ -51,13 +52,49 @@ func ValidateDisk(s string) error {
 	return nil
 }
 
+// ValidateMountPoint ensures mountPoint is an absolute, clean path, does not contain
+// directory traversal or shell metacharacters, and is not a system-critical path
+// (/, /boot, /etc, /usr, /var, /root, /bin, /sbin, /lib, /sys, /proc, /dev)
+// or within configured reserved mounts (e.g. /data01).
+func ValidateMountPoint(mountPoint string, reservedMounts []string) error {
+	if mountPoint == "" {
+		return fmt.Errorf("mount point cannot be empty")
+	}
+	if !strings.HasPrefix(mountPoint, "/") {
+		return fmt.Errorf("mount point must be an absolute path: %q", mountPoint)
+	}
+	if err := ValidateName(mountPoint); err != nil {
+		return err
+	}
+	cleaned := path.Clean(mountPoint)
+	if cleaned == "/" {
+		return fmt.Errorf("mount point cannot be root directory: %q", mountPoint)
+	}
+	systemRoots := []string{
+		"/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
+		"/proc", "/root", "/sbin", "/sys", "/usr", "/var",
+	}
+	for _, sys := range systemRoots {
+		if cleaned == sys || strings.HasPrefix(cleaned, sys+"/") {
+			return fmt.Errorf("mount point %q is within protected system path %q", mountPoint, sys)
+		}
+	}
+	for _, res := range reservedMounts {
+		res = path.Clean(strings.TrimRight(res, "/"))
+		if res != "" && (cleaned == res || strings.HasPrefix(cleaned, res+"/")) {
+			return fmt.Errorf("mount point %q is within reserved mount %q", mountPoint, res)
+		}
+	}
+	return nil
+}
+
 func shellLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 // PreflightDeviceCmd returns a read-only safety check that must run immediately
-// before pvcreate. It rejects mounted devices, signatures/PVs, system or
-// reserved ancestors, whole disks with children, and ambiguous device types.
+// before pvcreate. It rejects mounted devices, devices belonging to active VGs,
+// system or reserved ancestors, and mounted child partitions.
 func PreflightDeviceCmd(device string, reservedMounts []string) string {
 	patterns := []string{"/", "/boot", "/boot/efi"}
 	for _, mountPoint := range reservedMounts {
@@ -89,9 +126,13 @@ done <<EOF
 $(lsblk -nr -o MOUNTPOINT "$root" 2>/dev/null)
 EOF
 [ -z "$(findmnt -rn -S "$device" 2>/dev/null)" ] || { echo "device is mounted" >&2; exit 1; }
-! wipefs -n "$device" 2>/dev/null | grep -q . || { echo "device has filesystem or partition signature" >&2; exit 1; }
-! pvs --noheadings "$device" >/dev/null 2>&1 || { echo "device is already an LVM PV" >&2; exit 1; }
-if [ "$dtype" = disk ] && [ "$(lsblk -nr -o NAME "$device" 2>/dev/null | wc -l)" -gt 1 ]; then echo "whole disk has child devices" >&2; exit 1; fi
+if [ "$dtype" = disk ]; then
+  for child in $(lsblk -nr -o NAME "$device" 2>/dev/null); do
+    [ -z "$(findmnt -rn -S "/dev/$child" 2>/dev/null)" ] || { echo "child partition is mounted: /dev/$child" >&2; exit 1; }
+  done
+fi
+vg=$(pvs --noheadings -o vg_name "$device" 2>/dev/null | tr -d ' ')
+if [ -n "$vg" ]; then echo "device belongs to active volume group: $vg" >&2; exit 1; fi
 echo SAFE`, d, strings.Join(quotedPatterns, "|"))
 }
 
@@ -211,14 +252,14 @@ func BaseName(path string) string {
 // own VG so disks of different physical block sizes can coexist (LVM otherwise
 // refuses to mix them in one VG). Each disk is its own step pair so a single
 // disk failure aborts before later disks and the failure names which disk.
-// wipefs first ensures pvcreate does not prompt on stale filesystem signatures
-// (which would hang the non-interactive SSH session).
+// wipefs first ensures pvcreate does not prompt on stale filesystem signatures.
+// -y -ff on pvcreate bypasses interactive prompts when reusing stale partitions/PVs.
 func CreateVGSteps(r CreateVGReq) []Step {
 	steps := make([]Step, 0, len(r.Disks)*2)
 	for _, d := range r.Disks {
 		vg := VGNameForDisk(r.VGNamePrefix, d)
 		steps = append(steps,
-			Step{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("wipefs -a %s && pvcreate %s", d, d)},
+			Step{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("wipefs -a %s && pvcreate -y -ff %s", d, d)},
 			Step{Name: "vgcreate:" + vg, Cmd: fmt.Sprintf("vgcreate %s %s", vg, d)},
 		)
 	}
@@ -239,17 +280,17 @@ type ResizeLVReq struct {
 // is resized in the same operation: resize2fs for ext, xfs_growfs for xfs. For
 // shrink, -r shrinks the filesystem first and aborts the LV reduce if the fs
 // resize fails (e.g. shrinking below used space, or xfs which cannot shrink),
-// so data is not lost. DeltaGB must be > 0 (validated by the handler).
+// so data is not lost. -y (--yes) bypasses the interactive confirmation prompt
+// required by lvreduce in non-interactive SSH sessions. DeltaGB must be > 0.
 func ResizeLVSteps(r ResizeLVReq) []Step {
 	lvDev := fmt.Sprintf("/dev/%s/%s", r.VGName, r.LVName)
-	sign := "+"
-	verb := "lvextend"
-	if !r.Grow {
-		sign = "-"
-		verb = "lvreduce"
+	if r.Grow {
+		return []Step{
+			{Name: "lvextend", Cmd: fmt.Sprintf("lvextend -r -L +%dG %s", r.DeltaGB, lvDev)},
+		}
 	}
 	return []Step{
-		{Name: verb, Cmd: fmt.Sprintf("%s -r -L %s%dG %s", verb, sign, r.DeltaGB, lvDev)},
+		{Name: "lvreduce", Cmd: fmt.Sprintf("lvreduce -y -r -L -%dG %s", r.DeltaGB, lvDev)},
 	}
 }
 

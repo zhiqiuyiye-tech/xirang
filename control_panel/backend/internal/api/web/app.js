@@ -48,7 +48,7 @@
 
     // ===== CSRF & Cookie Management =====
     function getCSRFToken() {
-        var match = document.cookie.match(/(?:^|;\s*)cp_csrf=([^;]+)/);
+        var match = document.cookie.match(/(?:^|;\s*)(?:cp_csrf|[^=;]*csrf[^=;]*)=([^;]+)/i);
         return match ? decodeURIComponent(match[1]) : '';
     }
 
@@ -210,7 +210,12 @@
     // ===== Utility =====
     function esc(s) {
         if (s == null) return '';
-        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     function fmtTime(ts) {
@@ -618,6 +623,31 @@
         });
     }
 
+    function updatePodRowInTable(pod) {
+        var row = document.querySelector('tr[data-pod-uid="' + pod.uid + '"]');
+        if (!row) return;
+        var ownerCell = row.querySelector('.pod-owner-cell');
+        if (ownerCell) {
+            ownerCell.innerHTML = pod.owner_name
+                ? ('<strong>' + esc(pod.owner_name) + '</strong>' + (pod.note ? '<div class="muted" style="font-size:11.5px;">' + esc(pod.note) + '</div>' : ''))
+                : '<span class="muted" style="font-size:12px;">(未设置)</span>';
+        }
+        var btn = row.querySelector('button[data-pod]');
+        if (btn) {
+            btn.setAttribute('data-pod', JSON.stringify(pod));
+        }
+    }
+
+    function updatePodMappingsCountInTable(podUid) {
+        var row = document.querySelector('tr[data-pod-uid="' + podUid + '"]');
+        if (!row) return;
+        var mapCell = row.querySelector('.pod-mappings-cell');
+        if (mapCell) {
+            var cnt = servicesForPod(podUid).length;
+            mapCell.innerHTML = cnt > 0 ? '<span class="badge badge-success">' + cnt + ' 条映射</span>' : '<span class="muted">-</span>';
+        }
+    }
+
     async function loadPods(content) {
         var tbody = document.getElementById('pods-tbody');
         var msgEl = document.getElementById('pods-msg');
@@ -634,14 +664,14 @@
                 var ownerDisplay = p.owner_name
                     ? ('<strong>' + esc(p.owner_name) + '</strong>' + (p.note ? '<div class="muted" style="font-size:11.5px;">' + esc(p.note) + '</div>' : ''))
                     : '<span class="muted" style="font-size:12px;">(未设置)</span>';
-                return '<tr>' +
+                return '<tr data-pod-uid="' + esc(p.uid) + '">' +
                     '<td><strong>' + esc(p.name) + '</strong></td>' +
-                    '<td>' + ownerDisplay + '</td>' +
+                    '<td class="pod-owner-cell">' + ownerDisplay + '</td>' +
                     '<td><span class="badge badge-muted font-mono">' + esc(p.namespace) + '</span></td>' +
                     '<td><span class="font-mono">' + esc(p.node) + '</span></td>' +
                     '<td>' + statusBadge(p.status) + '</td>' +
                     '<td><span class="font-mono">' + esc((p.ips || []).join(', ')) + '</span></td>' +
-                    '<td>' + (cnt > 0 ? '<span class="badge badge-success">' + cnt + ' 条映射</span>' : '<span class="muted">-</span>') + '</td>' +
+                    '<td class="pod-mappings-cell">' + (cnt > 0 ? '<span class="badge badge-success">' + cnt + ' 条映射</span>' : '<span class="muted">-</span>') + '</td>' +
                     '<td style="text-align:right;"><button class="btn btn-sm btn-primary" data-pod=\'' + esc(JSON.stringify(p)) + '\'>配置端口映射与备注</button></td>' +
                     '</tr>';
             }).join('');
@@ -655,66 +685,213 @@
     }
 
     async function showPortMappingForm(content, pod) {
-        var editingSvc = null;
+        var existingModal = document.getElementById('port-modal');
+        if (existingModal) existingModal.remove();
 
-        var html = '<div class="modal-overlay" id="port-modal"><div class="modal" style="max-width: 760px;">' +
-            '<h3 class="modal-title">' +
-            '<span>Notebook 端口映射与归属配置</span>' +
+        var editingSvc = null;
+        var activeTab = 'ports';
+
+        var currentServices = servicesForPod(pod.uid);
+        var initialSvcCount = currentServices.length;
+
+        var html = '<div class="modal-overlay" id="port-modal">' +
+            '<div class="modal modal-structured port-modal-dialog">' +
+            // Header
+            '<div class="modal-header-bar">' +
+            '<div>' +
+            '<div class="port-modal-title-row">' +
+            '<svg class="port-modal-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 105.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 11-2.828-2.828l3-3z" clip-rule="evenodd"/></svg>' +
+            '<span class="port-modal-title">Notebook 端口映射与归属配置</span>' +
             '<span class="badge badge-primary font-mono">' + esc(pod.name) + '</span>' +
-            '</h3>' +
-            // Section 1: Metadata / Remark
-            '<div class="card mb-2">' +
-            '<div class="section-title" style="margin-bottom:6px;">使用人与备注信息</div>' +
-            '<p class="muted mb-2" style="font-size:12px;">标注 Notebook 的责任人与用途，帮助集群运维人员清晰识别容器使用者。</p>' +
-            '<div class="row">' +
-            '<div class="col"><div class="form-field mb-1"><label>使用人 / 负责人</label><input type="text" id="nb-meta-owner" placeholder="如：张三、算法组李工" value="' + esc(pod.owner_name || '') + '"></div></div>' +
-            '<div class="col"><div class="form-field mb-1"><label>业务备注说明</label><input type="text" id="nb-meta-note" placeholder="如：大模型微调实验、PyTorch训练" value="' + esc(pod.note || '') + '"></div></div>' +
             '</div>' +
-            '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">' +
-            '<span class="muted" style="font-size:11.5px;">' +
-            (pod.key_kind === 'business_labels'
-                ? '<span class="badge badge-success" style="font-size:10.5px;">稳定业务标签</span> Pod 重建后将自动保持备注'
-                : '<span class="badge badge-muted" style="font-size:10.5px;">Pod UID 绑定</span> 缺少 workspace/project 标签，Pod 重建后不继承') +
-            (pod.updated_by ? (' · 最近修改: ' + esc(pod.updated_by) + ' (' + fmtTime(pod.metadata_updated_at) + ')') : '') +
-            '</span>' +
-            '<button type="button" class="btn btn-xs btn-outline" id="btn-save-meta">保存使用人与备注</button>' +
+            '<div class="port-modal-meta-pills">' +
+            '<span class="pill-item">命名空间: <code>' + esc(pod.namespace) + '</code></span>' +
+            '<span class="pill-item">宿主节点: <code>' + esc(pod.node || 'N/A') + '</code></span>' +
+            '<span class="pill-item">容器 IP: <code>' + esc((pod.ips || []).join(', ') || '未分配') + '</code></span>' +
+            '<span class="pill-item">' + statusBadge(pod.status) + '</span>' +
             '</div>' +
-            '<div id="nb-meta-msg" class="info-msg" style="margin-top:4px;"></div>' +
             '</div>' +
-            // Section 2: Existing Mappings
-            '<div class="card"><div class="section-title">该 Pod 关联的 Service 映射</div>' +
-            '<p class="muted mb-2" style="font-size:12px;">包含全部匹配该 Pod 的 Service。<span class="badge badge-success">本面板创建</span> 可随时原地编辑或清理，<span class="badge badge-muted">外部创建</span> 为集群固有只读。</p>' +
-            '<div class="table-responsive">' +
-            '<table class="data-table" id="pod-svc-table"><thead><tr><th>Service 名称</th><th>端口映射规则 (NodePort &rarr; 容器目标端口)</th><th>归属</th><th style="text-align:right;">操作</th></tr></thead>' +
-            '<tbody id="pod-existing-tbody"><tr><td colspan="4" class="muted">加载中...</td></tr></tbody></table></div></div>' +
-            // Section 3: Add/Edit Port Rules
-            '<div class="card mt-2">' +
-            '<div style="display:flex;justify-content:space-between;align-items:center;">' +
+            '<button type="button" class="modal-close-btn" id="port-modal-close-x" title="关闭 (Esc)">&times;</button>' +
+            '</div>' +
+
+            // Tabs Bar
+            '<div class="port-modal-tabs">' +
+            '<button type="button" class="port-tab-btn active" id="tab-btn-ports" data-tab="ports">' +
+            '<svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd"/></svg>' +
+            '<span>端口映射规则</span>' +
+            '<span class="badge badge-primary font-mono tab-badge-count" id="tab-ports-count">' + initialSvcCount + '</span>' +
+            '</button>' +
+            '<button type="button" class="port-tab-btn" id="tab-btn-meta" data-tab="meta">' +
+            '<svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/></svg>' +
+            '<span>使用人与备注</span>' +
+            '<span id="tab-meta-badge">' + (pod.owner_name ? '<span class="badge badge-success tab-badge-count">已设置</span>' : '') + '</span>' +
+            '</button>' +
+            '</div>' +
+
+            // Modal Body
+            '<div class="modal-body-scroll" id="port-modal-body">' +
+
+            // Pane 1: Port Mappings
+            '<div id="pane-ports">' +
+            // Section A: Existing Services
+            '<div class="port-section-card">' +
+            '<div class="card-header-clean">' +
+            '<div>' +
+            '<div class="section-title" style="margin-bottom:0;">已关联的 Service 映射</div>' +
+            '<div class="muted" style="font-size:12px;margin-top:2px;">匹配当前 Pod 的 Kubernetes Service。本面板创建规则支持原地编辑与清理，外部固有 Service 为只读。</div>' +
+            '</div>' +
+            '</div>' +
+            '<div id="pod-existing-container"><div class="muted" style="padding:8px 0;font-size:12.5px;">正在加载关联 Service...</div></div>' +
+            '</div>' +
+
+            // Section B: Add / Edit Port Rules
+            '<div class="port-section-card" id="port-form-section">' +
+            '<div class="card-header-clean">' +
+            '<div>' +
             '<div class="section-title" id="port-form-title" style="margin-bottom:0;">新建 NodePort 映射规则</div>' +
-            '<button type="button" class="btn btn-xs btn-outline" id="btn-cancel-edit" style="display:none;">取消编辑并返回新建</button>' +
+            '<div class="muted" style="font-size:12px;margin-top:2px;">配置容器内部端口与外部 NodePort（30000-32767，若不填则由 Kubernetes 随机分配），系统联动放行 NetworkPolicy。</div>' +
             '</div>' +
-            '<p class="muted mb-2" style="font-size:12px;">直接配置容器内部端口与可选外部 NodePort（30000-32767，若不填则由 Kubernetes 自动随机分配）。系统将联动配置 NetworkPolicy 放行外部流量。</p>' +
+            '<button type="button" class="btn btn-xs btn-outline" id="btn-cancel-edit" style="display:none;">&larr; 取消编辑，返回新建</button>' +
+            '</div>' +
+
+            // Table Column Headers
+            '<div class="port-rules-table-header">' +
+            '<div style="flex:1;">容器内部端口 (Pod Port) <span style="color:var(--danger);">*</span></div>' +
+            '<div style="width:20px;text-align:center;">&nbsp;</div>' +
+            '<div style="flex:1.4;">外部 NodePort (留空自动分配)</div>' +
+            '<div style="width:60px;text-align:center;">协议</div>' +
+            '<div style="width:70px;text-align:right;">操作</div>' +
+            '</div>' +
+
             '<form id="port-form">' +
             '<div id="port-rows-container"></div>' +
-            '<div style="margin-bottom:12px;">' +
-            '<button type="button" class="btn btn-xs btn-outline" id="btn-add-port-row">+ 添加一行端口映射</button>' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;">' +
+            '<button type="button" class="btn btn-sm btn-outline" id="btn-add-port-row">' +
+            '<svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-2px;"><path fill-rule="evenodd" d="M10 5a1 1 0 011 1v3h3a1 1 0 110 2h-3v3a1 1 0 11-2 0v-3H6a1 1 0 110-2h3V6a1 1 0 011-1z" clip-rule="evenodd"/></svg>' +
+            ' 添加一行端口映射' +
+            '</button>' +
+            '<span class="muted" style="font-size:11.5px;">支持批量添加多组端口映射</span>' +
             '</div>' +
-            '<div class="row mt-2" style="justify-content: flex-end;">' +
+            '</form>' +
+            '</div>' +
+            '</div>' + // end pane-ports
+
+            // Pane 2: Metadata / Ownership
+            '<div id="pane-meta" style="display:none;">' +
+            '<div class="port-section-card">' +
+            '<div class="card-header-clean">' +
+            '<div>' +
+            '<div class="section-title" style="margin-bottom:0;">Notebook 使用人与业务用途</div>' +
+            '<div class="muted" style="font-size:12px;margin-top:2px;">标注责任人与业务场景，便于集群运维人员识别容器使用者并保持持久化元数据同步。</div>' +
+            '</div>' +
+            '</div>' +
+            '<div class="form-field mb-2">' +
+            '<label>使用人 / 负责人 <span class="muted" style="font-weight:normal;font-size:11.5px;">(如：张三、算法组李工)</span></label>' +
+            '<input type="text" id="nb-meta-owner" placeholder="请输入责任人姓名或所属团队" value="' + esc(pod.owner_name || '') + '">' +
+            '</div>' +
+            '<div class="form-field mb-2">' +
+            '<label>业务备注说明 <span class="muted" style="font-weight:normal;font-size:11.5px;">(如：Qwen 大模型微调实验、PyTorch 训练)</span></label>' +
+            '<textarea id="nb-meta-note" rows="3" placeholder="请输入实验内容、训练场景或特殊配置说明..." style="width:100%;">' + esc(pod.note || '') + '</textarea>' +
+            '</div>' +
+
+            '<div class="meta-binding-info-box">' +
+            '<div style="display:flex;align-items:center;gap:8px;">' +
+            (pod.key_kind === 'business_labels'
+                ? '<span class="badge badge-success" style="font-size:11px;">稳定业务标签</span>'
+                : '<span class="badge badge-muted" style="font-size:11px;">Pod UID 绑定</span>') +
+            '<span style="font-size:12px;color:var(--text-secondary);">' +
+            (pod.key_kind === 'business_labels'
+                ? '已识别 workspace 与 project 稳定标签，Pod 重建后将自动保持备注'
+                : '缺少 workspace/project 标签，仅绑定当前 Pod UID，Pod 重建后不继承') +
+            '</span>' +
+            '</div>' +
+            (pod.updated_by ? ('<div class="muted mt-1" style="font-size:11.5px;">最近修改: ' + esc(pod.updated_by) + ' (' + fmtTime(pod.metadata_updated_at) + ')</div>') : '') +
+            '</div>' +
+
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;">' +
+            '<div id="nb-meta-msg" class="info-msg" style="margin:0;"></div>' +
+            '<button type="button" class="btn btn-primary" id="btn-save-meta">' +
+            '<svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-2px;"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>' +
+            ' 保存使用人与备注' +
+            '</button>' +
+            '</div>' +
+            '</div>' +
+            '</div>' + // end pane-meta
+
+            '</div>' + // end modal-body-scroll
+
+            // Fixed Footer
+            '<div class="modal-footer-bar">' +
+            '<div id="port-modal-status-msg" class="port-footer-status"></div>' +
+            '<div class="port-footer-actions">' +
             '<button type="button" class="btn btn-outline" id="port-cancel">关闭</button>' +
-            '<button type="submit" class="btn btn-primary" id="btn-submit-port">立即创建映射</button>' +
+            '<button type="button" class="btn btn-primary" id="btn-submit-port">' +
+            '<span id="btn-submit-port-text">立即创建映射</span>' +
+            '</button>' +
             '</div>' +
-            '<div id="port-form-msg" class="error-msg"></div></form></div></div></div>';
+            '</div>' +
+
+            '</div>' +
+            '</div>';
 
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('port-modal');
-        document.getElementById('port-cancel').addEventListener('click', function () { modal.remove(); });
+        var modalBody = document.getElementById('port-modal-body');
 
-        // Save metadata handler
+        // Close handlers (Esc, close button, backdrop click)
+        function closeModal() {
+            document.removeEventListener('keydown', handleEsc);
+            modal.remove();
+        }
+        function handleEsc(e) {
+            if (e.key === 'Escape') closeModal();
+        }
+        document.addEventListener('keydown', handleEsc);
+
+        document.getElementById('port-cancel').addEventListener('click', closeModal);
+        document.getElementById('port-modal-close-x').addEventListener('click', closeModal);
+        modal.addEventListener('click', function (e) {
+            if (e.target === modal) closeModal();
+        });
+
+        // Tab Switching Logic
+        var btnTabPorts = document.getElementById('tab-btn-ports');
+        var btnTabMeta = document.getElementById('tab-btn-meta');
+        var panePorts = document.getElementById('pane-ports');
+        var paneMeta = document.getElementById('pane-meta');
+        var submitBtn = document.getElementById('btn-submit-port');
+        var submitBtnText = document.getElementById('btn-submit-port-text');
+
+        function switchTab(tab) {
+            activeTab = tab;
+            if (tab === 'ports') {
+                btnTabPorts.classList.add('active');
+                btnTabMeta.classList.remove('active');
+                panePorts.style.display = 'block';
+                paneMeta.style.display = 'none';
+                submitBtn.style.display = 'inline-flex';
+                submitBtnText.textContent = editingSvc ? '保存并更新规则' : '立即创建映射';
+            } else {
+                btnTabMeta.classList.add('active');
+                btnTabPorts.classList.remove('active');
+                paneMeta.style.display = 'block';
+                panePorts.style.display = 'none';
+                submitBtn.style.display = 'none';
+            }
+            setMsg(document.getElementById('port-modal-status-msg'), '', 'error');
+        }
+
+        btnTabPorts.addEventListener('click', function () { switchTab('ports'); });
+        btnTabMeta.addEventListener('click', function () { switchTab('meta'); });
+
+        // Metadata Save Handler (Zero lag - updates DOM directly without full table reload)
         document.getElementById('btn-save-meta').addEventListener('click', async function () {
             var owner = document.getElementById('nb-meta-owner').value.trim();
             var note = document.getElementById('nb-meta-note').value.trim();
             var msgEl = document.getElementById('nb-meta-msg');
+            var footerMsgEl = document.getElementById('port-modal-status-msg');
             this.disabled = true;
+            this.innerHTML = '<span class="spinner-sm" style="margin-right:6px;"></span>正在保存...';
             try {
                 var r = await apiJSON('/k8s/notebooks/' + encodeURIComponent(pod.namespace) + '/' + encodeURIComponent(pod.name) + '/metadata', {
                     method: 'PUT',
@@ -722,82 +899,317 @@
                 });
                 if (!r.resp.ok) {
                     setMsg(msgEl, '保存失败: ' + (r.data && r.data.error), 'error');
+                    setMsg(footerMsgEl, '保存失败: ' + (r.data && r.data.error), 'error');
                 } else {
                     setMsg(msgEl, '使用人与备注已成功保存！', 'info');
+                    setMsg(footerMsgEl, '使用人与备注已成功保存！', 'info');
                     pod.owner_name = owner;
                     pod.note = note;
-                    loadPods(content);
+                    var metaBadge = document.getElementById('tab-meta-badge');
+                    if (metaBadge) {
+                        metaBadge.innerHTML = owner ? '<span class="badge badge-success tab-badge-count">已设置</span>' : '';
+                    }
+                    updatePodRowInTable(pod);
                 }
             } catch (err) {
                 setMsg(msgEl, '保存失败: ' + err.message, 'error');
+                setMsg(footerMsgEl, '保存失败: ' + err.message, 'error');
             } finally {
                 this.disabled = false;
+                this.innerHTML = '<svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-2px;"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg> 保存使用人与备注';
             }
         });
 
+        // Dynamic Port Rows Logic
         var rowsContainer = document.getElementById('port-rows-container');
 
-        function createPortRow(podPort, nodePort) {
+        function createPortRow(podPort, nodePort, highlight) {
             var row = document.createElement('div');
-            row.className = 'port-row-item';
-            row.style.cssText = 'display:flex;gap:10px;align-items:center;margin-bottom:8px;';
-            row.innerHTML = '<div style="flex:1;"><input type="number" class="row-pod-port" placeholder="Pod 内部端口 (必填，如 8888)" min="1" max="65535" value="' + (podPort || '') + '" required style="margin-bottom:0;"></div>' +
-                '<div style="flex:1.3;"><input type="number" class="row-node-port" placeholder="外部 NodePort (可选，留空自动分配)" min="30000" max="32767" value="' + (nodePort || '') + '" style="margin-bottom:0;"></div>' +
-                '<button type="button" class="btn btn-xs btn-danger btn-del-row" style="padding:6px 10px;">&times; 删除行</button>';
+            row.className = 'port-row-item' + (highlight ? ' highlight-added' : '');
+            row.innerHTML =
+                '<div style="flex:1;">' +
+                '<input type="number" class="row-pod-port port-num-input" placeholder="Pod 内部端口 (必填，如 8888)" min="1" max="65535" value="' + (podPort || '') + '" style="margin-bottom:0;">' +
+                '<div class="port-row-error error-pod-port"></div>' +
+                '</div>' +
+                '<div class="port-row-arrow">&rarr;</div>' +
+                '<div style="flex:1.4;">' +
+                '<input type="number" class="row-node-port port-num-input" placeholder="外部 NodePort (可选，留空自动分配)" min="30000" max="32767" value="' + (nodePort || '') + '" style="margin-bottom:0;">' +
+                '<div class="port-row-error error-node-port"></div>' +
+                '</div>' +
+                '<div style="width:60px;text-align:center;"><span class="badge badge-muted font-mono" style="font-size:11px;">TCP</span></div>' +
+                '<div style="width:70px;text-align:right;">' +
+                '<button type="button" class="btn btn-xs btn-outline btn-del-row" title="删除此行" style="color:var(--danger);border-color:var(--border-color);">' +
+                '<svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-1px;"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg> 删除' +
+                '</button>' +
+                '</div>';
+
+            var inputs = row.querySelectorAll('.port-num-input');
+            inputs.forEach(function (inp) {
+                inp.addEventListener('wheel', function () { this.blur(); });
+                inp.addEventListener('input', validateLive);
+            });
+
             row.querySelector('.btn-del-row').addEventListener('click', function () {
                 row.remove();
+                validateLive();
             });
+
             rowsContainer.appendChild(row);
+            return row;
+        }
+
+        // Real-time live validation
+        function validateLive() {
+            var rowEls = rowsContainer.querySelectorAll('.port-row-item');
+            var seenPodPorts = {};
+            var seenNodePorts = {};
+            var hasErr = false;
+
+            rowEls.forEach(function (row) {
+                var podInp = row.querySelector('.row-pod-port');
+                var nodeInp = row.querySelector('.row-node-port');
+                var podErr = row.querySelector('.error-pod-port');
+                var nodeErr = row.querySelector('.error-node-port');
+
+                podInp.classList.remove('port-input-error');
+                nodeInp.classList.remove('port-input-error');
+                podErr.style.display = 'none';
+                podErr.textContent = '';
+                nodeErr.style.display = 'none';
+                nodeErr.textContent = '';
+
+                var podVal = podInp.value.trim();
+                var nodeVal = nodeInp.value.trim();
+
+                if (podVal) {
+                    var pNum = parseInt(podVal, 10);
+                    if (isNaN(pNum) || pNum < 1 || pNum > 65535) {
+                        podInp.classList.add('port-input-error');
+                        podErr.textContent = '端口范围需为 1~65535';
+                        podErr.style.display = 'block';
+                        hasErr = true;
+                    } else if (seenPodPorts[pNum]) {
+                        podInp.classList.add('port-input-error');
+                        podErr.textContent = '内部端口不能重复';
+                        podErr.style.display = 'block';
+                        hasErr = true;
+                    } else {
+                        seenPodPorts[pNum] = true;
+                    }
+                }
+
+                if (nodeVal) {
+                    var nNum = parseInt(nodeVal, 10);
+                    if (isNaN(nNum) || nNum < 30000 || nNum > 32767) {
+                        nodeInp.classList.add('port-input-error');
+                        nodeErr.textContent = 'NodePort 需在 30000~32767 或留空';
+                        nodeErr.style.display = 'block';
+                        hasErr = true;
+                    } else if (seenNodePorts[nNum]) {
+                        nodeInp.classList.add('port-input-error');
+                        nodeErr.textContent = '外部 NodePort 不能重复';
+                        nodeErr.style.display = 'block';
+                        hasErr = true;
+                    } else {
+                        seenNodePorts[nNum] = true;
+                    }
+                }
+            });
+
+            return !hasErr;
         }
 
         // Add initial row
-        createPortRow('', '');
+        createPortRow('', '', false);
 
         document.getElementById('btn-add-port-row').addEventListener('click', function () {
-            createPortRow('', '');
+            var row = createPortRow('', '', true);
+            var inp = row.querySelector('.row-pod-port');
+            if (inp) inp.focus();
         });
 
         var btnCancelEdit = document.getElementById('btn-cancel-edit');
         var formTitle = document.getElementById('port-form-title');
-        var submitBtn = document.getElementById('btn-submit-port');
 
         function resetFormToCreate() {
             editingSvc = null;
             formTitle.textContent = '新建 NodePort 映射规则';
-            submitBtn.textContent = '立即创建映射';
+            submitBtnText.textContent = '立即创建映射';
             btnCancelEdit.style.display = 'none';
             rowsContainer.innerHTML = '';
-            createPortRow('', '');
-            setMsg(document.getElementById('port-form-msg'), '', 'error');
+            createPortRow('', '', false);
+            setMsg(document.getElementById('port-modal-status-msg'), '', 'error');
         }
 
         btnCancelEdit.addEventListener('click', resetFormToCreate);
 
         function setupEditMode(svc) {
             editingSvc = svc;
+            switchTab('ports');
             formTitle.innerHTML = '正在编辑 Service: <code>' + esc(svc.name) + '</code>';
-            submitBtn.textContent = '保存并更新规则';
-            btnCancelEdit.style.display = 'inline-block';
+            submitBtnText.textContent = '保存并更新规则';
+            btnCancelEdit.style.display = 'inline-flex';
             rowsContainer.innerHTML = '';
             var ports = svc.ports || [];
             if (ports.length === 0) {
-                createPortRow('', '');
+                createPortRow('', '', false);
             } else {
                 ports.forEach(function (p) {
-                    createPortRow(p.target_port || p.port, p.node_port || '');
+                    createPortRow(p.target_port || p.port, p.node_port || '', false);
                 });
             }
-            document.getElementById('port-form').scrollIntoView({ behavior: 'smooth' });
+            validateLive();
+            var formSection = document.getElementById('port-form-section');
+            if (formSection && modalBody) {
+                modalBody.scrollTo({ top: formSection.offsetTop - 20, behavior: 'smooth' });
+            }
         }
 
-        renderExistingMappings(modal, pod, setupEditMode);
+        // Render Existing Mappings in Modal
+        function renderExistingMappings() {
+            var container = modal.querySelector('#pod-existing-container');
+            if (!container) return;
+            var mine = servicesForPod(pod.uid);
+            var countBadge = modal.querySelector('#tab-ports-count');
+            if (countBadge) countBadge.textContent = mine.length;
+            updatePodMappingsCountInTable(pod.uid);
 
-        document.getElementById('port-form').addEventListener('submit', async function (e) {
-            e.preventDefault();
-            var msgEl = document.getElementById('port-form-msg');
+            if (mine.length === 0) {
+                container.innerHTML = '<div class="muted" style="padding:14px 12px;background:var(--slate-50);border-radius:var(--radius-md);border:1px dashed var(--slate-300);text-align:center;font-size:12.5px;">' +
+                    '当前 Pod 暂无关联 Service 端口映射。可在下方快速配置并生效。' +
+                    '</div>';
+                return;
+            }
+
+            mine.sort(function (a, b) { return (a.managed === b.managed) ? 0 : (a.managed ? -1 : 1); });
+
+            container.innerHTML = mine.map(function (s) {
+                var ports = s.ports || [];
+                var rulesHtml = ports.length === 0
+                    ? '<span class="muted">(未定义端口)</span>'
+                    : ports.map(function (p) {
+                        var target = p.target_port || p.port;
+                        var nodePortPart = p.node_port
+                            ? ('<strong style="color:var(--primary);">' + p.node_port + '</strong>')
+                            : '<span class="muted">自动分配</span>';
+                        return '<span class="port-svc-rule-pill">' +
+                            '<span>NodePort ' + nodePortPart + '</span>' +
+                            '<span style="color:var(--slate-400);">&rarr;</span>' +
+                            '<span class="font-mono">Pod ' + target + '/TCP</span>' +
+                            '</span>';
+                    }).join('');
+
+                var srcBadge = s.managed
+                    ? '<span class="badge badge-success">本面板管理</span>'
+                    : '<span class="badge badge-muted">外部固有</span>';
+
+                var actions = s.managed
+                    ? '<div style="display:flex;align-items:center;gap:6px;">' +
+                    '<button type="button" class="btn btn-xs btn-outline" data-act="edit-svc" data-svc=\'' + esc(JSON.stringify(s)) + '\'>' +
+                    '<svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-1px;"><path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"/></svg> 编辑' +
+                    '</button>' +
+                    '<button type="button" class="btn btn-xs btn-danger" data-act="del-svc" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">' +
+                    '<svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-1px;"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg> 删除' +
+                    '</button>' +
+                    '</div>'
+                    : '<span class="muted" style="font-size:11.5px;">集群固有只读</span>';
+
+                return '<div class="port-svc-card">' +
+                    '<div class="port-svc-header">' +
+                    '<div style="display:flex;align-items:center;gap:8px;">' +
+                    '<span class="font-mono" style="font-weight:600;font-size:13px;color:var(--slate-900);">' + esc(s.name) + '</span>' +
+                    srcBadge +
+                    '</div>' +
+                    actions +
+                    '</div>' +
+                    '<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;">' + rulesHtml + '</div>' +
+                    '</div>';
+            }).join('');
+
+            container.querySelectorAll('button[data-act="edit-svc"]').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var s = JSON.parse(this.getAttribute('data-svc'));
+                    setupEditMode(s);
+                });
+            });
+
+            container.querySelectorAll('button[data-act="del-svc"]').forEach(function (btn) {
+                btn.addEventListener('click', async function () {
+                    var name = this.getAttribute('data-name');
+                    var ns2 = this.getAttribute('data-ns');
+                    var msgEl = document.getElementById('port-modal-status-msg');
+
+                    if (this.getAttribute('data-confirming') !== 'true') {
+                        var self = this;
+                        self.setAttribute('data-confirming', 'true');
+                        var origHtml = self.innerHTML;
+                        self.innerHTML = '确定删除？';
+                        self.classList.remove('btn-danger');
+                        self.style.backgroundColor = '#991b1b';
+                        self.style.color = '#fff';
+                        setTimeout(function () {
+                            if (self && self.isConnected) {
+                                self.removeAttribute('data-confirming');
+                                self.innerHTML = origHtml;
+                                self.classList.add('btn-danger');
+                                self.style.backgroundColor = '';
+                                self.style.color = '';
+                            }
+                        }, 3500);
+                        return;
+                    }
+
+                    this.disabled = true;
+                    this.textContent = '删除中...';
+                    setMsg(msgEl, '正在删除 Service ' + name + '...', 'info');
+
+                    try {
+                        var r = await apiJSON('/k8s/services/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
+                        if (!r.resp.ok) {
+                            setMsg(msgEl, '删除失败: ' + (r.data && r.data.error), 'error');
+                            this.disabled = false;
+                            this.textContent = '删除';
+                            return;
+                        }
+                        setMsg(msgEl, '已提交删除任务！Service ' + name + ' 正在清理。', 'info');
+                        if (editingSvc && editingSvc.name === name) {
+                            resetFormToCreate();
+                        }
+                        refreshServicesList();
+                    } catch (err) {
+                        setMsg(msgEl, '删除失败: ' + err.message, 'error');
+                        this.disabled = false;
+                        this.textContent = '删除';
+                    }
+                });
+            });
+        }
+
+        async function refreshServicesList() {
+            try {
+                var sr = await apiJSON('/k8s/services');
+                if (sr.resp.ok && Array.isArray(sr.data)) {
+                    k8sServices = sr.data;
+                    renderExistingMappings();
+                }
+            } catch (e) {
+                console.error('Failed to refresh services:', e);
+            }
+        }
+
+        renderExistingMappings();
+
+        // Submit Port Mapping Form Handler
+        async function submitPortRules() {
+            var msgEl = document.getElementById('port-modal-status-msg');
             setMsg(msgEl, '', 'error');
-            var rowEls = rowsContainer.querySelectorAll('.port-row-item');
 
+            if (!validateLive()) {
+                setMsg(msgEl, '请修正标红的端口输入错误', 'error');
+                return;
+            }
+
+            var rowEls = rowsContainer.querySelectorAll('.port-row-item');
             if (rowEls.length === 0) {
                 if (editingSvc) {
                     if (!confirm('已移除全部端口映射。保存将彻底删除 Service ' + editingSvc.name + ' 及对应 NetworkPolicy，是否确认？')) {
@@ -816,16 +1228,22 @@
 
             rowEls.forEach(function (row) {
                 if (parseErr) return;
-                var podPortVal = parseInt(row.querySelector('.row-pod-port').value, 10);
-                var nodePortInput = row.querySelector('.row-node-port').value.trim();
-                var nodePortVal = nodePortInput ? parseInt(nodePortInput, 10) : 0;
+                var podPortInp = row.querySelector('.row-pod-port').value.trim();
+                var nodePortInp = row.querySelector('.row-node-port').value.trim();
 
-                if (isNaN(podPortVal) || podPortVal < 1 || podPortVal > 65535) {
-                    parseErr = 'Pod 内部端口必须在 1 到 65535 之间';
+                if (!podPortInp) {
+                    parseErr = '容器内部端口不能为空';
                     return;
                 }
-                if (nodePortInput && (isNaN(nodePortVal) || nodePortVal < 30000 || nodePortVal > 32767)) {
-                    parseErr = '外部 NodePort (' + nodePortInput + ') 必须在 30000 到 32767 范围内，或留空让系统自动分配';
+                var podPortVal = parseInt(podPortInp, 10);
+                var nodePortVal = nodePortInp ? parseInt(nodePortInp, 10) : 0;
+
+                if (isNaN(podPortVal) || podPortVal < 1 || podPortVal > 65535) {
+                    parseErr = 'Pod 内部端口 (' + podPortInp + ') 必须在 1 到 65535 之间';
+                    return;
+                }
+                if (nodePortInp && (isNaN(nodePortVal) || nodePortVal < 30000 || nodePortVal > 32767)) {
+                    parseErr = '外部 NodePort (' + nodePortInp + ') 必须在 30000 到 32767 范围内，或留空自动分配';
                     return;
                 }
                 if (seenPodPorts[podPortVal]) {
@@ -848,6 +1266,9 @@
                 return;
             }
 
+            submitBtn.disabled = true;
+            submitBtnText.innerHTML = '<span class="spinner-sm" style="margin-right:6px;"></span>正在提交...';
+
             try {
                 var r;
                 if (editingSvc) {
@@ -865,60 +1286,32 @@
                     };
                     r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
                 }
-                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
-                modal.remove();
+
+                if (!r.resp.ok) {
+                    setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error');
+                    submitBtn.disabled = false;
+                    submitBtnText.textContent = editingSvc ? '保存并更新规则' : '立即创建映射';
+                    return;
+                }
+
+                closeModal();
                 var taskID = r.data && r.data.task_id;
-                if (taskID) window.location.hash = '#/tasks/' + taskID;
-            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
-        });
-    }
-
-    function renderExistingMappings(scope, pod, onEditSvc) {
-        var el = scope.querySelector('#pod-existing-tbody');
-        if (!el) return;
-        var mine = servicesForPod(pod.uid);
-        if (mine.length === 0) {
-            el.innerHTML = '<tr><td colspan="4" class="muted">当前 Pod 尚无关联端口映射。可在下方新建映射规则。</td></tr>';
-            return;
+                if (taskID) {
+                    window.location.hash = '#/tasks/' + taskID;
+                } else {
+                    loadPods(content);
+                }
+            } catch (err) {
+                setMsg(msgEl, '提交失败: ' + err.message, 'error');
+                submitBtn.disabled = false;
+                submitBtnText.textContent = editingSvc ? '保存并更新规则' : '立即创建映射';
+            }
         }
-        mine.sort(function (a, b) { return (a.managed === b.managed) ? 0 : (a.managed ? -1 : 1); });
-        el.innerHTML = mine.map(function (s) {
-            var ports = s.ports || [];
-            var rulesHtml = ports.length === 0 ? '<span class="muted">(未定义端口)</span>' : ports.map(function (p) {
-                var ext = p.node_port ? ('<strong style="color:var(--primary);">' + p.node_port + '</strong>') : '<span class="muted">自动分配</span>';
-                var target = p.target_port || p.port;
-                return '<span class="badge" style="margin:2px 4px 2px 0;background:rgba(255,255,255,0.05);">' + ext + ' &rarr; <span class="font-mono">' + target + '/TCP</span></span>';
-            }).join('');
-            var srcBadge = s.managed ? '<span class="badge badge-success">本面板管理</span>' : '<span class="badge badge-muted">外部固有</span>';
-            var action = s.managed
-                ? '<div class="actions-cell" style="justify-content:flex-end;">' +
-                  '<button class="btn btn-xs btn-outline" data-act="edit-svc" data-svc=\'' + esc(JSON.stringify(s)) + '\'>编辑规则</button>' +
-                  '<button class="btn btn-xs btn-danger" data-act="del-svc" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">删除</button>' +
-                  '</div>'
-                : '<span class="muted" style="font-size:12px;">只读</span>';
-            return '<tr><td><span class="font-mono" style="font-weight:600;">' + esc(s.name) + '</span></td><td>' + rulesHtml + '</td><td>' + srcBadge + '</td>' +
-                '<td style="text-align:right;">' + action + '</td></tr>';
-        }).join('');
 
-        el.querySelectorAll('button[data-act="edit-svc"]').forEach(function (btn) {
-            btn.addEventListener('click', function () {
-                var s = JSON.parse(this.getAttribute('data-svc'));
-                if (onEditSvc) onEditSvc(s);
-            });
-        });
-
-        el.querySelectorAll('button[data-act="del-svc"]').forEach(function (btn) {
-            btn.addEventListener('click', async function () {
-                if (!confirm('确认删除 Service ' + this.getAttribute('data-name') + '？\n删除将释放对应的 NodePort 端口并清理配套 NetworkPolicy 规则。')) return;
-                var name = this.getAttribute('data-name');
-                var ns2 = this.getAttribute('data-ns');
-                try {
-                    var r = await apiJSON('/k8s/services/' + encodeURIComponent(name) + '?namespace=' + encodeURIComponent(ns2), { method: 'DELETE' });
-                    if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
-                    var taskID = r.data && r.data.task_id;
-                    if (taskID) window.location.hash = '#/tasks/' + taskID;
-                } catch (err) { alert('错误: ' + err.message); }
-            });
+        submitBtn.addEventListener('click', submitPortRules);
+        document.getElementById('port-form').addEventListener('submit', function (e) {
+            e.preventDefault();
+            submitPortRules();
         });
     }
 
@@ -1491,10 +1884,13 @@
                 btn.addEventListener('click', function () {
                     var t = JSON.parse(this.getAttribute('data-reg-task'));
                     var curWorker = workersMap[t.target_id] || {};
+                    var p = {};
+                    try { p = JSON.parse(t.params_json || '{}'); } catch (e) {}
                     showPlatformRegistrationModal(content, {
-                        name: 'nfs-task-' + t.id,
+                        name: 'nfs-' + (p.lv_name || ('task-' + t.id)),
                         service_address: curWorker.host || '127.0.0.1',
-                        path: '/data02/notebook_nfs',
+                        path: p.mount_point || '/data02/notebook_nfs',
+                        size_gb: p.size_gb || 0,
                         workspace_uuid: ''
                     });
                 });
@@ -1824,10 +2220,13 @@
                     var wr = await apiJSON('/workers/' + task.target_id);
                     if (wr.resp.ok && wr.data && wr.data.host) addr = wr.data.host;
                 } catch (e) {}
+                var p = {};
+                try { p = JSON.parse(task.params_json || '{}'); } catch (e) {}
                 showPlatformRegistrationModal(document.getElementById('content'), {
-                    name: 'nfs-task-' + task.id,
+                    name: 'nfs-' + (p.lv_name || ('task-' + task.id)),
                     service_address: addr,
-                    path: '/data02/notebook_nfs',
+                    path: p.mount_point || '/data02/notebook_nfs',
+                    size_gb: p.size_gb || 0,
                     workspace_uuid: ''
                 });
             });

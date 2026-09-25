@@ -17,12 +17,17 @@ func RollbackFor(req ProvisionReq, done []string) []Step {
 	}
 	var rb []Step
 	lvDev := fmt.Sprintf("/dev/%s/%s", req.VGName, req.LVName)
-	// Reverse order: undo later steps first
+	// Reverse order: undo later steps first.
+	// Exports must be undone and reloaded before umount, otherwise NFS holds the
+	// mount point open and umount fails with EBUSY (device or resource busy).
+	if has["exports"] {
+		rb = append(rb,
+			Step{"rollback:exports", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports`, req.MountPoint)},
+			Step{"rollback:exportfs", "exportfs -arv"},
+		)
+	}
 	if has["mount"] {
 		rb = append(rb, Step{"rollback:mount", fmt.Sprintf("umount %s", req.MountPoint)})
-	}
-	if has["exports"] {
-		rb = append(rb, Step{"rollback:exports", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports`, req.MountPoint)})
 	}
 	if has["fstab"] {
 		rb = append(rb, Step{"rollback:fstab", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab`, lvDev)})

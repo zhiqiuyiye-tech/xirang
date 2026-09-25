@@ -221,6 +221,19 @@ func TestEngineSerializesPerTarget(t *testing.T) {
 		t.Fatalf("maxOverlap=%d, want 2 (different targets must run in parallel)", maxOverlap)
 	}
 	mu.Unlock()
+
+	// Worker and storage tasks on the same worker ID: must serialize.
+	maxOverlap = 0
+	overlap = 0
+	id5, _ := e.Submit(context.Background(), "slow", "worker", 4, nil)
+	id6, _ := e.Submit(context.Background(), "slow", "storage", 4, nil)
+	waitFor(t, e, id5, "succeeded", 3*time.Second)
+	waitFor(t, e, id6, "succeeded", 3*time.Second)
+	mu.Lock()
+	if maxOverlap != 1 {
+		t.Fatalf("maxOverlap=%d, want 1 (worker and storage on same worker must serialize)", maxOverlap)
+	}
+	mu.Unlock()
 }
 
 // TestEngineTaskTimeout verifies a task whose handler blocks past the run

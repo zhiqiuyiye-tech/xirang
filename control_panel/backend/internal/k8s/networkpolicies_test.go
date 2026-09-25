@@ -68,12 +68,31 @@ func TestListNetworkPolicies(t *testing.T) {
 }
 
 func TestDeleteNetworkPolicy(t *testing.T) {
-	cs := fake.NewSimpleClientset(&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np1", Namespace: "ns1"}})
+	cs := fake.NewSimpleClientset(&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+		Name:      "np1",
+		Namespace: "ns1",
+		Labels:    map[string]string{"managed-by": "control-panel"},
+	}})
 	if err := DeleteNetworkPolicy(context.Background(), cs, "ns1", "np1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := cs.NetworkingV1().NetworkPolicies("ns1").Get(context.Background(), "np1", metav1.GetOptions{}); err == nil {
 		t.Fatal("expected not found after delete")
+	}
+
+	// External network policy must be rejected
+	if _, err := cs.NetworkingV1().NetworkPolicies("ns1").Create(context.Background(), &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-np", Namespace: "ns1"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteNetworkPolicy(context.Background(), cs, "ns1", "ext-np"); err == nil {
+		t.Fatal("expected error deleting external network policy")
+	}
+
+	// Protected namespace must be rejected
+	if err := DeleteNetworkPolicy(context.Background(), cs, "kube-system", "np1"); err == nil {
+		t.Fatal("expected error deleting in protected namespace")
 	}
 }
 

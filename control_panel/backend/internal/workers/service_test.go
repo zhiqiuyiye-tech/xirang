@@ -42,6 +42,7 @@ func (s *workerSSHStub) RunWithStdin(_ context.Context, _ db.WorkerNode, _ strin
 	return "", "", 0, nil
 }
 func (s *workerSSHStub) TestConnection(_ context.Context, _ db.WorkerNode) error { return s.testErr }
+func (s *workerSSHStub) EvictWorker(_ int64)                                     {}
 
 func TestConnectionPersistsWorkerStatus(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "health.db"))

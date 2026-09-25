@@ -420,9 +420,12 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 		}
 	}
 
-	// Safe initialization candidates may be whole disks or independent blank
+	// Safe initialization candidates may be unmounted whole disks or unmounted
 	// partitions. A candidate is rejected if its physical ancestor is a system
-	// or reserved disk, or if it has children, a filesystem, a mount, or PV use.
+	// disk or reserved disk (/data01), if it is currently mounted, if it has
+	// child devices (partitions), or if it already belongs to an active volume group.
+	// Devices with stale unmounted filesystems or unassigned PVs are valid candidates
+	// because create_vg will wipe them prior to initialization.
 	candidateBytesByDisk := map[string]int64{}
 	unusedMap := map[string]bool{}
 	for _, row := range lsblkRows {
@@ -434,7 +437,14 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 		if physical == "" || systemDisks[physical] || reservedDisks[physical] {
 			continue
 		}
-		if row.Fstype != "" || row.Mountpoint != "" || childrenOf[row.Name] || pvSet[device] {
+		// A mounted device or a device with child devices (partitions) cannot be
+		// directly initialized. For partitioned disks, child partitions will be evaluated.
+		if row.Mountpoint != "" || childrenOf[row.Name] {
+			continue
+		}
+		// Devices belonging to an active Volume Group must not be wiped.
+		// Free PVs without an active VG are safe to reuse/initialize.
+		if detail, ok := pvMap[device]; ok && detail.VGName != "" {
 			continue
 		}
 		inv.UnusedDisks = append(inv.UnusedDisks, DiskInfo{
@@ -461,7 +471,7 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 			disk.Role = "system"
 		case len(vgNamesByDisk[device]) > 0:
 			disk.Role = "lvm"
-		case unusedMap[device]:
+		case unusedMap[device] || (candidateBytesByDisk[device] > 0 && len(disk.MountPoints) == 0):
 			disk.Role = "unused"
 		default:
 			disk.Role = "data"

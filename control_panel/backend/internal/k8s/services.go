@@ -31,10 +31,25 @@ type CreateServiceReq struct {
 	Ports     []PortSpec
 }
 
+func isProtectedNamespace(ns string) bool {
+	switch ns {
+	case "kube-system", "kube-public", "kube-node-lease":
+		return true
+	default:
+		return false
+	}
+}
+
 // CreateService creates a Service owned by the given Pod. The Service is
 // labelled with managed-by=control-panel and pod-uid=<uid> so it can be
 // discovered and garbage-collected by the control panel.
 func CreateService(ctx context.Context, client kubernetes.Interface, req CreateServiceReq) (*corev1.Service, error) {
+	if isProtectedNamespace(req.Namespace) {
+		return nil, fmt.Errorf("cannot create service in protected namespace %q", req.Namespace)
+	}
+	if len(req.Selector) == 0 {
+		return nil, fmt.Errorf("selector cannot be empty")
+	}
 	svcType := corev1.ServiceTypeClusterIP
 	if req.Type == "NodePort" {
 		svcType = corev1.ServiceTypeNodePort
@@ -84,8 +99,18 @@ func CreateService(ctx context.Context, client kubernetes.Interface, req CreateS
 	return created, nil
 }
 
-// DeleteService deletes a Service by name.
+// DeleteService deletes a Service by name after verifying it is managed by the control panel.
 func DeleteService(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+	if isProtectedNamespace(namespace) {
+		return fmt.Errorf("cannot delete service in protected namespace %q", namespace)
+	}
+	svc, err := client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if svc.Labels["managed-by"] != "control-panel" {
+		return fmt.Errorf("cannot delete externally managed service %s/%s", namespace, name)
+	}
 	return client.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 

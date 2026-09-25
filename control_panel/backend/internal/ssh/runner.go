@@ -107,7 +107,14 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	if err != nil {
 		return "", "", -1, err
 	}
-	defer m.release(w.ID, client)
+	reuse := false
+	defer func() {
+		if reuse {
+			m.release(w.ID, client)
+		} else {
+			client.Close()
+		}
+	}()
 	sess, err := client.NewSession()
 	if err != nil {
 		return "", "", -1, err
@@ -127,11 +134,13 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	select {
 	case err := <-done:
 		if ee, ok := err.(*xssh.ExitError); ok {
+			reuse = true
 			return outB.String(), errB.String(), ee.ExitStatus(), nil
 		}
 		if err != nil {
 			return outB.String(), errB.String(), -1, err
 		}
+		reuse = true
 		return outB.String(), errB.String(), 0, nil
 	case <-ctx.Done():
 		// SSH signal delivery is optional for servers; closing the session

@@ -37,6 +37,7 @@ func validatePort(p int) error {
 type workerSSH interface {
 	ssh.Runner
 	TestConnection(ctx context.Context, w db.WorkerNode) error
+	EvictWorker(wID int64)
 }
 
 type Service struct {
@@ -106,6 +107,7 @@ func (s *Service) Update(ctx context.Context, id int64, r UpdateReq) error {
 }
 
 func (s *Service) Delete(ctx context.Context, id int64) error {
+	s.sshm.EvictWorker(id)
 	return s.store.DeleteWorker(ctx, id)
 }
 
@@ -139,6 +141,7 @@ func (s *Service) SetPrivateKey(ctx context.Context, id int64, pem string) error
 	if w.EncPassword != nil {
 		mode = "both"
 	}
+	s.sshm.EvictWorker(id)
 	return s.store.SetWorkerCredentials(ctx, id, w.EncPassword, &enc, mode)
 }
 
@@ -155,6 +158,7 @@ func (s *Service) SetPanelPassword(ctx context.Context, id int64, password strin
 	if w.EncPrivateKey != nil {
 		mode = "both"
 	}
+	s.sshm.EvictWorker(id)
 	return s.store.SetWorkerCredentials(ctx, id, &enc, w.EncPrivateKey, mode)
 }
 

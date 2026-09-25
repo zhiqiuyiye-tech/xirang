@@ -21,6 +21,22 @@ func TestValidateName_Bad(t *testing.T) {
 	}
 }
 
+func TestValidateMountPoint(t *testing.T) {
+	reserved := []string{"/data01"}
+	// Valid mounts
+	for _, m := range []string{"/data02/nb", "/data02", "/mnt/storage", "/opt/data"} {
+		if err := ValidateMountPoint(m, reserved); err != nil {
+			t.Fatalf("unexpected err for %q: %v", m, err)
+		}
+	}
+	// Invalid mounts: relative, root, protected system, reserved
+	for _, m := range []string{"", "relative/path", "/", "/boot", "/boot/efi", "/etc", "/etc/exports", "/var/log", "/data01", "/data01/sub"} {
+		if err := ValidateMountPoint(m, reserved); err == nil {
+			t.Fatalf("expected err for mount point %q", m)
+		}
+	}
+}
+
 func TestProvisionSteps(t *testing.T) {
 	steps := ProvisionSteps(ProvisionReq{
 		VGName: "vg_data", LVName: "lv_200g", SizeGB: 200, FSType: "xfs",
@@ -120,7 +136,7 @@ func TestCreateVGSteps_New(t *testing.T) {
 	if len(steps) != 4 {
 		t.Fatalf("expected 4 steps (2 disks x 2), got %d", len(steps))
 	}
-	if steps[0].Name != "pvcreate:/dev/sdb" || steps[0].Cmd != "wipefs -a /dev/sdb && pvcreate /dev/sdb" {
+	if steps[0].Name != "pvcreate:/dev/sdb" || steps[0].Cmd != "wipefs -a /dev/sdb && pvcreate -y -ff /dev/sdb" {
 		t.Fatalf("pvcreate sdb wrong: %+v", steps[0])
 	}
 	if steps[1].Name != "vgcreate:vg_data_sdb" || steps[1].Cmd != "vgcreate vg_data_sdb /dev/sdb" {
@@ -174,7 +190,7 @@ func TestResizeLVSteps_Grow(t *testing.T) {
 
 func TestResizeLVSteps_Shrink(t *testing.T) {
 	steps := ResizeLVSteps(ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: false, DeltaGB: 10})
-	if steps[0].Name != "lvreduce" || steps[0].Cmd != "lvreduce -r -L -10G /dev/vg_data/lv_200g" {
+	if steps[0].Name != "lvreduce" || steps[0].Cmd != "lvreduce -y -r -L -10G /dev/vg_data/lv_200g" {
 		t.Fatalf("shrink wrong: %+v", steps[0])
 	}
 }

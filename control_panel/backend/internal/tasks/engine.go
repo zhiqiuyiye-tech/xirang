@@ -148,9 +148,16 @@ func (e *Engine) Submit(ctx context.Context, typeName, targetKind string, target
 }
 
 // slotFor returns (creating on first use) the serialization semaphore for a
-// target. Keyed by kind+id: worker 3 and worker 4 have independent slots.
+// target. Keyed by kind+id. For worker-level tasks (both targetKind="worker"
+// and targetKind="storage", where targetID is the worker ID), the slot is
+// unified under "worker/<id>" so storage and host tasks on the same physical
+// worker never run concurrently.
 func (e *Engine) slotFor(targetKind string, targetID int64) chan struct{} {
-	key := targetKind + "/" + fmt.Sprint(targetID)
+	normalizedKind := targetKind
+	if targetKind == "storage" {
+		normalizedKind = "worker"
+	}
+	key := normalizedKind + "/" + fmt.Sprint(targetID)
 	e.slotsMu.Lock()
 	defer e.slotsMu.Unlock()
 	if c, ok := e.slots[key]; ok {

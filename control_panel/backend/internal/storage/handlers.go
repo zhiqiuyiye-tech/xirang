@@ -22,19 +22,20 @@ func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Sto
 	if len(configuredReservedMounts) > 0 {
 		reservedMounts = append([]string(nil), configuredReservedMounts...)
 	}
-	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store})
-	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store})
+	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store, reservedMounts: reservedMounts})
+	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store, reservedMounts: reservedMounts})
 	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
 	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: reservedMounts})
 	eng.Register("storage_resize_lv", &resizeLVHandler{runner: runner, store: store})
-	eng.Register("storage_delete_lv", &deleteLVHandler{runner: runner, store: store})
+	eng.Register("storage_delete_lv", &deleteLVHandler{runner: runner, store: store, reservedMounts: reservedMounts})
 }
 
 // --- provisionHandler ---
 
 type provisionHandler struct {
-	runner ssh.Runner
-	store  *db.Store
+	runner         ssh.Runner
+	store          *db.Store
+	reservedMounts []string
 }
 
 func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -51,11 +52,15 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		r.Fail(fmt.Sprintf("parse params: %v", err))
 		return err
 	}
-	for _, f := range []string{p.VGName, p.LVName, p.MountPoint, p.FSType} {
+	for _, f := range []string{p.VGName, p.LVName, p.FSType} {
 		if err := ValidateName(f); err != nil {
 			r.Fail(fmt.Sprintf("invalid param: %v", err))
 			return err
 		}
+	}
+	if err := ValidateMountPoint(p.MountPoint, h.reservedMounts); err != nil {
+		r.Fail(fmt.Sprintf("invalid mount_point: %v", err))
+		return err
 	}
 	// ExportOpts is interpolated into the exports step's shell command, so it
 	// MUST be validated too - a single quote would break out of the echo.
@@ -120,8 +125,9 @@ func (h *provisionHandler) rollback(ctx context.Context, w db.WorkerNode, r *tas
 // --- reclaimHandler ---
 
 type reclaimHandler struct {
-	runner ssh.Runner
-	store  *db.Store
+	runner         ssh.Runner
+	store          *db.Store
+	reservedMounts []string
 }
 
 func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -156,6 +162,16 @@ func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Report
 			return err
 		}
 		p.WorkerID, p.VGName, p.LVName, p.MountPoint = pp.WorkerID, pp.VGName, pp.LVName, pp.MountPoint
+	}
+	for _, f := range []string{p.VGName, p.LVName} {
+		if err := ValidateName(f); err != nil {
+			r.Fail(fmt.Sprintf("invalid param: %v", err))
+			return err
+		}
+	}
+	if err := ValidateMountPoint(p.MountPoint, h.reservedMounts); err != nil {
+		r.Fail(fmt.Sprintf("invalid mount_point: %v", err))
+		return err
 	}
 	w, err := h.store.GetWorker(ctx, p.WorkerID)
 	if err != nil {
@@ -420,10 +436,7 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		detect.Done("succeeded", out, stderr, "vg "+vg+" absent, will create")
 
 		// pvcreate + vgcreate for this disk only.
-		for _, s := range []Step{
-			{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("wipefs -a %s && pvcreate %s", d, d)},
-			{Name: "vgcreate:" + vg, Cmd: fmt.Sprintf("vgcreate %s %s", vg, d)},
-		} {
+		for _, s := range CreateVGSteps(CreateVGReq{VGNamePrefix: p.VGName, Disks: []string{d}}) {
 			sh, err := r.Step(s.Name)
 			if err != nil {
 				r.Fail(fmt.Sprintf("create step: %v", err))
@@ -504,8 +517,9 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 // mount point via findmnt so it can clean /etc/exports, umount, and clean
 // /etc/fstab before lvremove. Works for LVs created outside the control panel.
 type deleteLVHandler struct {
-	runner ssh.Runner
-	store  *db.Store
+	runner         ssh.Runner
+	store          *db.Store
+	reservedMounts []string
 }
 
 func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -542,6 +556,11 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 	out, stderr, code, _ := h.runner.Run(ctx, *w, fmt.Sprintf("findmnt -n -o TARGET --source %s 2>/dev/null", lvDev))
 	mountPoint := strings.TrimSpace(out)
 	if code == 0 && mountPoint != "" {
+		if err := ValidateMountPoint(mountPoint, h.reservedMounts); err != nil {
+			st.Done("failed", out, stderr, fmt.Sprintf("cannot delete protected volume: %v", err))
+			r.Fail(fmt.Sprintf("cannot delete protected volume mounted on %s: %v", mountPoint, err))
+			return err
+		}
 		st.Done("succeeded", out, stderr, "mounted at "+mountPoint)
 	} else {
 		mountPoint = ""
