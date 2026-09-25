@@ -17,11 +17,15 @@ import (
 // (lvextend/lvreduce), and storage_delete_lv (generalized LV teardown). Each
 // handler parses task.ParamsJSON, fetches the target worker, and executes the
 // command sequence via the SSH runner.
-func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store) {
+func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store, configuredReservedMounts ...string) {
+	reservedMounts := []string{"/data01"}
+	if len(configuredReservedMounts) > 0 {
+		reservedMounts = append([]string(nil), configuredReservedMounts...)
+	}
 	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store})
 	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store})
 	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
-	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store})
+	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: reservedMounts})
 	eng.Register("storage_resize_lv", &resizeLVHandler{runner: runner, store: store})
 	eng.Register("storage_delete_lv", &deleteLVHandler{runner: runner, store: store})
 }
@@ -200,6 +204,30 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 		return err
 	}
 
+	// 0. verify root or passwordless sudo before any mutation.
+	privStep, err := r.Step("check_privilege")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	privOut, privStderr, privCode, privErr := h.runner.Run(ctx, *w, DetectPrivilegeCmd())
+	if privErr != nil || privCode != 0 {
+		message := "root or passwordless sudo is required"
+		if strings.TrimSpace(privStderr) != "" {
+			message += ": " + strings.TrimSpace(privStderr)
+		}
+		privStep.Done("failed", privOut, privStderr, message)
+		r.Fail(message)
+		return fmt.Errorf("privilege check failed")
+	}
+	privilege, err := ParsePrivilege(privOut)
+	if err != nil {
+		privStep.Done("failed", privOut, privStderr, err.Error())
+		r.Fail(err.Error())
+		return err
+	}
+	privStep.Done("succeeded", privOut, privStderr, privilege)
+
 	// 1. detect package manager
 	st, err := r.Step("detect_pm")
 	if err != nil {
@@ -243,7 +271,7 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 			r.Fail(err.Error())
 			return err
 		}
-		out3, stderr3, code3, _ := h.runner.Run(ctx, *w, cmd)
+		out3, stderr3, code3, _ := h.runner.Run(ctx, *w, PrivilegedCmd(privilege, cmd))
 		if code3 != 0 {
 			st3.Done("failed", out3, stderr3, fmt.Sprintf("install failed code=%d", code3))
 			r.Fail(fmt.Sprintf("install failed: %s", stderr3))
@@ -276,7 +304,7 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	out5, stderr5, code5, _ := h.runner.Run(ctx, *w, ConfigureNFSv4Cmd())
+	out5, stderr5, code5, _ := h.runner.Run(ctx, *w, PrivilegedCmd(privilege, ConfigureNFSv4Cmd()))
 	if code5 != 0 {
 		st5.Done("failed", out5, stderr5, fmt.Sprintf("configure_nfs_v4 failed code=%d", code5))
 		r.Fail(fmt.Sprintf("configure nfs.conf failed: %s", stderr5))
@@ -290,7 +318,7 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	out6, stderr6, code6, _ := h.runner.Run(ctx, *w, EnableNFSServiceCmd(pm))
+	out6, stderr6, code6, _ := h.runner.Run(ctx, *w, PrivilegedCmd(privilege, EnableNFSServiceCmd(pm)))
 	if code6 != 0 {
 		st6.Done("failed", out6, stderr6, fmt.Sprintf("enable_nfs_service failed code=%d", code6))
 		r.Fail(fmt.Sprintf("enable nfs service failed: %s", stderr6))
@@ -312,8 +340,9 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 // derived VG name is already taken; if so it skips that disk (idempotent) so a
 // re-run doesn't fail on a VG that already exists.
 type createVGHandler struct {
-	runner ssh.Runner
-	store  *db.Store
+	runner         ssh.Runner
+	store          *db.Store
+	reservedMounts []string
 }
 
 func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -347,6 +376,27 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 	if err != nil {
 		r.Fail(err.Error())
 		return err
+	}
+
+	// Revalidate every selected device immediately before any destructive LVM
+	// command. Cached inventory is for display only and can become stale.
+	for _, device := range p.Disks {
+		step, err := r.Step("preflight:" + device)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		out, stderr, code, runErr := h.runner.Run(ctx, *w, PreflightDeviceCmd(device, h.reservedMounts))
+		if runErr != nil || code != 0 || !strings.Contains(out, "SAFE") {
+			message := strings.TrimSpace(stderr)
+			if message == "" {
+				message = "device safety preflight failed"
+			}
+			step.Done("failed", out, stderr, message)
+			r.Fail(fmt.Sprintf("preflight failed for %s: %s", device, message))
+			return fmt.Errorf("device preflight failed for %s", device)
+		}
+		step.Done("succeeded", out, stderr, "device is safe")
 	}
 
 	// Per disk: detect whether the derived VG already exists; if so skip it
@@ -406,7 +456,7 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		WorkerID int64  `json:"worker_id"`
 		VGName   string `json:"vg_name"`
 		LVName   string `json:"lv_name"`
-		Action   string `json:"action"`  // "grow" (default) | "shrink"
+		Action   string `json:"action"` // "grow" (default) | "shrink"
 		DeltaGB  int    `json:"delta_gb"`
 	}
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {

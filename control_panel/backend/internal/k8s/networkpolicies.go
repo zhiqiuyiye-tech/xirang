@@ -18,6 +18,7 @@ type IngressPortSpec struct {
 
 // CreateNetworkPolicyReq is the input to CreateNetworkPolicy.
 type CreateNetworkPolicyReq struct {
+	Name         string
 	Namespace    string
 	ServiceName  string
 	PodName      string
@@ -46,9 +47,15 @@ func CreateNetworkPolicy(ctx context.Context, client kubernetes.Interface, req C
 	if req.ServiceName != "" {
 		labels["service-name"] = req.ServiceName
 	}
+	npName := req.Name
+	generateName := ""
+	if npName == "" {
+		generateName = "cp-np-"
+	}
 	np := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "cp-np-",
+			Name:         npName,
+			GenerateName: generateName,
 			Namespace:    req.Namespace,
 			Labels:       labels,
 			OwnerReferences: []metav1.OwnerReference{{
@@ -97,11 +104,39 @@ func DeleteNetworkPoliciesByService(ctx context.Context, client kubernetes.Inter
 	return nil
 }
 
+// UpdateNetworkPoliciesByService updates matching NetworkPolicies with the new set of ingress target ports.
+func UpdateNetworkPoliciesByService(ctx context.Context, client kubernetes.Interface, namespace, serviceName string, ingressPorts []IngressPortSpec) error {
+	list, err := client.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("managed-by=control-panel,service-name=%s", serviceName),
+	})
+	if err != nil {
+		return err
+	}
+	ports := make([]networkingv1.NetworkPolicyPort, 0, len(ingressPorts))
+	for _, p := range ingressPorts {
+		portVal := intOrString(p.Port)
+		ports = append(ports, networkingv1.NetworkPolicyPort{
+			Protocol: protoPtr(p.Protocol),
+			Port:     &portVal,
+		})
+	}
+	for _, np := range list.Items {
+		np.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{{
+			From:  []networkingv1.NetworkPolicyPeer{},
+			Ports: ports,
+		}}
+		if _, err := client.NetworkingV1().NetworkPolicies(namespace).Update(ctx, &np, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ListNetworkPolicies returns the NetworkPolicies in the namespace that are
 // managed by the control panel (filtered by managed-by=control-panel).
 func ListNetworkPolicies(ctx context.Context, client kubernetes.Interface, namespace string) ([]networkingv1.NetworkPolicy, error) {
 	list, err := client.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector:  "managed-by=control-panel",
+		LabelSelector:   "managed-by=control-panel",
 		ResourceVersion: "0",
 	})
 	if err != nil {

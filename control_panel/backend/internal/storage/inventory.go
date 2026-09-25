@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
+	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,35 +17,44 @@ import (
 // LVInfo is a logical volume on a worker node, with its size, mount point,
 // filesystem type, disk space usage, and NFS export status.
 type LVInfo struct {
-	VGName       string  `json:"vg_name"`
-	Name         string  `json:"name"`
-	SizeGB       float64 `json:"size_gb"`
-	UsedGB       float64 `json:"used_gb"`       // used space in GB (from df); 0 if unmounted
-	FreeGB       float64 `json:"free_gb"`       // remaining free space in GB (from df)
-	UsePct       string  `json:"use_pct"`       // usage percentage, e.g. "5%"
-	Path         string  `json:"path"`          // /dev/<vg>/<lv> (lv_path)
-	MountPoint   string  `json:"mount_point"`   // from lsblk join; empty if unmounted
-	FSType       string  `json:"fs_type"`       // from lsblk (reads superblock, works unmounted)
-	IsNFSExport  bool    `json:"is_nfs_export"` // true if exported via NFS
-	NFSExportOpt string  `json:"nfs_export_opt"`// export options e.g. "*(rw,sync)"
+	VGName        string   `json:"vg_name"`
+	Name          string   `json:"name"`
+	SizeGB        float64  `json:"size_gb"`
+	UsedGB        float64  `json:"used_gb"`        // used space in GB (from df); 0 if unmounted
+	FreeGB        float64  `json:"free_gb"`        // remaining free space in GB (from df)
+	UsePct        string   `json:"use_pct"`        // usage percentage, e.g. "5%"
+	Path          string   `json:"path"`           // /dev/<vg>/<lv> (lv_path)
+	MountPoint    string   `json:"mount_point"`    // from lsblk join; empty if unmounted
+	FSType        string   `json:"fs_type"`        // from lsblk (reads superblock, works unmounted)
+	IsNFSExport   bool     `json:"is_nfs_export"`  // true if exported via NFS
+	NFSExportOpt  string   `json:"nfs_export_opt"` // export options e.g. "*(rw,sync)"
+	PVs           []string `json:"pvs"`
+	PhysicalDisks []string `json:"physical_disks"`
+	FreeKnown     bool     `json:"free_known"`
 }
 
 // DiskInfo is an unused whole disk discovered on the worker - not mounted, has
 // no filesystem, no partitions, and is not already a PV. These are candidates
 // for pvcreate+vgcreate into a VG pool.
 type DiskInfo struct {
-	Name   string  `json:"name"` // /dev/sdb
-	SizeGB float64 `json:"size_gb"`
+	Name       string  `json:"name"` // /dev/sdb or /dev/sdb1
+	SizeGB     float64 `json:"size_gb"`
+	Type       string  `json:"type"`        // disk | part
+	ParentDisk string  `json:"parent_disk"` // top-level physical disk
 }
 
 // PhysicalDiskInfo represents a physical hard drive on the worker node,
 // with its total capacity, remaining allocatable capacity, and role.
 type PhysicalDiskInfo struct {
-	Name   string  `json:"name"`    // /dev/sda, /dev/sdb
-	SizeGB float64 `json:"size_gb"` // total capacity in GB
-	FreeGB float64 `json:"free_gb"` // remaining capacity in GB
-	Role   string  `json:"role"`    // "lvm", "unused", "system"
-	VGName string  `json:"vg_name"` // VG name if role is "lvm"
+	Name        string   `json:"name"`    // /dev/sda, /dev/sdb
+	SizeGB      float64  `json:"size_gb"` // total capacity in GB
+	FreeGB      float64  `json:"free_gb"` // remaining capacity in GB
+	FreeKind    string   `json:"free_kind"`
+	Role        string   `json:"role"`    // lvm, unused, data, reserved, system
+	VGName      string   `json:"vg_name"` // VG name if role is "lvm"
+	IsSystem    bool     `json:"is_system"`
+	IsReserved  bool     `json:"is_reserved"`
+	MountPoints []string `json:"mount_points"`
 }
 
 // NFSStatusInfo represents the state of NFS services and exported shares on a worker.
@@ -69,7 +80,7 @@ type InventoryInfo struct {
 // the whole probe; lsblk (util-linux, always present) runs last so the overall
 // exit code reflects it.
 const inventoryCmd = "echo '###VGS###'; vgs --units g --noheadings --nosuffix --separator , -o vg_name,vg_size,vg_free 2>/dev/null; " +
-	"echo '###LVS###'; lvs --units g --noheadings --nosuffix --separator , -o vg_name,lv_name,lv_size,lv_path 2>/dev/null; " +
+	"echo '###LVS###'; lvs --segments --units g --noheadings --nosuffix --separator , -o vg_name,lv_name,lv_size,lv_path,devices 2>/dev/null; " +
 	"echo '###PVS###'; pvs --units g --noheadings --nosuffix --separator , -o pv_name,pv_size,pv_free,vg_name 2>/dev/null; " +
 	"echo '###DF###'; df -B1 -P 2>/dev/null; " +
 	"echo '###NFS###'; (systemctl is-active nfs-server 2>/dev/null || systemctl is-active nfs-kernel-server 2>/dev/null || echo inactive); " +
@@ -90,6 +101,10 @@ type lsblkRow struct {
 // point + filesystem), and unused disks. Safe to call before lvm2 is installed:
 // the LVM sections will be empty and only lsblk (disks) is populated.
 func ListInventory(ctx context.Context, runner ssh.Runner, w db.WorkerNode) (*InventoryInfo, error) {
+	return ListInventoryWithReserved(ctx, runner, w, []string{"/data01"})
+}
+
+func ListInventoryWithReserved(ctx context.Context, runner ssh.Runner, w db.WorkerNode, reservedMounts []string) (*InventoryInfo, error) {
 	out, stderr, code, err := runner.Run(ctx, w, inventoryCmd)
 	if err != nil {
 		return nil, fmt.Errorf("inventory: %w (stderr: %s)", err, stderr)
@@ -97,7 +112,7 @@ func ListInventory(ctx context.Context, runner ssh.Runner, w db.WorkerNode) (*In
 	if code != 0 {
 		return nil, fmt.Errorf("inventory exited %d: %s", code, stderr)
 	}
-	return parseInventory(out), nil
+	return parseInventoryWithReserved(out, reservedMounts), nil
 }
 
 type pvDetail struct {
@@ -191,6 +206,10 @@ func ListNFSHosts(ctx context.Context, runner ssh.Runner, workers []db.WorkerNod
 // and computes physical disks and unused disks. Exported to tests via the package
 // so parseInventory can be unit-tested with fixture output.
 func parseInventory(out string) *InventoryInfo {
+	return parseInventoryWithReserved(out, []string{"/data01"})
+}
+
+func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryInfo {
 	inv := &InventoryInfo{
 		NFS:           NFSStatusInfo{Active: false, Exports: []string{}},
 		VGs:           []VGInfo{},
@@ -279,110 +298,257 @@ func parseInventory(out string) *InventoryInfo {
 		}
 	}
 
-	// Join LVs with lsblk lvm rows by device-mapper name for mount + fstype.
+	// lvs --segments may return one row per segment. Merge rows by VG/LV and
+	// keep the union of backing PV devices.
+	mergedLVs := make([]LVInfo, 0, len(inv.LVs))
+	lvIndex := map[string]int{}
+	for _, lv := range inv.LVs {
+		key := lv.VGName + "\x00" + lv.Name
+		if idx, ok := lvIndex[key]; ok {
+			mergedLVs[idx].PVs = appendUnique(mergedLVs[idx].PVs, lv.PVs...)
+			continue
+		}
+		lv.PVs = sortedUnique(lv.PVs)
+		lvIndex[key] = len(mergedLVs)
+		mergedLVs = append(mergedLVs, lv)
+	}
+	inv.LVs = mergedLVs
+
+	rowsByName := make(map[string]lsblkRow, len(lsblkRows))
+	childrenOf := map[string]bool{}
+	for _, row := range lsblkRows {
+		rowsByName[row.Name] = row
+		if row.Pkname != "" {
+			childrenOf[row.Pkname] = true
+		}
+	}
+
+	// Join LVs with lsblk lvm rows and map each LV's segment devices to the
+	// top-level physical disks. If devices are unavailable, fall back to all PVs
+	// in the same VG so the UI still reports a conservative relationship.
 	lvmByName := map[string]lsblkRow{}
-	for _, r := range lsblkRows {
-		if r.Type == "lvm" {
-			lvmByName[r.Name] = r
+	for _, row := range lsblkRows {
+		if row.Type == "lvm" {
+			lvmByName[row.Name] = row
 		}
 	}
 	for i := range inv.LVs {
 		lv := &inv.LVs[i]
-		if r, ok := lvmByName[dmName(lv.VGName, lv.Name)]; ok {
-			lv.MountPoint = r.Mountpoint
-			lv.FSType = r.Fstype
+		if row, ok := lvmByName[dmName(lv.VGName, lv.Name)]; ok {
+			lv.MountPoint = row.Mountpoint
+			lv.FSType = row.Fstype
 		}
+		if len(lv.PVs) == 0 {
+			for pvName, detail := range pvMap {
+				if detail.VGName == lv.VGName {
+					lv.PVs = append(lv.PVs, pvName)
+				}
+			}
+		}
+		for _, pvName := range lv.PVs {
+			if disk := physicalDiskFor(pvName, rowsByName); disk != "" {
+				lv.PhysicalDisks = append(lv.PhysicalDisks, disk)
+			}
+		}
+		lv.PVs = sortedUnique(lv.PVs)
+		lv.PhysicalDisks = sortedUnique(lv.PhysicalDisks)
 		if lv.MountPoint != "" {
-			if df, ok := dfMap[lv.MountPoint]; ok {
-				lv.UsedGB = bytesToGB(df.UsedBytes)
-				lv.FreeGB = bytesToGB(df.AvailBytes)
-				lv.UsePct = df.Capacity
+			if detail, ok := dfMap[lv.MountPoint]; ok {
+				lv.UsedGB = bytesToGB(detail.UsedBytes)
+				lv.FreeGB = bytesToGB(detail.AvailBytes)
+				lv.UsePct = detail.Capacity
+				lv.FreeKnown = true
 			}
 			if opt, ok := exportsMap[lv.MountPoint]; ok {
 				lv.IsNFSExport = true
 				lv.NFSExportOpt = opt
 			}
 		}
-		if lv.FreeGB == 0 && lv.UsedGB == 0 {
-			lv.FreeGB = lv.SizeGB
+	}
+
+	systemDisks := map[string]bool{}
+	reservedDisks := map[string]bool{}
+	diskMounts := map[string][]string{}
+	diskFilesystemFree := map[string]float64{}
+	markMount := func(device, mountPoint string) {
+		if mountPoint == "" {
+			return
+		}
+		disk := physicalDiskFor(device, rowsByName)
+		if disk == "" {
+			return
+		}
+		diskMounts[disk] = appendUnique(diskMounts[disk], mountPoint)
+		if mountPoint == "/" || mountPoint == "/boot" || mountPoint == "/boot/efi" {
+			systemDisks[disk] = true
+		}
+		if isReservedMountpoint(mountPoint, reservedMounts) {
+			reservedDisks[disk] = true
+		}
+		if detail, ok := dfMap[mountPoint]; ok {
+			diskFilesystemFree[disk] += bytesToGB(detail.AvailBytes)
+		}
+	}
+	for _, row := range lsblkRows {
+		markMount("/dev/"+row.Name, row.Mountpoint)
+	}
+	// LVM rows do not always expose PKNAME. Use the segment mapping to mark
+	// every physical disk behind mounted LVs.
+	for _, lv := range inv.LVs {
+		for _, disk := range lv.PhysicalDisks {
+			if lv.MountPoint == "" {
+				continue
+			}
+			diskMounts[disk] = appendUnique(diskMounts[disk], lv.MountPoint)
+			if lv.MountPoint == "/" || lv.MountPoint == "/boot" || lv.MountPoint == "/boot/efi" {
+				systemDisks[disk] = true
+			}
+			if isReservedMountpoint(lv.MountPoint, reservedMounts) {
+				reservedDisks[disk] = true
+			}
 		}
 	}
 
-	// Unused disks: TYPE=disk with no children (no lsblk row has PKNAME==disk),
-	// no filesystem, no mountpoint, and not already a PV.
-	childrenOf := map[string]bool{}
-	for _, r := range lsblkRows {
-		if r.Pkname != "" {
-			childrenOf[r.Pkname] = true
+	pvFreeByDisk := map[string]float64{}
+	vgNamesByDisk := map[string][]string{}
+	for pvName, detail := range pvMap {
+		if disk := physicalDiskFor(pvName, rowsByName); disk != "" {
+			pvFreeByDisk[disk] += detail.FreeGB
+			if detail.VGName != "" {
+				vgNamesByDisk[disk] = appendUnique(vgNamesByDisk[disk], detail.VGName)
+			}
 		}
 	}
+
+	// Safe initialization candidates may be whole disks or independent blank
+	// partitions. A candidate is rejected if its physical ancestor is a system
+	// or reserved disk, or if it has children, a filesystem, a mount, or PV use.
+	candidateBytesByDisk := map[string]int64{}
 	unusedMap := map[string]bool{}
-	for _, r := range lsblkRows {
-		if r.Type != "disk" {
+	for _, row := range lsblkRows {
+		if row.Type != "disk" && row.Type != "part" {
 			continue
 		}
-		if r.Fstype != "" || r.Mountpoint != "" {
+		device := "/dev/" + row.Name
+		physical := physicalDiskFor(device, rowsByName)
+		if physical == "" || systemDisks[physical] || reservedDisks[physical] {
 			continue
 		}
-		if childrenOf[r.Name] {
+		if row.Fstype != "" || row.Mountpoint != "" || childrenOf[row.Name] || pvSet[device] {
 			continue
 		}
-		if pvSet["/dev/"+r.Name] {
-			continue
-		}
-		dName := "/dev/" + r.Name
 		inv.UnusedDisks = append(inv.UnusedDisks, DiskInfo{
-			Name:   dName,
-			SizeGB: bytesToGB(r.SizeBytes),
+			Name: device, SizeGB: bytesToGB(row.SizeBytes), Type: row.Type, ParentDisk: physical,
 		})
-		unusedMap[dName] = true
+		unusedMap[device] = true
+		candidateBytesByDisk[physical] += row.SizeBytes
 	}
+	sort.Slice(inv.UnusedDisks, func(i, j int) bool { return inv.UnusedDisks[i].Name < inv.UnusedDisks[j].Name })
 
-	// Physical disks: all TYPE=disk block devices (excluding virtual loops/rams)
-	for _, r := range lsblkRows {
-		if r.Type != "disk" {
+	for _, row := range lsblkRows {
+		if row.Type != "disk" || isVirtualDiskName(row.Name) {
 			continue
 		}
-		if strings.HasPrefix(r.Name, "loop") || strings.HasPrefix(r.Name, "ram") || strings.HasPrefix(r.Name, "zram") || strings.HasPrefix(r.Name, "sr") {
-			continue
-		}
-		devName := "/dev/" + r.Name
-		sizeGB := bytesToGB(r.SizeBytes)
+		device := "/dev/" + row.Name
 		disk := PhysicalDiskInfo{
-			Name:   devName,
-			SizeGB: sizeGB,
+			Name: device, SizeGB: bytesToGB(row.SizeBytes), IsSystem: systemDisks[device],
+			IsReserved: reservedDisks[device], MountPoints: sortedUnique(diskMounts[device]),
 		}
-		if pv, ok := pvMap[devName]; ok {
-			disk.Role = "lvm"
-			disk.VGName = pv.VGName
-			disk.FreeGB = pv.FreeGB
-			if disk.FreeGB == 0 && pv.VGName != "" {
-				for _, v := range inv.VGs {
-					if v.Name == pv.VGName {
-						disk.FreeGB = v.FreeGB
-						break
-					}
-				}
-			}
-		} else if unusedMap[devName] {
-			disk.Role = "unused"
-			disk.FreeGB = sizeGB
-		} else {
+		switch {
+		case disk.IsReserved:
+			disk.Role = "reserved"
+		case disk.IsSystem:
 			disk.Role = "system"
-			var partBytes int64
-			for _, p := range lsblkRows {
-				if p.Pkname == r.Name {
-					partBytes += p.SizeBytes
-				}
-			}
-			if r.SizeBytes > partBytes {
-				disk.FreeGB = bytesToGB(r.SizeBytes - partBytes)
+		case len(vgNamesByDisk[device]) > 0:
+			disk.Role = "lvm"
+		case unusedMap[device]:
+			disk.Role = "unused"
+		default:
+			disk.Role = "data"
+		}
+		disk.VGName = strings.Join(sortedUnique(vgNamesByDisk[device]), ",")
+		if len(vgNamesByDisk[device]) > 0 {
+			disk.FreeGB = pvFreeByDisk[device]
+			disk.FreeKind = "pv_allocatable"
+		} else {
+			disk.FreeGB = diskFilesystemFree[device] + bytesToGB(candidateBytesByDisk[device])
+			if candidateBytesByDisk[device] > 0 && diskFilesystemFree[device] > 0 {
+				disk.FreeKind = "filesystem_and_candidate"
+			} else if candidateBytesByDisk[device] > 0 {
+				disk.FreeKind = "candidate"
+			} else if len(disk.MountPoints) > 0 {
+				disk.FreeKind = "filesystem_available"
 			}
 		}
 		inv.PhysicalDisks = append(inv.PhysicalDisks, disk)
 	}
-
+	sort.Slice(inv.PhysicalDisks, func(i, j int) bool { return inv.PhysicalDisks[i].Name < inv.PhysicalDisks[j].Name })
 	return inv
+}
+
+func appendUnique(values []string, additions ...string) []string {
+	seen := make(map[string]struct{}, len(values)+len(additions))
+	for _, value := range values {
+		seen[value] = struct{}{}
+	}
+	for _, value := range additions {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values
+}
+
+func sortedUnique(values []string) []string {
+	values = appendUnique(nil, values...)
+	sort.Strings(values)
+	return values
+}
+
+func physicalDiskFor(device string, rows map[string]lsblkRow) string {
+	name := strings.TrimPrefix(strings.TrimSpace(device), "/dev/")
+	seen := map[string]bool{}
+	for name != "" && !seen[name] {
+		seen[name] = true
+		row, ok := rows[name]
+		if !ok {
+			return ""
+		}
+		if row.Type == "disk" {
+			return "/dev/" + row.Name
+		}
+		name = strings.TrimPrefix(row.Pkname, "/dev/")
+	}
+	return ""
+}
+
+func isReservedMountpoint(mountPoint string, reservedRoots []string) bool {
+	for _, reservedRoot := range reservedRoots {
+		if reservedRoot != "" && isMountWithin(mountPoint, reservedRoot) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMountWithin(mountPoint, reservedRoot string) bool {
+	mountPoint = path.Clean(mountPoint)
+	reservedRoot = path.Clean(reservedRoot)
+	return mountPoint == reservedRoot || strings.HasPrefix(mountPoint, reservedRoot+"/")
+}
+
+func isVirtualDiskName(name string) bool {
+	for _, prefix := range []string{"loop", "ram", "zram", "sr"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseVGLine parses a vgs CSV row "vg_name,vg_size,vg_free" (gigabyte units,
@@ -399,7 +565,8 @@ func parseVGLine(line string) (VGInfo, bool) {
 	return VGInfo{Name: name, VSize: vsize, VFree: vfree, FreeGB: freeGB}, true
 }
 
-// parseLVLine parses an lvs CSV row "vg_name,lv_name,lv_size,lv_path".
+// parseLVLine parses an lvs CSV row
+// "vg_name,lv_name,lv_size,lv_path,devices...".
 func parseLVLine(line string) (LVInfo, bool) {
 	parts := strings.Split(line, ",")
 	if len(parts) < 4 {
@@ -408,9 +575,19 @@ func parseLVLine(line string) (LVInfo, bool) {
 	vg := strings.TrimSpace(parts[0])
 	name := strings.TrimSpace(parts[1])
 	sizeStr := strings.TrimSpace(parts[2])
-	path := strings.TrimSpace(parts[3])
+	lvPath := strings.TrimSpace(parts[3])
 	sizeGB, _ := strconv.ParseFloat(strings.TrimSuffix(sizeStr, "g"), 64)
-	return LVInfo{VGName: vg, Name: name, SizeGB: sizeGB, Path: path}, true
+	pvs := make([]string, 0)
+	for _, rawDevice := range parts[4:] {
+		device := strings.TrimSpace(rawDevice)
+		if idx := strings.IndexByte(device, '('); idx >= 0 {
+			device = device[:idx]
+		}
+		if strings.HasPrefix(device, "/dev/") {
+			pvs = append(pvs, device)
+		}
+	}
+	return LVInfo{VGName: vg, Name: name, SizeGB: sizeGB, Path: lvPath, PVs: sortedUnique(pvs)}, true
 }
 
 // lsblkPairRe matches key="value" pairs in lsblk -P output. Values may contain

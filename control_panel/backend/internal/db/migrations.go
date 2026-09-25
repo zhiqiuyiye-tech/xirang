@@ -73,12 +73,11 @@ type migration struct {
 }
 
 func runMigrations(db *sql.DB) error {
-	_, err := db.Exec(`
+	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version     INTEGER PRIMARY KEY,
   applied_at  TIMESTAMP NOT NULL
-);`)
-	if err != nil {
+);`); err != nil {
 		return fmt.Errorf("init schema_migrations: %w", err)
 	}
 
@@ -86,55 +85,82 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		{
 			version: 1,
 			apply: func(tx *sql.Tx) error {
-				if _, err := tx.Exec(migration0001); err != nil {
-					return err
-				}
-				return nil
+				_, err := tx.Exec(migration0001)
+				return err
 			},
 		},
 		{
 			version: 2,
 			apply: func(tx *sql.Tx) error {
-				rows, err := tx.Query("PRAGMA table_info(admin)")
+				has, err := tableHasColumn(tx, "admin", "auth_version")
 				if err != nil {
 					return err
 				}
-				defer rows.Close()
-
-				hasCol := false
-				for rows.Next() {
-					var cid int
-					var name, ctype string
-					var notnull, pk int
-					var dfltValue sql.NullString
-					if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+				if !has {
+					_, err = tx.Exec("ALTER TABLE admin ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1")
+				}
+				return err
+			},
+		},
+		{
+			version: 3,
+			apply: func(tx *sql.Tx) error {
+				for _, col := range []struct {
+					name string
+					ddl  string
+				}{
+					{"last_checked_at", "ALTER TABLE worker_nodes ADD COLUMN last_checked_at TIMESTAMP"},
+					{"status_error", "ALTER TABLE worker_nodes ADD COLUMN status_error TEXT"},
+					{"health_failures", "ALTER TABLE worker_nodes ADD COLUMN health_failures INTEGER NOT NULL DEFAULT 0"},
+				} {
+					has, err := tableHasColumn(tx, "worker_nodes", col.name)
+					if err != nil {
 						return err
 					}
-					if name == "auth_version" {
-						hasCol = true
-						break
+					if !has {
+						if _, err := tx.Exec(col.ddl); err != nil {
+							return err
+						}
 					}
 				}
-				if !hasCol {
-					if _, err := tx.Exec("ALTER TABLE admin ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 1;"); err != nil {
-						return err
-					}
-				}
-				return nil
+				_, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS storage_inventory_snapshots (
+  worker_id         INTEGER PRIMARY KEY REFERENCES worker_nodes(id) ON DELETE CASCADE,
+  schema_version    INTEGER NOT NULL DEFAULT 1,
+  payload_json      TEXT NOT NULL DEFAULT '',
+  collected_at      TIMESTAMP,
+  last_attempted_at TIMESTAMP NOT NULL,
+  last_error        TEXT,
+  updated_at        TIMESTAMP NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notebook_metadata (
+  stable_key    TEXT PRIMARY KEY,
+  key_kind      TEXT NOT NULL,
+  namespace     TEXT NOT NULL,
+  workspace_id  TEXT NOT NULL DEFAULT '',
+  project_id    TEXT NOT NULL DEFAULT '',
+  last_pod_uid  TEXT NOT NULL,
+  owner_name    TEXT NOT NULL DEFAULT '',
+  note          TEXT NOT NULL DEFAULT '',
+  updated_by    TEXT NOT NULL,
+  created_at    TIMESTAMP NOT NULL,
+  updated_at    TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notebook_metadata_namespace ON notebook_metadata(namespace);
+`)
+				return err
 			},
 		},
 	}
 
 	for _, m := range migrations {
 		var exists int
-		err := db.QueryRow("SELECT COUNT(1) FROM schema_migrations WHERE version=?", m.version).Scan(&exists)
-		if err != nil {
+		if err := db.QueryRow("SELECT COUNT(1) FROM schema_migrations WHERE version=?", m.version).Scan(&exists); err != nil {
 			return fmt.Errorf("check migration %d: %w", m.version, err)
 		}
 		if exists > 0 {
 			continue
 		}
-
 		tx, err := db.Begin()
 		if err != nil {
 			return fmt.Errorf("begin migration %d: %w", m.version, err)
@@ -151,6 +177,26 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return fmt.Errorf("commit migration %d: %w", m.version, err)
 		}
 	}
-
 	return nil
+}
+
+func tableHasColumn(tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

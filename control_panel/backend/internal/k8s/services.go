@@ -22,6 +22,7 @@ type PortSpec struct {
 
 // CreateServiceReq is the input to CreateService.
 type CreateServiceReq struct {
+	Name      string
 	Namespace string
 	PodName   string
 	PodUID    string
@@ -48,9 +49,15 @@ func CreateService(ctx context.Context, client kubernetes.Interface, req CreateS
 			Protocol:   p.Protocol,
 		})
 	}
+	svcName := req.Name
+	generateName := ""
+	if svcName == "" {
+		generateName = "cp-svc-"
+	}
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "cp-svc-",
+			Name:         svcName,
+			GenerateName: generateName,
 			Namespace:    req.Namespace,
 			Labels: map[string]string{
 				"managed-by": "control-panel",
@@ -82,11 +89,46 @@ func DeleteService(ctx context.Context, client kubernetes.Interface, namespace, 
 	return client.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
+// UpdateServiceReq describes the desired ports and concurrency token for updating a Service.
+type UpdateServiceReq struct {
+	Namespace       string
+	Name            string
+	ResourceVersion string
+	Ports           []PortSpec
+}
+
+// UpdateServicePorts replaces the port spec of a control-panel managed Service in-place,
+// maintaining optimistic concurrency control via ResourceVersion.
+func UpdateServicePorts(ctx context.Context, client kubernetes.Interface, req UpdateServiceReq) (*corev1.Service, error) {
+	svc, err := client.CoreV1().Services(req.Namespace).Get(ctx, req.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if svc.Labels["managed-by"] != "control-panel" {
+		return nil, fmt.Errorf("cannot edit externally managed service %s/%s", req.Namespace, req.Name)
+	}
+	if req.ResourceVersion != "" && svc.ResourceVersion != req.ResourceVersion {
+		return nil, fmt.Errorf("conflict: service %s/%s was modified, please refresh", req.Namespace, req.Name)
+	}
+	ports := make([]corev1.ServicePort, 0, len(req.Ports))
+	for _, p := range req.Ports {
+		ports = append(ports, corev1.ServicePort{
+			Name:       fmt.Sprintf("port-%d", p.Port),
+			Port:       p.Port,
+			TargetPort: intOrString(p.TargetPort),
+			NodePort:   p.NodePort,
+			Protocol:   p.Protocol,
+		})
+	}
+	svc.Spec.Ports = ports
+	return client.CoreV1().Services(req.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
+}
+
 // ListServices returns the Services in the namespace that are managed by the
 // control panel (filtered by managed-by=control-panel).
 func ListServices(ctx context.Context, client kubernetes.Interface, namespace string) ([]corev1.Service, error) {
 	list, err := client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector:  "managed-by=control-panel",
+		LabelSelector:   "managed-by=control-panel",
 		ResourceVersion: "0",
 	})
 	if err != nil {
@@ -103,13 +145,14 @@ func ListServices(ctx context.Context, client kubernetes.Interface, namespace st
 // Services created by other systems are included (read-only) when they target
 // the same pod.
 type ServiceInfo struct {
-	Name      string            `json:"name"`
-	Namespace string            `json:"namespace"`
-	Type      string            `json:"type"` // ClusterIP | NodePort | LoadBalancer
-	Selector  map[string]string `json:"selector"`
-	Managed   bool              `json:"managed"`
-	Ports     []PortRow         `json:"ports"`
-	Pods      []PodRef          `json:"pods"` // notebook pods this Service routes to (selector match); empty if none
+	Name            string            `json:"name"`
+	Namespace       string            `json:"namespace"`
+	Type            string            `json:"type"` // ClusterIP | NodePort | LoadBalancer
+	Selector        map[string]string `json:"selector"`
+	Managed         bool              `json:"managed"`
+	Ports           []PortRow         `json:"ports"`
+	Pods            []PodRef          `json:"pods"` // notebook pods this Service routes to (selector match); empty if none
+	ResourceVersion string            `json:"resource_version"`
 }
 
 // PodRef is a minimal reference to a notebook pod a Service routes to.
@@ -223,12 +266,13 @@ func toServiceInfo(s corev1.Service) ServiceInfo {
 		})
 	}
 	return ServiceInfo{
-		Name:      s.Name,
-		Namespace: s.Namespace,
-		Type:      string(s.Spec.Type),
-		Selector:  s.Spec.Selector,
-		Managed:   s.Labels["managed-by"] == "control-panel",
-		Ports:     ports,
+		Name:            s.Name,
+		Namespace:       s.Namespace,
+		Type:            string(s.Spec.Type),
+		Selector:        s.Spec.Selector,
+		Managed:         s.Labels["managed-by"] == "control-panel",
+		Ports:           ports,
+		ResourceVersion: s.ResourceVersion,
 	}
 }
 
@@ -236,4 +280,4 @@ func toServiceInfo(s corev1.Service) ServiceInfo {
 
 func intOrString(port int32) intstr.IntOrString { return intstr.FromInt(int(port)) }
 func boolPtr(b bool) *bool                      { return &b }
-func typesUID(s string) types.UID              { return types.UID(s) }
+func typesUID(s string) types.UID               { return types.UID(s) }

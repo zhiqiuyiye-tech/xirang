@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 
-	"xirang/control_panel/internal/db"
-	"xirang/control_panel/internal/tasks"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/tasks"
 )
 
 // errNoK8sClient is the failure recorded when a k8s task runs while the panel
@@ -19,15 +19,83 @@ import (
 // panic into a clean failed task.
 var errNoK8sClient = errors.New("k8s client unavailable (non-cluster mode)")
 
-// RegisterK8sHandlers registers the four K8s task handlers (k8s_create_svc,
-// k8s_delete_svc, k8s_create_np, k8s_delete_np) on the engine. Each handler
-// parses task.ParamsJSON, invokes the corresponding k8s operation, and records
-// a step via the reporter before succeeding or failing.
+// RegisterK8sHandlers registers the five K8s task handlers (k8s_create_svc,
+// k8s_update_svc, k8s_delete_svc, k8s_create_np, k8s_delete_np) on the engine.
+// Each handler parses task.ParamsJSON, invokes the corresponding k8s operation,
+// and records a step via the reporter before succeeding or failing.
 func RegisterK8sHandlers(eng *tasks.Engine, client kubernetes.Interface) {
 	eng.Register("k8s_create_svc", &createSvcHandler{client: client})
+	eng.Register("k8s_update_svc", &updateSvcHandler{client: client})
 	eng.Register("k8s_delete_svc", &deleteSvcHandler{client: client})
 	eng.Register("k8s_create_np", &createNPHandler{client: client})
 	eng.Register("k8s_delete_np", &deleteNPHandler{client: client})
+}
+
+func parsePortSpecs(mappings, ports []map[string]any) ([]PortSpec, error) {
+	if len(mappings) > 0 {
+		seenPodPorts := make(map[int32]bool)
+		seenNodePorts := make(map[int32]bool)
+		specs := make([]PortSpec, 0, len(mappings))
+		for _, m := range mappings {
+			podPort, err := numField(m, "pod_port")
+			if err != nil || podPort == 0 {
+				podPort, err = numField(m, "target_port")
+			}
+			if err != nil || podPort < 1 || podPort > 65535 {
+				return nil, fmt.Errorf("pod_port must be between 1 and 65535")
+			}
+			nodePort, _ := numField(m, "node_port")
+			if nodePort != 0 && (nodePort < 30000 || nodePort > 32767) {
+				return nil, fmt.Errorf("node_port must be between 30000 and 32767 (or 0 for automatic)")
+			}
+			p32 := int32(podPort)
+			n32 := int32(nodePort)
+			if seenPodPorts[p32] {
+				return nil, fmt.Errorf("duplicate pod_port %d", p32)
+			}
+			seenPodPorts[p32] = true
+			if n32 > 0 {
+				if seenNodePorts[n32] {
+					return nil, fmt.Errorf("duplicate node_port %d", n32)
+				}
+				seenNodePorts[n32] = true
+			}
+			specs = append(specs, PortSpec{
+				Port:       p32,
+				TargetPort: p32,
+				NodePort:   n32,
+				Protocol:   corev1.ProtocolTCP,
+			})
+		}
+		return specs, nil
+	}
+
+	specs := make([]PortSpec, 0, len(ports))
+	for _, pp := range ports {
+		port, err := numField(pp, "port")
+		if err != nil {
+			return nil, err
+		}
+		targetPort, err := numField(pp, "target_port")
+		if err != nil {
+			return nil, err
+		}
+		nodePort, err := numField(pp, "node_port")
+		if err != nil {
+			return nil, err
+		}
+		protocol, err := strField(pp, "protocol")
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, PortSpec{
+			Port:       int32(port),
+			TargetPort: int32(targetPort),
+			NodePort:   int32(nodePort),
+			Protocol:   corev1.Protocol(protocol),
+		})
+	}
+	return specs, nil
 }
 
 // --- createSvcHandler ---
@@ -40,45 +108,26 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return errNoK8sClient
 	}
 	var p struct {
-		Namespace string                       `json:"namespace"`
-		PodName   string                       `json:"pod_name"`
-		PodUID    string                       `json:"pod_uid"`
-		Selector  map[string]string            `json:"selector"`
-		Type      string                       `json:"type"`
-		Ports     []map[string]any             `json:"ports"`
+		Name      string            `json:"name"`
+		Namespace string            `json:"namespace"`
+		PodName   string            `json:"pod_name"`
+		PodUID    string            `json:"pod_uid"`
+		Selector  map[string]string `json:"selector"`
+		Type      string            `json:"type"`
+		Ports     []map[string]any  `json:"ports"`
+		Mappings  []map[string]any  `json:"mappings"`
 	}
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
 		r.Fail(fmt.Sprintf("k8s_create_svc: parse params: %v", err))
 		return err
 	}
-	ports := make([]PortSpec, 0, len(p.Ports))
-	for _, pp := range p.Ports {
-		port, err := numField(pp, "port")
-		if err != nil {
-			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
-			return err
-		}
-		targetPort, err := numField(pp, "target_port")
-		if err != nil {
-			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
-			return err
-		}
-		nodePort, err := numField(pp, "node_port")
-		if err != nil {
-			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
-			return err
-		}
-		protocol, err := strField(pp, "protocol")
-		if err != nil {
-			r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
-			return err
-		}
-		ports = append(ports, PortSpec{
-			Port:       int32(port),
-			TargetPort: int32(targetPort),
-			NodePort:   int32(nodePort),
-			Protocol:   corev1.Protocol(protocol),
-		})
+	if p.Type == "" {
+		p.Type = "NodePort"
+	}
+	ports, err := parsePortSpecs(p.Mappings, p.Ports)
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_create_svc: %v", err))
+		return err
 	}
 
 	st, err := r.Step("create_service")
@@ -87,7 +136,7 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return err
 	}
 	svc, err := CreateService(ctx, h.client, CreateServiceReq{
-		Namespace: p.Namespace, PodName: p.PodName, PodUID: p.PodUID,
+		Name: p.Name, Namespace: p.Namespace, PodName: p.PodName, PodUID: p.PodUID,
 		Selector: p.Selector, Type: p.Type, Ports: ports,
 	})
 	if err != nil {
@@ -130,6 +179,108 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return err
 	}
 	st2.Done("succeeded", np.Name, "", "")
+	r.Succeed()
+	return nil
+}
+
+// --- updateSvcHandler ---
+
+type updateSvcHandler struct{ client kubernetes.Interface }
+
+func (h *updateSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
+	if h.client == nil {
+		r.Fail(errNoK8sClient.Error())
+		return errNoK8sClient
+	}
+	var p struct {
+		Namespace       string           `json:"namespace"`
+		Name            string           `json:"name"`
+		ResourceVersion string           `json:"resource_version"`
+		Ports           []map[string]any `json:"ports"`
+		Mappings        []map[string]any `json:"mappings"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
+		r.Fail(fmt.Sprintf("k8s_update_svc: parse params: %v", err))
+		return err
+	}
+	if p.Namespace == "" || p.Name == "" {
+		r.Fail("k8s_update_svc: namespace and name required")
+		return errors.New("namespace and name required")
+	}
+
+	// Deleting the last mapping cleanly deletes the Service and its associated NetworkPolicy.
+	if len(p.Mappings) == 0 && len(p.Ports) == 0 {
+		st, err := r.Step("delete_empty_service")
+		if err != nil {
+			r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
+			return err
+		}
+		if err := DeleteService(ctx, h.client, p.Namespace, p.Name); err != nil {
+			st.Done("failed", "", err.Error(), err.Error())
+			r.Fail(fmt.Sprintf("k8s_update_svc: delete service: %v", err))
+			return err
+		}
+		st.Done("succeeded", p.Name, "", "")
+
+		stNP, _ := r.Step("delete_network_policy")
+		if err := DeleteNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name); err != nil {
+			if stNP != nil {
+				stNP.Done("failed", "", err.Error(), err.Error())
+			}
+		} else if stNP != nil {
+			stNP.Done("succeeded", p.Name, "", "")
+		}
+		r.Succeed()
+		return nil
+	}
+
+	ports, err := parsePortSpecs(p.Mappings, p.Ports)
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
+		return err
+	}
+
+	ingressPorts := make([]IngressPortSpec, 0, len(ports))
+	for _, pp := range ports {
+		tp := pp.TargetPort
+		if tp <= 0 {
+			tp = pp.Port
+		}
+		ingressPorts = append(ingressPorts, IngressPortSpec{
+			Protocol: string(pp.Protocol),
+			Port:     tp,
+		})
+	}
+
+	stNP, err := r.Step("update_network_policy")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
+		return err
+	}
+	if err := UpdateNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name, ingressPorts); err != nil {
+		stNP.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_update_svc: update network policy: %v", err))
+		return err
+	}
+	stNP.Done("succeeded", p.Name, "", "")
+
+	stSvc, err := r.Step("update_service")
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
+		return err
+	}
+	svc, err := UpdateServicePorts(ctx, h.client, UpdateServiceReq{
+		Namespace:       p.Namespace,
+		Name:            p.Name,
+		ResourceVersion: p.ResourceVersion,
+		Ports:           ports,
+	})
+	if err != nil {
+		stSvc.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("k8s_update_svc: update service: %v", err))
+		return err
+	}
+	stSvc.Done("succeeded", svc.Name, "", "")
 	r.Succeed()
 	return nil
 }
@@ -187,11 +338,11 @@ func (h *createNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return errNoK8sClient
 	}
 	var p struct {
-		Namespace    string                       `json:"namespace"`
-		PodName      string                       `json:"pod_name"`
-		PodUID       string                       `json:"pod_uid"`
-		PodSelector  map[string]string            `json:"pod_selector"`
-		IngressPorts []map[string]any             `json:"ingress_ports"`
+		Namespace    string            `json:"namespace"`
+		PodName      string            `json:"pod_name"`
+		PodUID       string            `json:"pod_uid"`
+		PodSelector  map[string]string `json:"pod_selector"`
+		IngressPorts []map[string]any  `json:"ingress_ports"`
 	}
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
 		r.Fail(fmt.Sprintf("k8s_create_np: parse params: %v", err))

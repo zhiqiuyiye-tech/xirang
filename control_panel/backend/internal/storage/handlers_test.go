@@ -181,6 +181,12 @@ func (s *scriptRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (stri
 			return r.stdout, r.stderr, r.exitCode, nil
 		}
 	}
+	if strings.Contains(cmd, "$(id -u)") {
+		return "root\n", "", 0, nil
+	}
+	if strings.Contains(cmd, "cp-storage-preflight") {
+		return "SAFE\n", "", 0, nil
+	}
 	return "", "", 0, nil
 }
 
@@ -252,9 +258,9 @@ func TestInstallDeps_InstallSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	// 6 commands: detect_pm, check_deps, install, verify, configure_nfs_v4, enable_nfs_service
-	if len(sr.calls) != 6 {
-		t.Fatalf("expected 6 calls, got %d: %v", len(sr.calls), sr.calls)
+	// 7 commands: privilege, detect_pm, check_deps, install, verify, configure_nfs_v4, enable_nfs_service
+	if len(sr.calls) != 7 {
+		t.Fatalf("expected 7 calls, got %d: %v", len(sr.calls), sr.calls)
 	}
 }
 
@@ -322,9 +328,9 @@ func TestCreateVGHandler_CreatesOneVGPerDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	// Each disk: detect_vg + pvcreate + vgcreate = 3 calls x 2 disks = 6.
-	if len(sr.calls) != 6 {
-		t.Fatalf("expected 6 calls, got %d: %v", len(sr.calls), sr.calls)
+	// Each disk: preflight + detect_vg + pvcreate + vgcreate = 4 calls x 2 disks = 8.
+	if len(sr.calls) != 8 {
+		t.Fatalf("expected 8 calls, got %d: %v", len(sr.calls), sr.calls)
 	}
 	// vgcreate uses a per-disk name, one disk each.
 	var creates []string
@@ -338,6 +344,27 @@ func TestCreateVGHandler_CreatesOneVGPerDisk(t *testing.T) {
 	}
 	if !contains(creates[0], "vg_data_sdb /dev/sdb") || !contains(creates[1], "vg_data_sdc /dev/sdc") {
 		t.Fatalf("per-disk vgcreate wrong: %v", creates)
+	}
+}
+
+func TestCreateVGHandler_StopsWhenPreflightRejectsReservedDisk(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("cp-storage-preflight", scriptResult{stderr: "device belongs to reserved mount /data01", exitCode: 1})
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, _ := eng.Submit(context.Background(), "storage_create_vg", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "disks": []string{"/dev/sdb"},
+	})
+	waitFor(t, store, id, "failed", 2*time.Second)
+	for _, call := range sr.calls {
+		if strings.Contains(call, "pvcreate") || strings.Contains(call, "vgcreate") {
+			t.Fatalf("destructive command ran after failed preflight: %v", sr.calls)
+		}
 	}
 }
 
@@ -363,10 +390,10 @@ func TestCreateVGHandler_SkipsExistingVG(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	// sdb: detect only (exists -> skip). sdc: detect + pvcreate + vgcreate.
-	// Total = 1 + 3 = 4.
-	if len(sr.calls) != 4 {
-		t.Fatalf("expected 4 calls (skip existing), got %d: %v", len(sr.calls), sr.calls)
+	// Two preflights; sdb: detect only (exists -> skip); sdc: detect + pvcreate + vgcreate.
+	// Total = 2 + 1 + 3 = 6.
+	if len(sr.calls) != 6 {
+		t.Fatalf("expected 6 calls (preflight + skip existing), got %d: %v", len(sr.calls), sr.calls)
 	}
 	// No pvcreate/vgcreate touching sdb.
 	for _, c := range sr.calls {

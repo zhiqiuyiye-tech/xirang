@@ -7,7 +7,7 @@ func TestParsePM(t *testing.T) {
 		{"yum\n", "yum"},
 		{"dnf\n", "dnf"},
 		{"apt\n", "apt"},
-		{"yum\ndnf\napt\n", "yum"},  // yum 优先
+		{"yum\ndnf\napt\n", "dnf"}, // dnf 优先
 		{"dnf\napt\n", "dnf"},      // dnf 次之
 		{"", ""},
 		{"\n\n", ""},
@@ -79,6 +79,38 @@ func TestCheckDepsCmd(t *testing.T) {
 	}
 	if !contains(CheckDepsCmd(), "lvcreate") || !contains(CheckDepsCmd(), "exportfs") {
 		t.Fatal("missing probes")
+	}
+}
+
+func TestDetectPMOutputUsesSuccessfulConditionalChain(t *testing.T) {
+	cmd := DetectPMOutput()
+	if !contains(cmd, "if command -v dnf") || !contains(cmd, "elif command -v yum") || !contains(cmd, "elif command -v apt-get") {
+		t.Fatalf("package manager detection is not a single conditional chain: %s", cmd)
+	}
+	if !contains(cmd, "exit 0") {
+		t.Fatalf("successful detection must explicitly exit zero: %s", cmd)
+	}
+}
+
+func TestPrivilegeDetectionAndWrapping(t *testing.T) {
+	if !contains(DetectPrivilegeCmd(), "sudo -n true") || !contains(DetectPrivilegeCmd(), "id -u") {
+		t.Fatalf("privilege probe missing checks: %s", DetectPrivilegeCmd())
+	}
+	for input, want := range map[string]string{"root\n": "root", "sudo\n": "sudo"} {
+		got, err := ParsePrivilege(input)
+		if err != nil || got != want {
+			t.Fatalf("ParsePrivilege(%q)=%q,%v want %q", input, got, err, want)
+		}
+	}
+	if _, err := ParsePrivilege("none\n"); err == nil {
+		t.Fatal("expected unsupported privilege error")
+	}
+	if got := PrivilegedCmd("root", "dnf install -y lvm2"); got != "dnf install -y lvm2" {
+		t.Fatalf("root wrapper=%q", got)
+	}
+	got := PrivilegedCmd("sudo", "touch /etc/nfs.conf && echo 'x'")
+	if !contains(got, "sudo -n sh -c") || !contains(got, "'\"'\"'") {
+		t.Fatalf("sudo wrapper does not safely quote command: %s", got)
 	}
 }
 

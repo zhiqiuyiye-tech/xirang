@@ -80,15 +80,15 @@ func TestParseInventory_LVMNotInstalled(t *testing.T) {
 	}
 }
 
-func TestParseInventory_DiskWithPartitionsExcluded(t *testing.T) {
-	// sdb has an unused partition sdb1 (no mount, no fstype). We must NOT offer
-	// sdb as unused - wiping it would destroy the partition table.
+func TestParseInventory_BlankPartitionIsCandidate(t *testing.T) {
+	// A blank partition is a safe candidate, while its parent whole disk is not
+	// offered separately because it has children.
 	const out = "###VGS###\n###LVS###\n###PVS###\n###LSBLK###\n" +
 		`NAME="sdb" TYPE="disk" SIZE="10737418240" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
 		`NAME="sdb1" TYPE="part" SIZE="10737418240" MOUNTPOINT="" FSTYPE="" PKNAME="sdb"`
 	inv := parseInventory(out)
-	if len(inv.UnusedDisks) != 0 {
-		t.Fatalf("disk with partitions must not be unused: %+v", inv.UnusedDisks)
+	if len(inv.UnusedDisks) != 1 || inv.UnusedDisks[0].Name != "/dev/sdb1" || inv.UnusedDisks[0].Type != "part" {
+		t.Fatalf("blank partition should be the only candidate: %+v", inv.UnusedDisks)
 	}
 }
 
@@ -198,6 +198,56 @@ func TestParseInventory_NFS_DF_PhysicalDisks(t *testing.T) {
 	}
 }
 
+func TestParseInventory_ClassifiesDataReservedAndPartitionCandidates(t *testing.T) {
+	const out = "###VGS###\n###LVS###\n###PVS###\n###DF###\n" +
+		"Filesystem 1024-blocks Used Available Capacity Mounted on\n" +
+		"/dev/sdb1 100000000000 10000000000 90000000000 10% /data02\n" +
+		"/dev/sdc1 100000000000 20000000000 80000000000 20% /data01\n" +
+		"###NFS###\ninactive\n###EXPORTS###\n###LSBLK###\n" +
+		`NAME="sda" TYPE="disk" SIZE="100000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sda1" TYPE="part" SIZE="100000000000" MOUNTPOINT="/" FSTYPE="xfs" PKNAME="sda"` + "\n" +
+		`NAME="sdb" TYPE="disk" SIZE="200000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sdb1" TYPE="part" SIZE="100000000000" MOUNTPOINT="/data02" FSTYPE="xfs" PKNAME="sdb"` + "\n" +
+		`NAME="sdb2" TYPE="part" SIZE="100000000000" MOUNTPOINT="" FSTYPE="" PKNAME="sdb"` + "\n" +
+		`NAME="sdc" TYPE="disk" SIZE="100000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sdc1" TYPE="part" SIZE="100000000000" MOUNTPOINT="/data01" FSTYPE="xfs" PKNAME="sdc"`
+
+	inv := parseInventory(out)
+	byName := map[string]PhysicalDiskInfo{}
+	for _, disk := range inv.PhysicalDisks {
+		byName[disk.Name] = disk
+	}
+	if byName["/dev/sda"].Role != "system" || !byName["/dev/sda"].IsSystem {
+		t.Fatalf("system disk wrong: %+v", byName["/dev/sda"])
+	}
+	if byName["/dev/sdb"].Role != "data" || byName["/dev/sdb"].FreeGB < 189 {
+		t.Fatalf("ordinary data disk wrong: %+v", byName["/dev/sdb"])
+	}
+	if byName["/dev/sdc"].Role != "reserved" || !byName["/dev/sdc"].IsReserved {
+		t.Fatalf("reserved disk wrong: %+v", byName["/dev/sdc"])
+	}
+	if len(inv.UnusedDisks) != 1 || inv.UnusedDisks[0].Name != "/dev/sdb2" || inv.UnusedDisks[0].Type != "part" || inv.UnusedDisks[0].ParentDisk != "/dev/sdb" {
+		t.Fatalf("partition candidates wrong: %+v", inv.UnusedDisks)
+	}
+}
+
+func TestParseInventory_MapsLVToPhysicalDisks(t *testing.T) {
+	const out = "###VGS###\nvg_cross,200.00g,100.00g\n" +
+		"###LVS###\nvg_cross,lv_a,100.00g,/dev/vg_cross/lv_a,/dev/sdb1(0),/dev/nvme1n1p1(0)\n" +
+		"###PVS###\n/dev/sdb1,100.00g,50.00g,vg_cross\n/dev/nvme1n1p1,100.00g,50.00g,vg_cross\n" +
+		"###DF###\n###NFS###\ninactive\n###EXPORTS###\n###LSBLK###\n" +
+		`NAME="sdb" TYPE="disk" SIZE="100000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="sdb1" TYPE="part" SIZE="100000000000" MOUNTPOINT="" FSTYPE="LVM2_member" PKNAME="sdb"` + "\n" +
+		`NAME="nvme1n1" TYPE="disk" SIZE="100000000000" MOUNTPOINT="" FSTYPE="" PKNAME=""` + "\n" +
+		`NAME="nvme1n1p1" TYPE="part" SIZE="100000000000" MOUNTPOINT="" FSTYPE="LVM2_member" PKNAME="nvme1n1"`
+	inv := parseInventory(out)
+	if len(inv.LVs) != 1 || len(inv.LVs[0].PhysicalDisks) != 2 {
+		t.Fatalf("LV physical mapping wrong: %+v", inv.LVs)
+	}
+	if inv.LVs[0].PhysicalDisks[0] != "/dev/nvme1n1" || inv.LVs[0].PhysicalDisks[1] != "/dev/sdb" {
+		t.Fatalf("LV physical disks should be stable sorted: %+v", inv.LVs[0].PhysicalDisks)
+	}
+}
 
 // TestListInventory_Run verifies the SSH round-trip: the runner's output is fed
 // to parseInventory unchanged.

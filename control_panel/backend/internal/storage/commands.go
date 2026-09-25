@@ -7,6 +7,7 @@ import (
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_/-]+$`)
+
 // diskRe limits disk paths to /dev/ + safe characters.
 var diskRe = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
 
@@ -35,8 +36,8 @@ func ValidateName(s string) error {
 
 // ValidateDisk rejects anything that is not a /dev/ path of safe characters.
 // Applied to disk paths interpolated into pvcreate/wipefs to prevent command
-// injection. Only whole-device paths (/dev/sdb, /dev/nvme0n1) pass; partitions
-// (/dev/sdb1) also pass the charset but the inventory only offers whole disks.
+// injection. Both whole-device and partition paths are accepted; destructive
+// handlers must run PreflightDeviceCmd immediately before use.
 func ValidateDisk(s string) error {
 	if s == "" {
 		return fmt.Errorf("empty")
@@ -48,6 +49,50 @@ func ValidateDisk(s string) error {
 		return fmt.Errorf("invalid disk path: %q", s)
 	}
 	return nil
+}
+
+func shellLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+// PreflightDeviceCmd returns a read-only safety check that must run immediately
+// before pvcreate. It rejects mounted devices, signatures/PVs, system or
+// reserved ancestors, whole disks with children, and ambiguous device types.
+func PreflightDeviceCmd(device string, reservedMounts []string) string {
+	patterns := []string{"/", "/boot", "/boot/efi"}
+	for _, mountPoint := range reservedMounts {
+		mountPoint = strings.TrimRight(mountPoint, "/")
+		if mountPoint != "" {
+			patterns = append(patterns, mountPoint, mountPoint+"/*")
+		}
+	}
+	quotedPatterns := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		if strings.HasSuffix(pattern, "/*") {
+			quotedPatterns = append(quotedPatterns, shellLiteral(strings.TrimSuffix(pattern, "/*"))+"/*")
+		} else {
+			quotedPatterns = append(quotedPatterns, shellLiteral(pattern))
+		}
+	}
+	d := shellLiteral(device)
+	return fmt.Sprintf(`# cp-storage-preflight
+device=%s
+test -b "$device" || { echo "device is not a block device: $device" >&2; exit 1; }
+dtype=$(lsblk -dn -o TYPE "$device" 2>/dev/null | head -n1)
+{ [ "$dtype" = disk ] || [ "$dtype" = part ]; } || { echo "unsupported device type: $dtype" >&2; exit 1; }
+root="$device"
+while parent=$(lsblk -dn -o PKNAME "$root" 2>/dev/null | head -n1) && [ -n "$parent" ]; do root="/dev/$parent"; done
+while IFS= read -r mp; do
+  [ -z "$mp" ] && continue
+  case "$mp" in %s) echo "device belongs to protected mount: $mp" >&2; exit 1;; esac
+done <<EOF
+$(lsblk -nr -o MOUNTPOINT "$root" 2>/dev/null)
+EOF
+[ -z "$(findmnt -rn -S "$device" 2>/dev/null)" ] || { echo "device is mounted" >&2; exit 1; }
+! wipefs -n "$device" 2>/dev/null | grep -q . || { echo "device has filesystem or partition signature" >&2; exit 1; }
+! pvs --noheadings "$device" >/dev/null 2>&1 || { echo "device is already an LVM PV" >&2; exit 1; }
+if [ "$dtype" = disk ] && [ "$(lsblk -nr -o NAME "$device" 2>/dev/null | wc -l)" -gt 1 ]; then echo "whole disk has child devices" >&2; exit 1; fi
+echo SAFE`, d, strings.Join(quotedPatterns, "|"))
 }
 
 // ValidateExportOpts validates the NFS export options string (the part after

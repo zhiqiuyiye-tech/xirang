@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/api"
 	"xirang/control_panel/internal/auth"
+	"xirang/control_panel/internal/collector"
 	"xirang/control_panel/internal/config"
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -76,7 +78,31 @@ func main() {
 	// Storage task handlers: sshm implements ssh.Runner. Registered after the
 	// engine is created so the engine knows the type names before any storage
 	// API endpoint submits a task.
-	storage.RegisterStorageHandlers(eng, sshm, store)
+	storage.RegisterStorageHandlers(eng, sshm, store, cfg.ReservedMountPoints...)
+
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+	inventoryCollector := collector.New(store, sshm, collector.Config{
+		HeartbeatInterval: cfg.WorkerHeartbeatInterval,
+		InventoryInterval: cfg.StorageRefreshInterval,
+		HeartbeatTimeout:  cfg.WorkerHeartbeatTimeout,
+		InventoryTimeout:  cfg.StorageProbeTimeout,
+		Concurrency:       cfg.CollectorConcurrency,
+		OfflineThreshold:  2,
+		ReservedMounts:    cfg.ReservedMountPoints,
+	})
+	inventoryCollector.Start(appCtx)
+	_, _ = inventoryCollector.EnqueueAllHeartbeats(appCtx)
+	_, _ = inventoryCollector.EnqueueAllInventory(appCtx)
+	eng.OnComplete(func(task db.Task) {
+		if task.Status != "succeeded" || task.TargetID <= 0 {
+			return
+		}
+		if strings.HasPrefix(task.Type, "storage_") || task.Type == "install_deps" {
+			inventoryCollector.EnqueueHeartbeat(task.TargetID)
+			inventoryCollector.EnqueueInventory(task.TargetID)
+		}
+	})
 
 	gin.SetMode(gin.ReleaseMode)
 	r := api.NewRouter(tk, ws, store, eng, k8sClient, sshm,
@@ -101,6 +127,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	appCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {

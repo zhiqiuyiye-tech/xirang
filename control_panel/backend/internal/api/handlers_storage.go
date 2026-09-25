@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/auth"
@@ -12,16 +15,20 @@ import (
 	"xirang/control_panel/internal/tasks"
 )
 
-// storageHandlers exposes the three storage API endpoints (provision, reclaim,
-// list) backed by the task engine. Provision and reclaim are asynchronous: they
-// submit a task (storage_provision_nfs / storage_reclaim_nfs) to the engine
-// and respond 202 + task_id. The actual SSH work runs in the registered task
-// handler (see storage.RegisterStorageHandlers, called from main.go). List is
-// synchronous and returns recent tasks whose target_kind is 'storage'.
+type storageCollector interface {
+	EnqueueInventory(workerID int64) bool
+	EnqueueAllInventory(ctx context.Context) (int, error)
+	IsInventoryRefreshing(workerID int64) bool
+}
+
+// storageHandlers exposes the storage API endpoints backed by the task engine,
+// SQLite snapshot storage, and background collector.
 type storageHandlers struct {
-	eng    *tasks.Engine
-	store  *db.Store
-	runner ssh.Runner
+	eng        *tasks.Engine
+	store      *db.Store
+	runner     ssh.Runner
+	collector  storageCollector
+	staleAfter time.Duration
 }
 
 // provision: POST /api/v1/storage/provision
@@ -103,32 +110,87 @@ func (h *storageHandlers) listVgs(c *gin.Context) {
 }
 
 // listInventory: GET /api/v1/storage/inventory?worker_id=X
-// Synchronous: SSHes to the worker once and returns its VGs, LVs (with mount
-// point + filesystem), and unused disks - everything the storage UI needs to
-// render the VG/LV management blocks and the create-VG-pool action in one call.
+// Returns the cached storage inventory snapshot and freshness metadata for the
+// worker. If no snapshot exists yet or it is stale, background collection is
+// scheduled without blocking the HTTP response.
 func (h *storageHandlers) listInventory(c *gin.Context) {
 	wid, err := strconv.ParseInt(c.Query("worker_id"), 10, 64)
 	if err != nil || wid <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "worker_id required"})
 		return
 	}
-	w, err := h.store.GetWorker(c, wid)
-	if err != nil {
+	if _, err := h.store.GetWorker(c, wid); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "worker not found"})
 		return
 	}
-	inv, err := storage.ListInventory(c, h.runner, *w)
+
+	refreshing := h.collector != nil && h.collector.IsInventoryRefreshing(wid)
+	snapshot, err := h.store.GetInventorySnapshot(c, wid)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if h.collector != nil && !refreshing {
+			h.collector.EnqueueInventory(wid)
+			refreshing = true
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"vgs":               []storage.VGInfo{},
+			"lvs":               []storage.LVInfo{},
+			"physical_disks":    []storage.PhysicalDiskInfo{},
+			"unused_disks":      []storage.DiskInfo{},
+			"nfs":               storage.NFSStatusInfo{Active: false, Exports: []string{}},
+			"data":              nil,
+			"collected_at":      nil,
+			"last_attempted_at": nil,
+			"stale":             true,
+			"refreshing":        refreshing,
+			"last_error":        nil,
+		})
 		return
 	}
-	c.JSON(http.StatusOK, inv)
+
+	stale := snapshot.CollectedAt == nil || (h.staleAfter > 0 && time.Since(*snapshot.CollectedAt) > h.staleAfter)
+	if stale && !refreshing && h.collector != nil {
+		h.collector.EnqueueInventory(wid)
+		refreshing = true
+	}
+
+	var inv storage.InventoryInfo
+	if snapshot.PayloadJSON != "" {
+		_ = json.Unmarshal([]byte(snapshot.PayloadJSON), &inv)
+	}
+	if inv.VGs == nil {
+		inv.VGs = []storage.VGInfo{}
+	}
+	if inv.LVs == nil {
+		inv.LVs = []storage.LVInfo{}
+	}
+	if inv.PhysicalDisks == nil {
+		inv.PhysicalDisks = []storage.PhysicalDiskInfo{}
+	}
+	if inv.UnusedDisks == nil {
+		inv.UnusedDisks = []storage.DiskInfo{}
+	}
+	if inv.NFS.Exports == nil {
+		inv.NFS.Exports = []string{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"vgs":               inv.VGs,
+		"lvs":               inv.LVs,
+		"physical_disks":    inv.PhysicalDisks,
+		"unused_disks":      inv.UnusedDisks,
+		"nfs":               inv.NFS,
+		"data":              inv,
+		"collected_at":      snapshot.CollectedAt,
+		"last_attempted_at": snapshot.LastAttemptedAt,
+		"stale":             stale,
+		"refreshing":        refreshing,
+		"last_error":        snapshot.LastError,
+	})
 }
 
 // listNFSHosts: GET /api/v1/storage/nfs-hosts?all=true|false
-// Returns status for hosts where NFS is enabled (or all hosts if all=true),
-// including physical disks count & remaining capacities, allocated virtual
-// disks (LVs), their mount points, used/free space, and NFS export details.
+// Returns the status of workers and their storage inventories from local
+// SQLite snapshots without performing synchronous SSH round trips.
 func (h *storageHandlers) listNFSHosts(c *gin.Context) {
 	workers, err := h.store.ListWorkers(c)
 	if err != nil {
@@ -136,15 +198,106 @@ func (h *storageHandlers) listNFSHosts(c *gin.Context) {
 		return
 	}
 	nfsOnly := c.Query("all") != "true"
-	hosts, err := storage.ListNFSHosts(c, h.runner, workers, nfsOnly)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	snapshots, _ := h.store.ListInventorySnapshots(c)
+	snapMap := make(map[int64]db.InventorySnapshot, len(snapshots))
+	for _, snap := range snapshots {
+		snapMap[snap.WorkerID] = snap
+	}
+
+	results := make([]map[string]any, 0, len(workers))
+	for _, w := range workers {
+		refreshing := h.collector != nil && h.collector.IsInventoryRefreshing(w.ID)
+		snap, hasSnap := snapMap[w.ID]
+		var inv storage.InventoryInfo
+		if hasSnap && snap.PayloadJSON != "" {
+			_ = json.Unmarshal([]byte(snap.PayloadJSON), &inv)
+		}
+		if inv.PhysicalDisks == nil {
+			inv.PhysicalDisks = []storage.PhysicalDiskInfo{}
+		}
+		if inv.LVs == nil {
+			inv.LVs = []storage.LVInfo{}
+		}
+		if inv.NFS.Exports == nil {
+			inv.NFS.Exports = []string{}
+		}
+
+		stale := !hasSnap || snap.CollectedAt == nil || (h.staleAfter > 0 && time.Since(*snap.CollectedAt) > h.staleAfter)
+		var lastAttempted *time.Time
+		if hasSnap {
+			lastAttempted = &snap.LastAttemptedAt
+		}
+		var errMsg string
+		if hasSnap && snap.LastError != nil {
+			errMsg = *snap.LastError
+		}
+
+		hasExportedLV := false
+		for _, lv := range inv.LVs {
+			if lv.IsNFSExport {
+				hasExportedLV = true
+				break
+			}
+		}
+
+		if nfsOnly && !inv.NFS.Active && len(inv.NFS.Exports) == 0 && !hasExportedLV {
+			continue
+		}
+
+		hostItem := map[string]any{
+			"worker_id":         w.ID,
+			"worker_name":       w.Name,
+			"host":              w.Host,
+			"port":              w.Port,
+			"status":            w.Status,
+			"nfs_active":        inv.NFS.Active,
+			"total_disks":       len(inv.PhysicalDisks),
+			"physical_disks":    inv.PhysicalDisks,
+			"virtual_disks":     inv.LVs,
+			"nfs_exports":       inv.NFS.Exports,
+			"collected_at":      snap.CollectedAt,
+			"last_attempted_at": lastAttempted,
+			"stale":             stale,
+			"refreshing":        refreshing,
+			"error_message":     errMsg,
+		}
+		results = append(results, hostItem)
+	}
+
+	c.JSON(http.StatusOK, results)
+}
+
+// refresh: POST /api/v1/storage/refresh
+// Body: {worker_id?: int64}. Schedules an immediate background inventory probe
+// for one worker or all workers and responds 202.
+func (h *storageHandlers) refresh(c *gin.Context) {
+	var req map[string]any
+	_ = c.ShouldBindJSON(&req)
+	var wid int64
+	if req != nil {
+		wid, _ = parseWorkerID(req["worker_id"])
+	}
+	if wid == 0 && c.Query("worker_id") != "" {
+		wid, _ = strconv.ParseInt(c.Query("worker_id"), 10, 64)
+	}
+
+	if wid > 0 {
+		if _, err := h.store.GetWorker(c, wid); err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "worker not found"})
+			return
+		}
+		if h.collector != nil {
+			h.collector.EnqueueInventory(wid)
+		}
+		c.JSON(http.StatusAccepted, gin.H{"refreshing": true, "worker_id": wid})
 		return
 	}
-	if hosts == nil {
-		hosts = []storage.NFSHostStatus{}
+
+	count := 0
+	if h.collector != nil {
+		count, _ = h.collector.EnqueueAllInventory(c)
 	}
-	c.JSON(http.StatusOK, hosts)
+	c.JSON(http.StatusAccepted, gin.H{"refreshing": true, "count": count})
 }
 
 // createVG: POST /api/v1/storage/vg

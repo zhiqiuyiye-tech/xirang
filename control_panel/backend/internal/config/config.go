@@ -30,6 +30,13 @@ type Config struct {
 	RateLimitLockoutDuration time.Duration
 	RateLimitWindow          time.Duration
 	RequireK8s               bool
+	WorkerHeartbeatInterval  time.Duration
+	WorkerHeartbeatTimeout   time.Duration
+	StorageRefreshInterval   time.Duration
+	StorageProbeTimeout      time.Duration
+	CollectorConcurrency     int
+	StorageStaleAfter        time.Duration
+	ReservedMountPoints      []string
 }
 
 func Load() (Config, error) {
@@ -107,6 +114,31 @@ func Load() (Config, error) {
 
 	c.RequireK8s = envBoolOr("REQUIRE_K8S", false)
 
+	if c.WorkerHeartbeatInterval, err = positiveDurationEnv("WORKER_HEARTBEAT_INTERVAL", time.Minute); err != nil {
+		return c, err
+	}
+	if c.WorkerHeartbeatTimeout, err = positiveDurationEnv("WORKER_HEARTBEAT_TIMEOUT", 5*time.Second); err != nil {
+		return c, err
+	}
+	if c.StorageRefreshInterval, err = positiveDurationEnv("STORAGE_REFRESH_INTERVAL", 5*time.Minute); err != nil {
+		return c, err
+	}
+	if c.StorageProbeTimeout, err = positiveDurationEnv("STORAGE_PROBE_TIMEOUT", 45*time.Second); err != nil {
+		return c, err
+	}
+	if c.StorageStaleAfter, err = positiveDurationEnv("STORAGE_STALE_AFTER", 10*time.Minute); err != nil {
+		return c, err
+	}
+	if c.CollectorConcurrency, err = positiveIntEnv("COLLECTOR_CONCURRENCY", 8); err != nil {
+		return c, err
+	}
+	c.ReservedMountPoints = envSliceOr("RESERVED_MOUNT_POINTS", []string{"/data01"})
+	for _, mountPoint := range c.ReservedMountPoints {
+		if !strings.HasPrefix(mountPoint, "/") {
+			return c, fmt.Errorf("RESERVED_MOUNT_POINTS entries must be absolute paths, got %q", mountPoint)
+		}
+	}
+
 	return c, nil
 }
 
@@ -142,6 +174,30 @@ func envBoolOr(k string, def bool) bool {
 		return v == "1" || v == "true" || v == "yes" || v == "on"
 	}
 	return def
+}
+
+func positiveDurationEnv(key string, def time.Duration) (time.Duration, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return def, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration, got %q", key, value)
+	}
+	return duration, nil
+}
+
+func positiveIntEnv(key string, def int) (int, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return def, nil
+	}
+	var number int
+	if _, err := fmt.Sscanf(value, "%d", &number); err != nil || number <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", key, value)
+	}
+	return number, nil
 }
 
 func envSliceOr(k string, def []string) []string {

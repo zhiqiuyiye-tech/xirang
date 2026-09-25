@@ -36,3 +36,20 @@ func TestListNotebookPods(t *testing.T) {
 		t.Fatalf("case-insensitive match failed: %+v", byName["NoteBook-2"])
 	}
 }
+
+func TestStableKeyForPod(t *testing.T) {
+	key, kind, ws, proj := StableKeyForPod("ns1", "uid-123", map[string]string{
+		"workspace_id": "ws-abc",
+		"project_id":   "proj-xyz",
+	})
+	if key != "v1:namespace:ns1:workspace:ws-abc:project:proj-xyz" || kind != "business_labels" || ws != "ws-abc" || proj != "proj-xyz" {
+		t.Fatalf("business labels stable key wrong: key=%s kind=%s ws=%s proj=%s", key, kind, ws, proj)
+	}
+
+	fallbackKey, fallbackKind, _, _ := StableKeyForPod("ns1", "uid-123", map[string]string{
+		"workspace_id": "ws-abc",
+	})
+	if fallbackKey != "v1:pod_uid:uid-123" || fallbackKind != "pod_uid" {
+		t.Fatalf("missing project_id fallback wrong: key=%s kind=%s", fallbackKey, fallbackKind)
+	}
+}

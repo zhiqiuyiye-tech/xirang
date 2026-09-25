@@ -11,18 +11,45 @@ type Admin struct {
 }
 
 type WorkerNode struct {
-	ID            int64      `json:"id"`
-	Name          string     `json:"name"`
-	Host          string     `json:"host"`
-	Port          int        `json:"port"`
-	Username      string     `json:"username"`
-	AuthMode      string     `json:"auth_mode"`
-	EncPassword   *string    `json:"-"`
-	EncPrivateKey *string    `json:"-"`
-	Status        string     `json:"status"`
-	LastSeenAt    *time.Time `json:"last_seen_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID             int64      `json:"id"`
+	Name           string     `json:"name"`
+	Host           string     `json:"host"`
+	Port           int        `json:"port"`
+	Username       string     `json:"username"`
+	AuthMode       string     `json:"auth_mode"`
+	EncPassword    *string    `json:"-"`
+	EncPrivateKey  *string    `json:"-"`
+	Status         string     `json:"status"`
+	LastSeenAt     *time.Time `json:"last_seen_at"`
+	LastCheckedAt  *time.Time `json:"last_checked_at"`
+	StatusError    *string    `json:"status_error,omitempty"`
+	HealthFailures int        `json:"health_failures"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+type InventorySnapshot struct {
+	WorkerID        int64      `json:"worker_id"`
+	SchemaVersion   int        `json:"schema_version"`
+	PayloadJSON     string     `json:"-"`
+	CollectedAt     *time.Time `json:"collected_at"`
+	LastAttemptedAt time.Time  `json:"last_attempted_at"`
+	LastError       *string    `json:"last_error,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+type NotebookMetadata struct {
+	StableKey   string    `json:"stable_key"`
+	KeyKind     string    `json:"key_kind"`
+	Namespace   string    `json:"namespace"`
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	ProjectID   string    `json:"project_id,omitempty"`
+	LastPodUID  string    `json:"last_pod_uid"`
+	OwnerName   string    `json:"owner_name"`
+	Note        string    `json:"note"`
+	UpdatedBy   string    `json:"updated_by"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Task struct {
@@ -52,11 +79,11 @@ type TaskStep struct {
 }
 
 type AuditLog struct {
-	ID         int64      `json:"id"`
-	Actor      string     `json:"actor"`
-	Action     string     `json:"action"`
-	Target     *string    `json:"target"`
-	ParamsJSON *string    `json:"-"`
-	Result     string     `json:"result"`
-	At         time.Time  `json:"at"`
+	ID         int64     `json:"id"`
+	Actor      string    `json:"actor"`
+	Action     string    `json:"action"`
+	Target     *string   `json:"target"`
+	ParamsJSON *string   `json:"-"`
+	Result     string    `json:"result"`
+	At         time.Time `json:"at"`
 }

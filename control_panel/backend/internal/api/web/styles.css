@@ -840,6 +840,24 @@ code, pre, .font-mono, .badge-mono {
     border-color: var(--slate-200);
 }
 
+.badge-danger {
+    background: #fef2f2;
+    color: #b91c1c;
+    border-color: #fecaca;
+}
+
+.badge-warning {
+    background: #fffbeb;
+    color: #b45309;
+    border-color: #fde68a;
+}
+
+.badge-primary {
+    background: #eff6ff;
+    color: #1d4ed8;
+    border-color: #bfdbfe;
+}
+
 /* ==========================================================================
    FORMS & INPUTS
    ========================================================================== */

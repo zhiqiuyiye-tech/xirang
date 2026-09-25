@@ -566,8 +566,8 @@
             '</div>' +
             '<div class="table-responsive">' +
             '<table class="data-table" id="pods-table"><thead><tr>' +
-            '<th>Pod 名称</th><th>命名空间</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th style="text-align:right;">操作</th>' +
-            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="7" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
+            '<th>Pod 名称</th><th>使用人 / 备注</th><th>命名空间</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th style="text-align:right;">操作</th>' +
+            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="8" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
             '</div></div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
@@ -583,24 +583,28 @@
     async function loadPods(content) {
         var tbody = document.getElementById('pods-tbody');
         var msgEl = document.getElementById('pods-msg');
-        tbody.innerHTML = '<tr><td colspan="7" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
         try {
             var results = await Promise.all([apiJSON('/k8s/pods'), apiJSON('/k8s/services')]);
             var pr = results[0], sr = results[1];
             if (!pr.resp.ok) { setMsg(msgEl, '错误: ' + (pr.data && pr.data.error), 'error'); tbody.innerHTML = ''; return; }
             k8sServices = (sr.resp.ok && Array.isArray(sr.data)) ? sr.data : [];
             var pods = pr.data || [];
-            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
+            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="8" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
             tbody.innerHTML = pods.map(function (p) {
                 var cnt = servicesForPod(p.uid).length;
+                var ownerDisplay = p.owner_name
+                    ? ('<strong>' + esc(p.owner_name) + '</strong>' + (p.note ? '<div class="muted" style="font-size:11.5px;">' + esc(p.note) + '</div>' : ''))
+                    : '<span class="muted" style="font-size:12px;">(未设置)</span>';
                 return '<tr>' +
                     '<td><strong>' + esc(p.name) + '</strong></td>' +
+                    '<td>' + ownerDisplay + '</td>' +
                     '<td><span class="badge badge-muted font-mono">' + esc(p.namespace) + '</span></td>' +
                     '<td><span class="font-mono">' + esc(p.node) + '</span></td>' +
                     '<td>' + statusBadge(p.status) + '</td>' +
                     '<td><span class="font-mono">' + esc((p.ips || []).join(', ')) + '</span></td>' +
                     '<td>' + (cnt > 0 ? '<span class="badge badge-success">' + cnt + ' 条映射</span>' : '<span class="muted">-</span>') + '</td>' +
-                    '<td style="text-align:right;"><button class="btn btn-sm btn-primary" data-pod=\'' + esc(JSON.stringify(p)) + '\'>配置端口映射</button></td>' +
+                    '<td style="text-align:right;"><button class="btn btn-sm btn-primary" data-pod=\'' + esc(JSON.stringify(p)) + '\'>配置端口映射与备注</button></td>' +
                     '</tr>';
             }).join('');
             tbody.querySelectorAll('button[data-pod]').forEach(function (btn) {
@@ -613,76 +617,216 @@
     }
 
     async function showPortMappingForm(content, pod) {
-        var html = '<div class="modal-overlay" id="port-modal"><div class="modal" style="max-width: 680px;">' +
+        var editingSvc = null;
+
+        var html = '<div class="modal-overlay" id="port-modal"><div class="modal" style="max-width: 760px;">' +
             '<h3 class="modal-title">' +
-            '<span>端口映射管理</span>' +
+            '<span>Notebook 端口映射与归属配置</span>' +
             '<span class="badge badge-primary font-mono">' + esc(pod.name) + '</span>' +
             '</h3>' +
-            '<div class="card"><div class="section-title">该 Pod 关联的 Service 映射</div>' +
-            '<p class="muted mb-2" style="font-size:12px;">包含全部匹配该 Pod 的 Service。<span class="badge badge-success">本面板创建</span> 可执行清理，<span class="badge badge-muted">外部创建</span> 为集群固有只读。</p>' +
-            '<div class="table-responsive">' +
-            '<table class="data-table" id="pod-svc-table"><thead><tr><th>Service 名称</th><th>类型</th><th>NodePort</th><th>Pod 目标端口</th><th>归属</th><th style="text-align:right;">操作</th></tr></thead>' +
-            '<tbody id="pod-existing-tbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody></table></div></div>' +
-            '<div class="card mt-2"><div class="section-title">新增端口映射规则</div>' +
-            '<p class="muted mb-2" style="font-size:12px;">系统将自动生成对应 K8s Service 并联动下发 NetworkPolicy 允许外部流量通过。</p>' +
-            '<form id="port-form">' +
+            // Section 1: Metadata / Remark
+            '<div class="card mb-2">' +
+            '<div class="section-title" style="margin-bottom:6px;">使用人与备注信息</div>' +
+            '<p class="muted mb-2" style="font-size:12px;">标注 Notebook 的责任人与用途，帮助集群运维人员清晰识别容器使用者。</p>' +
             '<div class="row">' +
-            '<div class="col"><div class="form-field"><label>目标命名空间</label><input type="text" name="namespace" value="' + esc(pod.namespace) + '" readonly></div></div>' +
-            '<div class="col"><div class="form-field"><label>Service 暴露模式</label><select name="type"><option value="NodePort">NodePort (主机端口映射)</option><option value="ClusterIP">ClusterIP (集群内网互通)</option></select></div></div>' +
+            '<div class="col"><div class="form-field mb-1"><label>使用人 / 负责人</label><input type="text" id="nb-meta-owner" placeholder="如：张三、算法组李工" value="' + esc(pod.owner_name || '') + '"></div></div>' +
+            '<div class="col"><div class="form-field mb-1"><label>业务备注说明</label><input type="text" id="nb-meta-note" placeholder="如：大模型微调实验、PyTorch训练" value="' + esc(pod.note || '') + '"></div></div>' +
             '</div>' +
-            '<div class="form-field">' +
-            '<label>映射端口 (逗号分隔，如 31555、8080:80 或 显式指定NodePort 8080:80:31555)</label>' +
-            '<input type="text" name="ports" placeholder="如 31555 或 8080:80 或 8080:80:31555" required>' +
-            '<p class="muted mt-1" style="font-size:12px;">格式说明：端口（如 31555，内外同端口且由K8s分配NodePort）、服务端口:容器端口（如 8080:80）、服务端口:容器端口:NodePort（如 8080:80:31555，指定NodePort 30000-32767）。</p>' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">' +
+            '<span class="muted" style="font-size:11.5px;">' +
+            (pod.key_kind === 'business_labels'
+                ? '<span class="badge badge-success" style="font-size:10.5px;">稳定业务标签</span> Pod 重建后将自动保持备注'
+                : '<span class="badge badge-muted" style="font-size:10.5px;">Pod UID 绑定</span> 缺少 workspace/project 标签，Pod 重建后不继承') +
+            (pod.updated_by ? (' · 最近修改: ' + esc(pod.updated_by) + ' (' + fmtTime(pod.metadata_updated_at) + ')') : '') +
+            '</span>' +
+            '<button type="button" class="btn btn-xs btn-outline" id="btn-save-meta">保存使用人与备注</button>' +
+            '</div>' +
+            '<div id="nb-meta-msg" class="info-msg" style="margin-top:4px;"></div>' +
+            '</div>' +
+            // Section 2: Existing Mappings
+            '<div class="card"><div class="section-title">该 Pod 关联的 Service 映射</div>' +
+            '<p class="muted mb-2" style="font-size:12px;">包含全部匹配该 Pod 的 Service。<span class="badge badge-success">本面板创建</span> 可随时原地编辑或清理，<span class="badge badge-muted">外部创建</span> 为集群固有只读。</p>' +
+            '<div class="table-responsive">' +
+            '<table class="data-table" id="pod-svc-table"><thead><tr><th>Service 名称</th><th>端口映射规则 (NodePort &rarr; 容器目标端口)</th><th>归属</th><th style="text-align:right;">操作</th></tr></thead>' +
+            '<tbody id="pod-existing-tbody"><tr><td colspan="4" class="muted">加载中...</td></tr></tbody></table></div></div>' +
+            // Section 3: Add/Edit Port Rules
+            '<div class="card mt-2">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;">' +
+            '<div class="section-title" id="port-form-title" style="margin-bottom:0;">新建 NodePort 映射规则</div>' +
+            '<button type="button" class="btn btn-xs btn-outline" id="btn-cancel-edit" style="display:none;">取消编辑并返回新建</button>' +
+            '</div>' +
+            '<p class="muted mb-2" style="font-size:12px;">直接配置容器内部端口与可选外部 NodePort（30000-32767，若不填则由 Kubernetes 自动随机分配）。系统将联动配置 NetworkPolicy 放行外部流量。</p>' +
+            '<form id="port-form">' +
+            '<div id="port-rows-container"></div>' +
+            '<div style="margin-bottom:12px;">' +
+            '<button type="button" class="btn btn-xs btn-outline" id="btn-add-port-row">+ 添加一行端口映射</button>' +
             '</div>' +
             '<div class="row mt-2" style="justify-content: flex-end;">' +
-            '<button type="button" class="btn btn-outline" id="port-cancel">取消</button>' +
-            '<button type="submit" class="btn btn-primary">立即创建映射</button>' +
+            '<button type="button" class="btn btn-outline" id="port-cancel">关闭</button>' +
+            '<button type="submit" class="btn btn-primary" id="btn-submit-port">立即创建映射</button>' +
             '</div>' +
             '<div id="port-form-msg" class="error-msg"></div></form></div></div></div>';
+
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('port-modal');
         document.getElementById('port-cancel').addEventListener('click', function () { modal.remove(); });
-        renderExistingMappings(modal, pod);
+
+        // Save metadata handler
+        document.getElementById('btn-save-meta').addEventListener('click', async function () {
+            var owner = document.getElementById('nb-meta-owner').value.trim();
+            var note = document.getElementById('nb-meta-note').value.trim();
+            var msgEl = document.getElementById('nb-meta-msg');
+            this.disabled = true;
+            try {
+                var r = await apiJSON('/k8s/notebooks/' + encodeURIComponent(pod.namespace) + '/' + encodeURIComponent(pod.name) + '/metadata', {
+                    method: 'PUT',
+                    body: JSON.stringify({ owner_name: owner, note: note })
+                });
+                if (!r.resp.ok) {
+                    setMsg(msgEl, '保存失败: ' + (r.data && r.data.error), 'error');
+                } else {
+                    setMsg(msgEl, '使用人与备注已成功保存！', 'info');
+                    pod.owner_name = owner;
+                    pod.note = note;
+                    loadPods(content);
+                }
+            } catch (err) {
+                setMsg(msgEl, '保存失败: ' + err.message, 'error');
+            } finally {
+                this.disabled = false;
+            }
+        });
+
+        var rowsContainer = document.getElementById('port-rows-container');
+
+        function createPortRow(podPort, nodePort) {
+            var row = document.createElement('div');
+            row.className = 'port-row-item';
+            row.style.cssText = 'display:flex;gap:10px;align-items:center;margin-bottom:8px;';
+            row.innerHTML = '<div style="flex:1;"><input type="number" class="row-pod-port" placeholder="Pod 内部端口 (必填，如 8888)" min="1" max="65535" value="' + (podPort || '') + '" required style="margin-bottom:0;"></div>' +
+                '<div style="flex:1.3;"><input type="number" class="row-node-port" placeholder="外部 NodePort (可选，留空自动分配)" min="30000" max="32767" value="' + (nodePort || '') + '" style="margin-bottom:0;"></div>' +
+                '<button type="button" class="btn btn-xs btn-danger btn-del-row" style="padding:6px 10px;">&times; 删除行</button>';
+            row.querySelector('.btn-del-row').addEventListener('click', function () {
+                row.remove();
+            });
+            rowsContainer.appendChild(row);
+        }
+
+        // Add initial row
+        createPortRow('', '');
+
+        document.getElementById('btn-add-port-row').addEventListener('click', function () {
+            createPortRow('', '');
+        });
+
+        var btnCancelEdit = document.getElementById('btn-cancel-edit');
+        var formTitle = document.getElementById('port-form-title');
+        var submitBtn = document.getElementById('btn-submit-port');
+
+        function resetFormToCreate() {
+            editingSvc = null;
+            formTitle.textContent = '新建 NodePort 映射规则';
+            submitBtn.textContent = '立即创建映射';
+            btnCancelEdit.style.display = 'none';
+            rowsContainer.innerHTML = '';
+            createPortRow('', '');
+            setMsg(document.getElementById('port-form-msg'), '', 'error');
+        }
+
+        btnCancelEdit.addEventListener('click', resetFormToCreate);
+
+        function setupEditMode(svc) {
+            editingSvc = svc;
+            formTitle.innerHTML = '正在编辑 Service: <code>' + esc(svc.name) + '</code>';
+            submitBtn.textContent = '保存并更新规则';
+            btnCancelEdit.style.display = 'inline-block';
+            rowsContainer.innerHTML = '';
+            var ports = svc.ports || [];
+            if (ports.length === 0) {
+                createPortRow('', '');
+            } else {
+                ports.forEach(function (p) {
+                    createPortRow(p.target_port || p.port, p.node_port || '');
+                });
+            }
+            document.getElementById('port-form').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        renderExistingMappings(modal, pod, setupEditMode);
+
         document.getElementById('port-form').addEventListener('submit', async function (e) {
             e.preventDefault();
-            var f = e.target;
             var msgEl = document.getElementById('port-form-msg');
-            var rawList = (f.ports.value || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
-            if (rawList.length === 0) {
-                setMsg(msgEl, '请输入映射端口', 'error');
-                return;
+            setMsg(msgEl, '', 'error');
+            var rowEls = rowsContainer.querySelectorAll('.port-row-item');
+
+            if (rowEls.length === 0) {
+                if (editingSvc) {
+                    if (!confirm('已移除全部端口映射。保存将彻底删除 Service ' + editingSvc.name + ' 及对应 NetworkPolicy，是否确认？')) {
+                        return;
+                    }
+                } else {
+                    setMsg(msgEl, '请至少添加一行端口映射规则', 'error');
+                    return;
+                }
             }
+
+            var mappings = [];
             var parseErr = null;
-            var ports = rawList.map(function (p) {
-                var parts = p.split(':').map(function (x) { return x.trim(); });
-                var port = parseInt(parts[0], 10);
-                var targetPort = port;
-                var nodePort = 0;
-                if (parts.length === 2) {
-                    targetPort = parseInt(parts[1], 10);
-                } else if (parts.length >= 3) {
-                    targetPort = parseInt(parts[1], 10);
-                    nodePort = parseInt(parts[2], 10);
+            var seenPodPorts = {};
+            var seenNodePorts = {};
+
+            rowEls.forEach(function (row) {
+                if (parseErr) return;
+                var podPortVal = parseInt(row.querySelector('.row-pod-port').value, 10);
+                var nodePortInput = row.querySelector('.row-node-port').value.trim();
+                var nodePortVal = nodePortInput ? parseInt(nodePortInput, 10) : 0;
+
+                if (isNaN(podPortVal) || podPortVal < 1 || podPortVal > 65535) {
+                    parseErr = 'Pod 内部端口必须在 1 到 65535 之间';
+                    return;
                 }
-                if (isNaN(port) || port <= 0 || isNaN(targetPort) || targetPort <= 0 || isNaN(nodePort) || nodePort < 0) {
-                    parseErr = '端口输入有误，端口号必须为正整数';
+                if (nodePortInput && (isNaN(nodePortVal) || nodePortVal < 30000 || nodePortVal > 32767)) {
+                    parseErr = '外部 NodePort (' + nodePortInput + ') 必须在 30000 到 32767 范围内，或留空让系统自动分配';
+                    return;
                 }
-                if (nodePort > 0 && (nodePort < 30000 || nodePort > 32767)) {
-                    parseErr = '外部 NodePort (' + nodePort + ') 超出 Kubernetes 默认端口范围 (30000-32767)';
+                if (seenPodPorts[podPortVal]) {
+                    parseErr = '同一次配置中不能重复相同的 Pod 内部端口 (' + podPortVal + ')';
+                    return;
                 }
-                return { port: port, target_port: targetPort, node_port: nodePort, protocol: 'TCP' };
+                seenPodPorts[podPortVal] = true;
+                if (nodePortVal > 0) {
+                    if (seenNodePorts[nodePortVal]) {
+                        parseErr = '同一次配置中不能指定重复的外部 NodePort (' + nodePortVal + ')';
+                        return;
+                    }
+                    seenNodePorts[nodePortVal] = true;
+                }
+                mappings.push({ pod_port: podPortVal, node_port: nodePortVal });
             });
+
             if (parseErr) {
                 setMsg(msgEl, '错误: ' + parseErr, 'error');
                 return;
             }
-            var body = {
-                namespace: pod.namespace, pod_name: pod.name, pod_uid: pod.uid,
-                selector: pod.labels || {}, type: f.type.value, ports: ports
-            };
+
             try {
-                var r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
+                var r;
+                if (editingSvc) {
+                    r = await apiJSON('/k8s/services/' + encodeURIComponent(editingSvc.name) + '?namespace=' + encodeURIComponent(editingSvc.namespace), {
+                        method: 'PUT',
+                        body: JSON.stringify({
+                            resource_version: editingSvc.resource_version || '',
+                            mappings: mappings
+                        })
+                    });
+                } else {
+                    var body = {
+                        namespace: pod.namespace, pod_name: pod.name, pod_uid: pod.uid,
+                        selector: pod.labels || {}, type: 'NodePort', mappings: mappings
+                    };
+                    r = await apiJSON('/k8s/services', { method: 'POST', body: JSON.stringify(body) });
+                }
                 if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
                 modal.remove();
                 var taskID = r.data && r.data.task_id;
@@ -691,29 +835,43 @@
         });
     }
 
-    function renderExistingMappings(scope, pod) {
+    function renderExistingMappings(scope, pod, onEditSvc) {
         var el = scope.querySelector('#pod-existing-tbody');
         if (!el) return;
         var mine = servicesForPod(pod.uid);
         if (mine.length === 0) {
-            el.innerHTML = '<tr><td colspan="6" class="muted">当前 Pod 尚无关联端口映射。</td></tr>';
+            el.innerHTML = '<tr><td colspan="4" class="muted">当前 Pod 尚无关联端口映射。可在下方新建映射规则。</td></tr>';
             return;
         }
         mine.sort(function (a, b) { return (a.managed === b.managed) ? 0 : (a.managed ? -1 : 1); });
         el.innerHTML = mine.map(function (s) {
             var ports = s.ports || [];
-            var extPorts = ports.length ? ports.map(function (p) { return (p.node_port || '-') + '/' + (p.protocol || 'TCP'); }).join(', ') : '-';
-            var intPorts = ports.length ? ports.map(function (p) { return p.port + '->' + (p.target_port || p.port); }).join(', ') : '-';
-            var srcBadge = s.managed ? '<span class="badge badge-success">本面板</span>' : '<span class="badge badge-muted">外部</span>';
+            var rulesHtml = ports.length === 0 ? '<span class="muted">(未定义端口)</span>' : ports.map(function (p) {
+                var ext = p.node_port ? ('<strong style="color:var(--primary);">' + p.node_port + '</strong>') : '<span class="muted">自动分配</span>';
+                var target = p.target_port || p.port;
+                return '<span class="badge" style="margin:2px 4px 2px 0;background:rgba(255,255,255,0.05);">' + ext + ' &rarr; <span class="font-mono">' + target + '/TCP</span></span>';
+            }).join('');
+            var srcBadge = s.managed ? '<span class="badge badge-success">本面板管理</span>' : '<span class="badge badge-muted">外部固有</span>';
             var action = s.managed
-                ? '<button class="btn btn-xs btn-danger" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">删除</button>'
+                ? '<div class="actions-cell" style="justify-content:flex-end;">' +
+                  '<button class="btn btn-xs btn-outline" data-act="edit-svc" data-svc=\'' + esc(JSON.stringify(s)) + '\'>编辑规则</button>' +
+                  '<button class="btn btn-xs btn-danger" data-act="del-svc" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">删除</button>' +
+                  '</div>'
                 : '<span class="muted" style="font-size:12px;">只读</span>';
-            return '<tr><td><span class="font-mono">' + esc(s.name) + '</span></td><td>' + esc(s.type) + '</td><td><span class="font-mono">' + esc(extPorts) + '</span></td><td><span class="font-mono">' + esc(intPorts) + '</span></td><td>' + srcBadge + '</td>' +
+            return '<tr><td><span class="font-mono" style="font-weight:600;">' + esc(s.name) + '</span></td><td>' + rulesHtml + '</td><td>' + srcBadge + '</td>' +
                 '<td style="text-align:right;">' + action + '</td></tr>';
         }).join('');
-        el.querySelectorAll('button[data-name]').forEach(function (btn) {
+
+        el.querySelectorAll('button[data-act="edit-svc"]').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var s = JSON.parse(this.getAttribute('data-svc'));
+                if (onEditSvc) onEditSvc(s);
+            });
+        });
+
+        el.querySelectorAll('button[data-act="del-svc"]').forEach(function (btn) {
             btn.addEventListener('click', async function () {
-                if (!confirm('确认删除 Service ' + this.getAttribute('data-name') + '？\n删除将释放对应的 NodePort 端口并清理 NetworkPolicy 规则。')) return;
+                if (!confirm('确认删除 Service ' + this.getAttribute('data-name') + '？\n删除将释放对应的 NodePort 端口并清理配套 NetworkPolicy 规则。')) return;
                 var name = this.getAttribute('data-name');
                 var ns2 = this.getAttribute('data-ns');
                 try {
@@ -744,10 +902,10 @@
             '<div class="section-title" style="margin-bottom:0;">当前已开启 NFS 的主机概览</div>' +
             '<span class="muted" style="font-size:12px;">展示已开启 NFS 的主机硬件磁盘分布、剩余可用容量、划分的虚拟盘及其挂载目录与空间占用</span>' +
             '</div>' +
-            '<button class="btn btn-outline btn-xs" id="btn-refresh-nfs-hosts">刷新监控状态</button>' +
+            '<button class="btn btn-outline btn-xs" id="btn-refresh-nfs-hosts">🔄 刷新全部缓存</button>' +
             '</div>' +
             '<div id="st-nfs-hosts-container" style="padding-top:10px;">' +
-            '<div class="muted">正在探测已开启 NFS 的主机情况...</div>' +
+            '<div class="muted">正在查询存储快照...</div>' +
             '</div>' +
             '</div>' +
             // Worker Selector
@@ -765,6 +923,7 @@
             '<div class="section-title" style="margin-bottom:0;">存储池 (VG) 与物理硬盘</div>' +
             '<div style="display:flex;align-items:center;gap:12px;">' +
             '<span id="st-vg-summary" class="muted" style="font-size:12.5px;"></span>' +
+            '<button class="btn btn-outline btn-xs" id="btn-refresh-worker-inv" style="display:none;">🔄 刷新此节点</button>' +
             '<button class="btn btn-primary btn-sm" id="btn-init-vg" disabled>初始化 VG 池 (从未挂载裸盘)</button>' +
             '</div></div>' +
             '<div id="st-disks-container" style="margin-bottom:12px;"></div>' +
@@ -776,11 +935,11 @@
             '<div class="card mt-2">' +
             '<div class="card-header">' +
             '<div class="section-title" style="margin-bottom:0;">逻辑卷 (虚拟盘) 管理</div>' +
-            '<span class="muted" style="font-size:12px;">包含全部底层识别的 LV 虚拟盘，实时监控挂载目录、空间已用/剩余与 NFS 导出状态</span>' +
+            '<span class="muted" style="font-size:12px;">包含全部底层识别的 LV 虚拟盘，实时监控所属物理盘、挂载目录、空间已用/剩余与 NFS 导出状态</span>' +
             '</div>' +
             '<div class="table-responsive">' +
-            '<table class="data-table" id="st-lv-table"><thead><tr><th>虚拟盘名称</th><th>所属 VG</th><th>总容量</th><th>挂载目录</th><th>已用空间</th><th>剩余可用</th><th>使用率</th><th>NFS 导出</th><th style="text-align:right;">操作</th></tr></thead>' +
-            '<tbody id="st-lv-tbody"><tr><td colspan="9" class="muted">请先在上方选择 Worker 节点。</td></tr></tbody></table>' +
+            '<table class="data-table" id="st-lv-table"><thead><tr><th>虚拟盘名称</th><th>所属 VG</th><th>底层物理盘</th><th>总容量</th><th>挂载目录</th><th>已用空间</th><th>剩余可用</th><th>使用率</th><th>NFS 导出</th><th style="text-align:right;">操作</th></tr></thead>' +
+            '<tbody id="st-lv-tbody"><tr><td colspan="10" class="muted">请先在上方选择 Worker 节点。</td></tr></tbody></table>' +
             '</div></div>' +
             // Block C: create NFS share
             '<div class="card mt-2">' +
@@ -813,7 +972,7 @@
         async function loadNFSHosts() {
             var container = document.getElementById('st-nfs-hosts-container');
             if (!container) return;
-            container.innerHTML = '<div class="muted">正在查询已开启 NFS 的主机状态...</div>';
+            container.innerHTML = '<div class="muted">正在查询存储快照...</div>';
             try {
                 var r = await apiJSON('/storage/nfs-hosts');
                 if (!r.resp.ok) {
@@ -832,79 +991,173 @@
                     var exports = h.nfs_exports || [];
 
                     var disksHtml = disks.length === 0 ? '<span class="muted">暂未检测到物理硬盘信息</span>' : disks.map(function (d) {
-                        var roleTag = d.role === 'lvm' ? '<span class="badge badge-muted" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>' :
-                            (d.role === 'unused' ? '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>' : '<span class="badge badge-muted" style="font-size:11px;">系统盘</span>');
-                        return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:8px 12px;min-width:180px;">' +
+                        var roleTag = '';
+                        var capLabel = '';
+                        if (d.is_reserved || d.role === 'reserved') {
+                            roleTag = '<span class="badge badge-danger" style="font-size:11px;" title="挂载在 /data01，为 K8s 保留盘，禁止用于 NFS">K8s保留盘 (/data01)</span>';
+                            capLabel = '<span style="color:var(--danger);font-size:11.5px;">(保留禁止作为NFS盘)</span>';
+                        } else if (d.is_system || d.role === 'system') {
+                            roleTag = '<span class="badge badge-muted" style="font-size:11px;">系统盘</span>';
+                            capLabel = '剩余: <span class="muted font-mono">' + (d.free_gb ? d.free_gb.toFixed(1) + ' GB' : '-') + '</span>';
+                        } else if (d.role === 'lvm') {
+                            roleTag = '<span class="badge badge-primary" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>';
+                            capLabel = 'VG可用: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
+                        } else if (d.role === 'unused') {
+                            roleTag = '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>';
+                            capLabel = '可初始化: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
+                        } else {
+                            roleTag = '<span class="badge badge-muted" style="font-size:11px;">普通数据盘</span>';
+                            capLabel = '剩余: <strong style="color:var(--text);" class="font-mono">' + (d.free_gb ? d.free_gb.toFixed(1) + ' GB' : '-') + '</strong>';
+                        }
+
+                        return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:8px 12px;min-width:190px;">' +
                             '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">' +
                             '<strong>' + esc(d.name) + '</strong>' + roleTag +
                             '</div>' +
                             '<div style="font-size:12px;color:var(--text-muted);margin-top:4px;">' +
-                            '总计: <span class="font-mono">' + (d.size_gb || 0).toFixed(1) + ' GB</span>' +
-                            '<br>剩余: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>' +
+                            '总计: <span class="font-mono">' + (d.size_gb || 0).toFixed(1) + ' GB</span><br>' + capLabel +
                             '</div>' +
                             '</div>';
                     }).join('');
 
+                    function renderLVRows(lvList) {
+                        return lvList.map(function (lv) {
+                            var pctNum = parseInt(lv.use_pct || '0', 10) || 0;
+                            var pctColor = pctNum > 85 ? 'var(--danger)' : (pctNum > 60 ? 'var(--warning, #f59e0b)' : 'var(--success)');
+                            var nfsBadge = lv.is_nfs_export
+                                ? '<span class="badge badge-success" title="' + esc(lv.nfs_export_opt || '') + '">✓ NFS 已导出</span>'
+                                : '<span class="badge badge-muted">未导出</span>';
+                            var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
+                            var platBtn = lv.mount_point
+                                ? '<button class="btn btn-xs btn-outline" data-act="platform" data-wid="' + h.worker_id + '" data-host="' + esc(h.host) + '" data-lv=\'' + esc(data) + '\'>平台参数</button>'
+                                : '-';
+                            var freeStr = lv.mount_point ? '<strong style="color:var(--success);">' + (lv.free_gb || 0).toFixed(1) + ' GB</strong>' : '<span class="muted">(未挂载)</span>';
+                            var disksBadge = (lv.physical_disks && lv.physical_disks.length)
+                                ? lv.physical_disks.map(function (x) { return '<span class="badge badge-mono font-mono" style="font-size:10.5px;">' + esc(x) + '</span>'; }).join(' ')
+                                : '<span class="muted">-</span>';
+                            return '<tr>' +
+                                '<td><strong>' + esc(lv.name) + '</strong></td>' +
+                                '<td><span class="badge badge-muted font-mono" style="font-size:11px;">' + esc(lv.vg_name || '-') + '</span></td>' +
+                                '<td>' + disksBadge + '</td>' +
+                                '<td><span class="font-mono">' + esc(lv.mount_point || '(未挂载)') + '</span></td>' +
+                                '<td><span class="font-mono">' + (lv.size_gb || 0).toFixed(1) + ' GB</span></td>' +
+                                '<td><span class="font-mono">' + (lv.mount_point ? (lv.used_gb || 0).toFixed(1) + ' GB' : '-') + '</span></td>' +
+                                '<td><span class="font-mono">' + freeStr + '</span></td>' +
+                                '<td>' + (lv.mount_point ? ('<div style="display:flex;align-items:center;gap:6px;"><div style="flex:1;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;min-width:40px;"><div style="width:' + Math.min(pctNum, 100) + '%;height:100%;background:' + pctColor + ';"></div></div><span style="font-size:11px;min-width:28px;">' + esc(lv.use_pct || '0%') + '</span></div>') : '-') + '</td>' +
+                                '<td>' + nfsBadge + '</td>' +
+                                '<td>' + platBtn + '</td>' +
+                                '</tr>';
+                        }).join('');
+                    }
+
+                    function renderLVTableContainer(rowsHtml) {
+                        return '<div class="table-responsive" style="margin-top:6px;">' +
+                            '<table class="data-table" style="font-size:12px;">' +
+                            '<thead><tr><th>虚拟盘名称</th><th>所属卷组</th><th>底层物理盘</th><th>挂载目录</th><th>总容量</th><th>已用空间</th><th>剩余空间</th><th>使用率</th><th>NFS 状态</th><th>操作</th></tr></thead>' +
+                            '<tbody>' + rowsHtml + '</tbody></table></div>';
+                    }
+
+                    var groupedByDisk = {};
+                    var crossDiskLVs = [];
+                    var unassignedLVs = [];
+
+                    vdisks.forEach(function (lv) {
+                        var pds = lv.physical_disks || [];
+                        if (pds.length === 1) {
+                            var dn = pds[0];
+                            if (!groupedByDisk[dn]) groupedByDisk[dn] = [];
+                            groupedByDisk[dn].push(lv);
+                        } else if (pds.length > 1) {
+                            crossDiskLVs.push(lv);
+                        } else {
+                            unassignedLVs.push(lv);
+                        }
+                    });
+
                     var vdisksHtml = '';
                     if (vdisks.length === 0) {
-                        vdisksHtml = '<div class="muted" style="padding:6px 0;font-size:12px;">该主机暂无划分的虚拟盘。</div>';
+                        vdisksHtml = '<div class="muted" style="padding:6px 0;font-size:12px;">该主机暂无划分的虚拟盘。可在下方选择该 Worker 节点进行创建。</div>';
                     } else {
-                        vdisksHtml = '<div class="table-responsive" style="margin-top:8px;">' +
-                            '<table class="data-table" style="font-size:12px;">' +
-                            '<thead><tr><th>虚拟盘名称</th><th>挂载目录</th><th>总容量</th><th>已用空间</th><th>剩余空间</th><th>使用率</th><th>NFS 状态</th><th>操作</th></tr></thead>' +
-                            '<tbody>' +
-                            vdisks.map(function (lv) {
-                                var pctNum = parseInt(lv.use_pct || '0', 10) || 0;
-                                var pctColor = pctNum > 85 ? 'var(--danger)' : (pctNum > 60 ? 'var(--warning, #f59e0b)' : 'var(--success)');
-                                var nfsBadge = lv.is_nfs_export
-                                    ? '<span class="badge badge-success" title="' + esc(lv.nfs_export_opt || '') + '">✓ NFS 已导出</span>'
-                                    : '<span class="badge badge-muted">未导出</span>';
-                                var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
-                                var platBtn = lv.mount_point
-                                    ? '<button class="btn btn-xs btn-outline" data-act="platform" data-wid="' + h.worker_id + '" data-host="' + esc(h.host) + '" data-lv=\'' + esc(data) + '\'>平台参数</button>'
-                                    : '-';
-                                return '<tr>' +
-                                    '<td><strong>' + esc(lv.name) + '</strong></td>' +
-                                    '<td><span class="font-mono">' + esc(lv.mount_point || '(未挂载)') + '</span></td>' +
-                                    '<td><span class="font-mono">' + (lv.size_gb || 0).toFixed(1) + ' GB</span></td>' +
-                                    '<td><span class="font-mono">' + (lv.mount_point ? (lv.used_gb || 0).toFixed(1) + ' GB' : '-') + '</span></td>' +
-                                    '<td><span class="font-mono">' + (lv.mount_point ? '<strong style="color:var(--success);">' + (lv.free_gb || 0).toFixed(1) + ' GB</strong>' : '-') + '</span></td>' +
-                                    '<td>' +
-                                    (lv.mount_point ? '<div style="display:flex;align-items:center;gap:6px;">' +
-                                        '<div style="flex:1;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;min-width:50px;">' +
-                                        '<div style="width:' + Math.min(pctNum, 100) + '%;height:100%;background:' + pctColor + ';"></div>' +
-                                        '</div>' +
-                                        '<span style="font-size:11px;min-width:30px;">' + esc(lv.use_pct || '0%') + '</span>' +
-                                        '</div>' : '-') +
-                                    '</td>' +
-                                    '<td>' + nfsBadge + '</td>' +
-                                    '<td>' + platBtn + '</td>' +
-                                    '</tr>';
-                            }).join('') +
-                            '</tbody></table></div>';
+                        var groupsHtml = [];
+                        disks.forEach(function (d) {
+                            var myLVs = groupedByDisk[d.name] || [];
+                            if (d.role === 'lvm' || myLVs.length > 0) {
+                                var countBadge = myLVs.length > 0
+                                    ? '<span class="badge badge-success font-mono" style="font-size:11px;">' + myLVs.length + ' 个虚拟盘</span>'
+                                    : '<span class="badge badge-muted" style="font-size:11px;">0 个虚拟盘</span>';
+                                var diskHeader = '<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:6px;padding:6px 12px;margin-top:8px;">' +
+                                    '<div style="display:flex;align-items:center;gap:8px;"><strong>物理数据盘: ' + esc(d.name) + '</strong> <span class="muted font-mono" style="font-size:11.5px;">(总计 ' + (d.size_gb||0).toFixed(1) + ' GB · VG可用 ' + (d.free_gb||0).toFixed(1) + ' GB)</span> ' + countBadge + '</div>' +
+                                    '<span class="muted" style="font-size:11.5px;">' + (d.vg_name ? '卷组: ' + esc(d.vg_name) : '') + '</span>' +
+                                    '</div>';
+                                var tbl = myLVs.length === 0
+                                    ? '<div class="muted" style="padding:6px 12px;font-size:12px;">该物理数据盘当前尚未切分出虚拟盘。</div>'
+                                    : renderLVTableContainer(renderLVRows(myLVs));
+                                groupsHtml.push('<div style="margin-bottom:8px;">' + diskHeader + tbl + '</div>');
+                            }
+                        });
+
+                        if (crossDiskLVs.length > 0) {
+                            var crossHeader = '<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(234,179,8,0.05);border:1px solid rgba(234,179,8,0.2);border-radius:6px;padding:6px 12px;margin-top:10px;">' +
+                                '<div style="display:flex;align-items:center;gap:8px;"><strong>🔀 跨盘存储池虚拟盘 (跨越多块物理盘)</strong> <span class="badge badge-warning font-mono" style="font-size:11px;">' + crossDiskLVs.length + ' 个跨盘虚拟盘</span></div>' +
+                                '<span class="muted" style="font-size:11.5px;">此类虚拟盘由多个底层物理盘共同支撑</span>' +
+                                '</div>';
+                            groupsHtml.push('<div style="margin-bottom:8px;">' + crossHeader + renderLVTableContainer(renderLVRows(crossDiskLVs)) + '</div>');
+                        }
+
+                        if (unassignedLVs.length > 0) {
+                            var unHeader = '<div style="display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:6px;padding:6px 12px;margin-top:10px;">' +
+                                '<div><strong>其他虚拟盘 (未定位具体物理盘)</strong></div>' +
+                                '</div>';
+                            groupsHtml.push('<div style="margin-bottom:8px;">' + unHeader + renderLVTableContainer(renderLVRows(unassignedLVs)) + '</div>');
+                        }
+
+                        vdisksHtml = groupsHtml.join('');
                     }
+
+                    var syncBadge = h.refreshing
+                        ? '<span class="badge badge-warning">🔄 正在后台刷新...</span>'
+                        : (h.stale
+                            ? '<span class="badge badge-muted" title="快照采集时间: ' + esc(fmtTime(h.collected_at)) + '">⏳ 缓存较旧</span>'
+                            : '<span class="badge badge-success" title="同步时间: ' + esc(fmtTime(h.collected_at)) + '">✓ 快照已同步</span>');
+
+                    var errHtml = h.error_message
+                        ? '<div class="error-msg" style="margin-top:6px;font-size:12px;">最近采集提示: ' + esc(h.error_message) + ' (展示历史快照)</div>'
+                        : '';
 
                     return '<div style="border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:12px;background:rgba(255,255,255,0.015);">' +
                         '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:10px;margin-bottom:10px;">' +
                         '<div style="display:flex;align-items:center;gap:10px;">' +
                         '<strong style="font-size:14px;">' + esc(h.worker_name) + '</strong>' +
                         '<span class="badge badge-muted font-mono">' + esc(h.host) + ':' + h.port + '</span>' +
-                        '<span class="badge badge-success"><span class="badge-dot"></span>NFS 服务运行中</span>' +
+                        (h.nfs_active ? '<span class="badge badge-success"><span class="badge-dot"></span>NFS 服务运行中</span>' : '<span class="badge badge-muted">NFS 未激活</span>') +
+                        syncBadge +
+                        '<button class="btn btn-xs btn-outline" data-act="refresh-worker" data-wid="' + h.worker_id + '">🔄 刷新此节点</button>' +
                         '</div>' +
                         '<div style="font-size:12px;color:var(--text-muted);">' +
                         '物理硬盘: <strong class="font-mono">' + (h.total_disks || disks.length) + '</strong> 块 · 虚拟盘: <strong class="font-mono">' + vdisks.length + '</strong> 个 · 导出路径: <strong class="font-mono">' + exports.length + '</strong> 个' +
                         '</div>' +
                         '</div>' +
+                        errHtml +
                         '<div style="margin-bottom:10px;">' +
                         '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">物理硬盘情况 (分别有 ' + (h.total_disks || disks.length) + ' 块硬盘，及其剩余容量)：</div>' +
                         '<div style="display:flex;flex-wrap:wrap;gap:8px;">' + disksHtml + '</div>' +
                         '</div>' +
                         '<div>' +
-                        '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:4px;">划分的虚拟盘与挂载状态 (挂载目录、空间已用与剩余)：</div>' +
+                        '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:4px;">划分的虚拟盘与挂载状态 (按所属物理数据盘分开显示)：</div>' +
                         vdisksHtml +
                         '</div>' +
                         '</div>';
                 }).join('');
+
+                container.querySelectorAll('button[data-act="refresh-worker"]').forEach(function (btn) {
+                    btn.addEventListener('click', async function () {
+                        var wid = parseInt(this.getAttribute('data-wid'), 10);
+                        this.disabled = true;
+                        this.textContent = '刷新中...';
+                        await apiJSON('/storage/refresh', { method: 'POST', body: JSON.stringify({ worker_id: wid }) });
+                        await loadNFSHosts();
+                    });
+                });
 
                 container.querySelectorAll('button[data-act="platform"]').forEach(function (btn) {
                     btn.addEventListener('click', function () {
@@ -925,7 +1178,19 @@
             }
         }
 
-        document.getElementById('btn-refresh-nfs-hosts').addEventListener('click', loadNFSHosts);
+        document.getElementById('btn-refresh-nfs-hosts').addEventListener('click', async function () {
+            var btn = this;
+            btn.disabled = true;
+            btn.textContent = '正在发起后台刷新...';
+            try {
+                await apiJSON('/storage/refresh', { method: 'POST', body: '{}' });
+                await loadNFSHosts();
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔄 刷新全部缓存';
+            }
+        });
+        loadNFSHosts();
         loadNFSHosts();
 
         try {
@@ -951,26 +1216,52 @@
             var btnNfs = document.getElementById('btn-nfs-create');
             var summary = document.getElementById('st-vg-summary');
             var disksContainer = document.getElementById('st-disks-container');
+            var btnRefreshWorker = document.getElementById('btn-refresh-worker-inv');
+
+            if (btnRefreshWorker) {
+                btnRefreshWorker.style.display = 'inline-block';
+                btnRefreshWorker.onclick = async function () {
+                    this.disabled = true;
+                    this.textContent = '刷新中...';
+                    try {
+                        await apiJSON('/storage/refresh', { method: 'POST', body: JSON.stringify({ worker_id: parseInt(wid, 10) }) });
+                        await loadInventory(wid);
+                        await loadNFSHosts();
+                    } finally {
+                        this.disabled = false;
+                        this.textContent = '🔄 刷新此节点';
+                    }
+                };
+            }
 
             btnInit.disabled = true; btnNfs.disabled = true; vsel.disabled = true;
             vsel.innerHTML = '<option value="">正在分析节点存储...</option>';
             vfree.textContent = ''; summary.textContent = '';
             if (disksContainer) disksContainer.innerHTML = '';
             vgTbody.innerHTML = '<tr><td colspan="3" class="muted">正在获取存储池 (VG) 数据...</td></tr>';
-            lvTbody.innerHTML = '<tr><td colspan="9" class="muted">正在获取逻辑卷 (虚拟盘) 数据...</td></tr>';
+            lvTbody.innerHTML = '<tr><td colspan="10" class="muted">正在获取逻辑卷 (虚拟盘) 数据...</td></tr>';
             try {
                 var r = await apiJSON('/storage/inventory?worker_id=' + encodeURIComponent(wid));
                 if (!r.resp.ok) {
                     var err = (r.data && r.data.error) || '加载失败';
                     setMsg(invMsg, '加载存储清单失败: ' + err + ' (若未安装 lvm2/nfs,请先在 Worker 页面点击「安装依赖」)', 'error');
                     vgTbody.innerHTML = '<tr><td colspan="3" class="muted">存储池清单获取失败</td></tr>';
-                    lvTbody.innerHTML = '<tr><td colspan="9" class="muted">逻辑卷清单获取失败</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="10" class="muted">逻辑卷清单获取失败</td></tr>';
                     vsel.innerHTML = '<option value="">-- 加载失败 --</option>';
                     return;
                 }
-                setMsg(invMsg, '', 'info');
-                var inv = r.data || { vgs: [], lvs: [], unused_disks: [] };
+                var inv = (r.data && r.data.data) ? r.data.data : (r.data || { vgs: [], lvs: [], unused_disks: [] });
                 lastInventory = inv;
+
+                if (r.data && r.data.refreshing) {
+                    setMsg(invMsg, '后台正在同步探测该节点存储，当前展示最近快照...', 'info');
+                } else if (r.data && r.data.last_error) {
+                    setMsg(invMsg, '最近采集提醒: ' + r.data.last_error + ' (当前展示历史有效快照)', 'info');
+                } else if (r.data && r.data.stale) {
+                    setMsg(invMsg, '当前展示历史快照 (' + (r.data.collected_at ? fmtTime(r.data.collected_at) : '未同步') + ')，可点击刷新。', 'info');
+                } else {
+                    setMsg(invMsg, '', 'info');
+                }
 
                 var vgs = inv.vgs || [];
                 if (vgs.length === 0) {
@@ -989,11 +1280,27 @@
                         disksContainer.innerHTML = '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">节点物理硬盘列表 (共 ' + pdisks.length + ' 块物理硬盘)：</div>' +
                             '<div style="display:flex;flex-wrap:wrap;gap:8px;">' +
                             pdisks.map(function (d) {
-                                var roleTag = d.role === 'lvm' ? '<span class="badge badge-muted" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>' :
-                                    (d.role === 'unused' ? '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>' : '<span class="badge badge-muted" style="font-size:11px;">系统盘</span>');
-                                return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;min-width:160px;">' +
+                                var roleTag = '';
+                                var capLabel = '';
+                                if (d.is_reserved || d.role === 'reserved') {
+                                    roleTag = '<span class="badge badge-danger" style="font-size:11px;" title="挂载在 /data01，为 K8s 保留盘，禁止作为 NFS 存储">K8s保留盘 (/data01)</span>';
+                                    capLabel = '<span style="color:var(--danger);font-size:11px;">(保留禁止作为NFS盘)</span>';
+                                } else if (d.is_system || d.role === 'system') {
+                                    roleTag = '<span class="badge badge-muted" style="font-size:11px;">系统盘</span>';
+                                    capLabel = '剩余: <span class="muted font-mono">' + (d.free_gb ? d.free_gb.toFixed(1) + ' GB' : '-') + '</span>';
+                                } else if (d.role === 'lvm') {
+                                    roleTag = '<span class="badge badge-primary" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>';
+                                    capLabel = 'VG可用: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
+                                } else if (d.role === 'unused') {
+                                    roleTag = '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>';
+                                    capLabel = '可初始化: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
+                                } else {
+                                    roleTag = '<span class="badge badge-muted" style="font-size:11px;">普通数据盘</span>';
+                                    capLabel = '剩余: <strong style="color:var(--text);" class="font-mono">' + (d.free_gb ? d.free_gb.toFixed(1) + ' GB' : '-') + '</strong>';
+                                }
+                                return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 10px;min-width:170px;">' +
                                     '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;"><strong>' + esc(d.name) + '</strong>' + roleTag + '</div>' +
-                                    '<div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">总计: ' + (d.size_gb || 0).toFixed(1) + ' GB · 剩余: <strong style="color:var(--success);">' + (d.free_gb || 0).toFixed(1) + ' GB</strong></div>' +
+                                    '<div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">总计: ' + (d.size_gb || 0).toFixed(1) + ' GB<br>' + capLabel + '</div>' +
                                     '</div>';
                             }).join('') + '</div>';
                     }
@@ -1002,14 +1309,14 @@
                 var disks = inv.unused_disks || [];
                 if (disks.length > 0) {
                     btnInit.disabled = false;
-                    summary.textContent = '发现 ' + disks.length + ' 块未挂载裸盘可供初始化。';
+                    summary.textContent = '发现 ' + disks.length + ' 处未挂载可用裸盘/分区可供初始化。';
                 } else {
-                    summary.textContent = '未检测到可用未挂载裸盘。';
+                    summary.textContent = '未检测到可用未挂载裸盘或分区（系统盘及 /data01 保留盘已自动排除）。';
                 }
 
                 var lvs = inv.lvs || [];
                 if (lvs.length === 0) {
-                    lvTbody.innerHTML = '<tr><td colspan="9" class="muted">该节点当前无划分的虚拟盘。</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="10" class="muted">该节点当前无划分的虚拟盘。</td></tr>';
                 } else {
                     lvTbody.innerHTML = lvs.map(function (lv) {
                         var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
@@ -1022,14 +1329,31 @@
                             ? '<span class="badge badge-success" title="' + esc(lv.nfs_export_opt || '') + '">✓ 已导出</span>'
                             : '<span class="badge badge-muted">未导出</span>';
                         var usedCol = lv.mount_point ? (lv.used_gb || 0).toFixed(1) + ' GB' : '-';
-                        var freeCol = lv.mount_point ? '<strong style="color:var(--success);">' + (lv.free_gb || 0).toFixed(1) + ' GB</strong>' : '-';
+                        var freeCol = lv.mount_point ? '<strong style="color:var(--success);">' + (lv.free_gb || 0).toFixed(1) + ' GB</strong>' : '<span class="muted">(未挂载)</span>';
                         var pctCol = lv.mount_point ? ('<div style="display:flex;align-items:center;gap:6px;"><div style="flex:1;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;min-width:40px;"><div style="width:' + Math.min(pctNum, 100) + '%;height:100%;background:' + pctColor + ';"></div></div><span style="font-size:11px;min-width:28px;">' + esc(lv.use_pct || '0%') + '</span></div>') : '-';
+                        var disksCol = (lv.physical_disks && lv.physical_disks.length)
+                            ? lv.physical_disks.map(function (x) { return '<span class="badge badge-mono font-mono" style="font-size:10.5px;">' + esc(x) + '</span>'; }).join(' ')
+                            : '<span class="muted">' + esc(lv.vg_name || '-') + '</span>';
 
                         return '<tr>' +
                             '<td><strong>' + esc(lv.name) + '</strong></td>' +
                             '<td><span class="font-mono">' + esc(lv.vg_name) + '</span></td>' +
+                            '<td>' + disksCol + '</td>' +
                             '<td><span class="font-mono">' + (lv.size_gb || 0).toFixed(1) + ' GB</span></td>' +
                             '<td><span class="font-mono">' + esc(lv.mount_point || '-') + '</span></td>' +
+                            '<td><span class="font-mono">' + usedCol + '</span></td>' +
+                            '<td><span class="font-mono">' + freeCol + '</span></td>' +
+                            '<td>' + pctCol + '</td>' +
+                            '<td>' + nfsBadge + '</td>' +
+                            '<td style="text-align:right;">' +
+                            '<div class="actions-cell" style="justify-content: flex-end;">' +
+                            platBtn +
+                            '<button class="btn btn-xs btn-outline" data-act="grow" data-lv=\'' + esc(data) + '\'>扩容</button>' +
+                            '<button class="btn btn-xs btn-outline" data-act="shrink" data-lv=\'' + esc(data) + '\'>缩容</button>' +
+                            '<button class="btn btn-xs btn-danger" data-act="delete" data-lv=\'' + esc(data) + '\'>删除释放</button>' +
+                            '</div>' +
+                            '</td></tr>';
+                    }).join('');
                             '<td><span class="font-mono">' + usedCol + '</span></td>' +
                             '<td><span class="font-mono">' + freeCol + '</span></td>' +
                             '<td>' + pctCol + '</td>' +

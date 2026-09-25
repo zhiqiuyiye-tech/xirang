@@ -36,7 +36,9 @@ func (f *fakeHandler) Run(ctx context.Context, task *db.Task, r *Reporter) error
 var errFailed = errBoiler()
 
 func errBoiler() error { return &failErr{} }
+
 type failErr struct{}
+
 func (*failErr) Error() string { return "boom" }
 
 func TestEngineSubmitAndRun(t *testing.T) {
@@ -57,6 +59,27 @@ func TestEngineSubmitAndRun(t *testing.T) {
 	steps, _ := s.ListSteps(context.Background(), id)
 	if len(steps) != 2 {
 		t.Fatalf("steps=%d", len(steps))
+	}
+}
+
+func TestEngineCompletionHookReceivesTerminalTask(t *testing.T) {
+	s, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer s.Close()
+	e := NewEngine(s)
+	e.Register("fake", &fakeHandler{})
+	done := make(chan db.Task, 1)
+	e.OnComplete(func(task db.Task) { done <- task })
+	id, err := e.Submit(context.Background(), "fake", "worker", 42, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case task := <-done:
+		if task.ID != id || task.Status != "succeeded" || task.TargetID != 42 {
+			t.Fatalf("unexpected completion task: %+v", task)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("completion hook was not called")
 	}
 }
 
@@ -106,7 +129,9 @@ func (*doubleFailHandler) Run(_ context.Context, _ *db.Task, r *Reporter) error 
 }
 
 var errGeneric = &genericErr{}
+
 type genericErr struct{}
+
 func (*genericErr) Error() string { return "generic engine fallback" }
 
 func TestEngineUnknownType(t *testing.T) {

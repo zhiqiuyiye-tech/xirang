@@ -37,6 +37,9 @@ type Engine struct {
 	subs     map[int64][]chan StepEvent
 	subsMu   sync.Mutex
 
+	// Optional terminal task observers (for cache invalidation/refresh).
+	completionHooks []func(db.Task)
+
 	// taskTimeout bounds each run; guarded by mu.
 	taskTimeout time.Duration
 
@@ -84,6 +87,33 @@ func (e *Engine) Register(typeName string, h Handler) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.handlers[typeName] = h
+}
+
+// OnComplete registers an observer invoked after a task reaches a terminal
+// state. Hooks must return quickly; panics are isolated from the task engine.
+func (e *Engine) OnComplete(hook func(db.Task)) {
+	if hook == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.completionHooks = append(e.completionHooks, hook)
+}
+
+func (e *Engine) notifyCompletion(id int64) {
+	task, err := e.store.GetTask(context.Background(), id)
+	if err != nil || (task.Status != "succeeded" && task.Status != "failed") {
+		return
+	}
+	e.mu.Lock()
+	hooks := append([]func(db.Task){}, e.completionHooks...)
+	e.mu.Unlock()
+	for _, hook := range hooks {
+		func() {
+			defer func() { _ = recover() }()
+			hook(*task)
+		}()
+	}
 }
 
 // Submit looks up the registered handler, persists a pending task row, and
@@ -141,6 +171,7 @@ func (e *Engine) run(id int64, targetKind string, targetID int64, h Handler) {
 		return
 	}
 	r := &Reporter{store: e.store, engine: e, taskID: id}
+	defer e.notifyCompletion(id)
 
 	// Serialize per target: at most one task goroutine per target executes at
 	// a time. The previous task's own timeout guarantees the queue drains.

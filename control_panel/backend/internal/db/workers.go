@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+const workerColumns = `id, name, host, port, username, auth_mode, enc_password, enc_private_key,
+ status, last_seen_at, last_checked_at, status_error, health_failures, created_at, updated_at`
+
 func (s *Store) CreateWorker(ctx context.Context, w WorkerNode) (int64, error) {
 	now := time.Now().UTC()
 	if w.Status == "" {
@@ -17,7 +20,7 @@ func (s *Store) CreateWorker(ctx context.Context, w WorkerNode) (int64, error) {
 	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO worker_nodes (name, host, port, username, auth_mode, enc_password, enc_private_key, status, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,? ,?,?)`,
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		w.Name, w.Host, w.Port, w.Username, w.AuthMode, w.EncPassword, w.EncPrivateKey, w.Status, now, now)
 	if err != nil {
 		return 0, err
@@ -26,9 +29,7 @@ func (s *Store) CreateWorker(ctx context.Context, w WorkerNode) (int64, error) {
 }
 
 func (s *Store) ListWorkers(ctx context.Context) ([]WorkerNode, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, host, port, username, auth_mode, enc_password, enc_private_key, status, last_seen_at, created_at, updated_at
-		 FROM worker_nodes ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+workerColumns+` FROM worker_nodes ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +37,7 @@ func (s *Store) ListWorkers(ctx context.Context) ([]WorkerNode, error) {
 	var out []WorkerNode
 	for rows.Next() {
 		var w WorkerNode
-		if err := rows.Scan(&w.ID, &w.Name, &w.Host, &w.Port, &w.Username, &w.AuthMode, &w.EncPassword, &w.EncPrivateKey, &w.Status, &w.LastSeenAt, &w.CreatedAt, &w.UpdatedAt); err != nil {
+		if err := scanWorker(rows, &w); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
@@ -46,10 +47,7 @@ func (s *Store) ListWorkers(ctx context.Context) ([]WorkerNode, error) {
 
 func (s *Store) GetWorker(ctx context.Context, id int64) (*WorkerNode, error) {
 	var w WorkerNode
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, host, port, username, auth_mode, enc_password, enc_private_key, status, last_seen_at, created_at, updated_at
-		 FROM worker_nodes WHERE id=?`, id,
-	).Scan(&w.ID, &w.Name, &w.Host, &w.Port, &w.Username, &w.AuthMode, &w.EncPassword, &w.EncPrivateKey, &w.Status, &w.LastSeenAt, &w.CreatedAt, &w.UpdatedAt)
+	err := scanWorker(s.db.QueryRowContext(ctx, `SELECT `+workerColumns+` FROM worker_nodes WHERE id=?`, id), &w)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -57,6 +55,12 @@ func (s *Store) GetWorker(ctx context.Context, id int64) (*WorkerNode, error) {
 		return nil, err
 	}
 	return &w, nil
+}
+
+func scanWorker(row rowScanner, w *WorkerNode) error {
+	return row.Scan(&w.ID, &w.Name, &w.Host, &w.Port, &w.Username, &w.AuthMode,
+		&w.EncPassword, &w.EncPrivateKey, &w.Status, &w.LastSeenAt, &w.LastCheckedAt,
+		&w.StatusError, &w.HealthFailures, &w.CreatedAt, &w.UpdatedAt)
 }
 
 func (s *Store) UpdateWorker(ctx context.Context, w WorkerNode) error {
@@ -78,9 +82,31 @@ func (s *Store) SetWorkerCredentials(ctx context.Context, id int64, encPassword,
 	return err
 }
 
+func (s *Store) RecordWorkerHealth(ctx context.Context, id int64, online bool, checkedAt time.Time, message string, offlineThreshold int) error {
+	if offlineThreshold < 1 {
+		offlineThreshold = 1
+	}
+	if online {
+		_, err := s.db.ExecContext(ctx, `
+UPDATE worker_nodes SET status='online', last_seen_at=?, last_checked_at=?, status_error=NULL,
+ health_failures=0, updated_at=? WHERE id=?`, checkedAt, checkedAt, time.Now().UTC(), id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE worker_nodes SET
+ status=CASE WHEN health_failures + 1 >= ? THEN 'offline' ELSE status END,
+ last_checked_at=?, status_error=?, health_failures=health_failures+1, updated_at=?
+WHERE id=?`, offlineThreshold, checkedAt, message, time.Now().UTC(), id)
+	return err
+}
+
+// SetWorkerStatus remains for callers that need an immediate explicit state.
 func (s *Store) SetWorkerStatus(ctx context.Context, id int64, status string) error {
+	now := time.Now().UTC()
+	if status == "online" {
+		return s.RecordWorkerHealth(ctx, id, true, now, "", 1)
+	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE worker_nodes SET status=?, last_seen_at=?, updated_at=? WHERE id=?`,
-		status, time.Now().UTC(), time.Now().UTC(), id)
+		`UPDATE worker_nodes SET status=?, last_checked_at=?, updated_at=? WHERE id=?`, status, now, now, id)
 	return err
 }

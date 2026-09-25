@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/workers"
 )
 
@@ -179,19 +180,125 @@ func TestListInventoryValidation(t *testing.T) {
 	if w2.Code != http.StatusNotFound {
 		t.Fatalf("unknown worker: code=%d want 404", w2.Code)
 	}
-	// Valid worker_id but SSH unreachable -> 500 (not a 202; sync endpoint).
+	// Valid worker_id without snapshot returns 200 with freshness metadata and enqueues background refresh.
 	req3 := httptest.NewRequest("GET", "/api/v1/storage/inventory?worker_id="+itoa(wid), nil)
 	req3.Header.Set("Authorization", authHeader(t, tk))
 	w3 := httptest.NewRecorder()
 	r.ServeHTTP(w3, req3)
-	if w3.Code != http.StatusInternalServerError {
-		t.Fatalf("valid worker unreachable: code=%d want 500", w3.Code)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("valid worker without snapshot: code=%d want 200", w3.Code)
+	}
+	var emptyInv map[string]any
+	if err := json.Unmarshal(w3.Body.Bytes(), &emptyInv); err != nil {
+		t.Fatal(err)
+	}
+	if emptyInv["stale"] != true {
+		t.Fatalf("expected stale true for uncollected worker: %+v", emptyInv)
 	}
 }
 
 // itoa is a tiny strconv.Itoa alias to keep imports lean in this test file.
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
+}
+
+func TestStorageEndpointsUseCachedSnapshotsAndRefresh(t *testing.T) {
+	r, ws, store, tk := newRouter(t)
+	wid, err := ws.Create(context.Background(), workers.CreateReq{Name: "w1", Host: "127.0.0.1", Port: 22, Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectedAt := time.Now().UTC().Add(-time.Minute)
+	payload := `{"nfs":{"active":true,"exports":["/data02/share"]},"vgs":[{"name":"vg_data","vsize":"100g","vfree":"50g","free_gb":50}],"lvs":[{"name":"lv_nb","vg_name":"vg_data","size_gb":50,"mount_point":"/data02/share","is_nfs_export":true}],"physical_disks":[{"name":"/dev/sdb","size_gb":100,"free_gb":50,"role":"lvm","vg_name":"vg_data"}],"unused_disks":[]}`
+	if err := store.SaveInventorySnapshot(context.Background(), db.InventorySnapshot{
+		WorkerID: wid, SchemaVersion: 1, PayloadJSON: payload, CollectedAt: &collectedAt, LastAttemptedAt: collectedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. GET /storage/nfs-hosts reads from DB without live SSH
+	req := httptest.NewRequest("GET", "/api/v1/storage/nfs-hosts", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("nfs-hosts code=%d body=%s", w.Code, w.Body.String())
+	}
+	var hosts []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &hosts); err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 1 || hosts[0]["worker_name"] != "w1" || hosts[0]["nfs_active"] != true {
+		t.Fatalf("unexpected nfs-hosts payload: %+v", hosts)
+	}
+
+	// 2. GET /storage/inventory?worker_id=X reads from snapshot
+	req2 := httptest.NewRequest("GET", "/api/v1/storage/inventory?worker_id="+strconv.FormatInt(wid, 10), nil)
+	req2.Header.Set("Authorization", authHeader(t, tk))
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("inventory code=%d body=%s", w2.Code, w2.Body.String())
+	}
+	var invResp map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &invResp); err != nil {
+		t.Fatal(err)
+	}
+	if invResp["stale"] == nil || invResp["refreshing"] == nil {
+		t.Fatalf("inventory metadata missing: %+v", invResp)
+	}
+
+	// 3. POST /storage/refresh returns 202
+	refreshBody, _ := json.Marshal(map[string]any{"worker_id": wid})
+	req3 := httptest.NewRequest("POST", "/api/v1/storage/refresh", bytes.NewReader(refreshBody))
+	req3.Header.Set("Authorization", authHeader(t, tk))
+	req3.Header.Set("Content-Type", "application/json")
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusAccepted {
+		t.Fatalf("refresh code=%d body=%s", w3.Code, w3.Body.String())
+	}
+}
+
+func TestListNFSHosts100WorkersUnderOneSecond(t *testing.T) {
+	r, ws, store, tk := newRouter(t)
+	now := time.Now().UTC()
+	payload := `{"nfs":{"active":true,"exports":["/data02/share"]},"vgs":[{"name":"vg_data","vsize":"100g","vfree":"50g","free_gb":50}],"lvs":[{"name":"lv_nb","vg_name":"vg_data","size_gb":50,"mount_point":"/data02/share","is_nfs_export":true}],"physical_disks":[{"name":"/dev/sdb","size_gb":100,"free_gb":50,"role":"lvm","vg_name":"vg_data"}],"unused_disks":[]}`
+
+	for i := 1; i <= 100; i++ {
+		wid, err := ws.Create(context.Background(), workers.CreateReq{
+			Name: "worker-" + strconv.Itoa(i), Host: "10.0.0." + strconv.Itoa(i), Port: 22, Username: "root",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveInventorySnapshot(context.Background(), db.InventorySnapshot{
+			WorkerID: wid, SchemaVersion: 1, PayloadJSON: payload, CollectedAt: &now, LastAttemptedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := time.Now()
+	req := httptest.NewRequest("GET", "/api/v1/storage/nfs-hosts?all=true", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var hosts []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &hosts); err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 100 {
+		t.Fatalf("expected 100 hosts, got %d", len(hosts))
+	}
+	if elapsed > time.Second {
+		t.Fatalf("100 cached workers took %v, want < 1s", elapsed)
+	}
 }
 
 // TestListNFSHostsViaAPI verifies GET /api/v1/storage/nfs-hosts returns 200

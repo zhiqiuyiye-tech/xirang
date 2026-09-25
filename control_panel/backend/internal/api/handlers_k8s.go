@@ -1,14 +1,17 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/k8s"
 	"xirang/control_panel/internal/tasks"
-	"k8s.io/client-go/kubernetes"
 )
 
 // k8sHandlers exposes the six K8s API endpoints (service + network-policy
@@ -91,6 +94,31 @@ func (h *k8sHandlers) deleteService(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
+// updateService: PUT /api/v1/k8s/services/:name?namespace=
+// Async: submits k8s_update_svc and responds 202 + {task_id}.
+func (h *k8sHandlers) updateService(c *gin.Context) {
+	if h.client == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
+		return
+	}
+	var req map[string]any
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req["name"] = c.Param("name")
+	if req["namespace"] == nil || req["namespace"] == "" {
+		req["namespace"] = c.Query("namespace")
+	}
+	taskID, err := h.eng.Submit(c, "k8s_update_svc", "k8s", 0, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "k8s.update_service", c.Param("name"), "submitted")
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
 // --- NetworkPolicies ---
 
 // createNetworkPolicy: POST /api/v1/k8s/network-policies
@@ -168,9 +196,8 @@ func (h *k8sHandlers) listNodes(c *gin.Context) {
 }
 
 // listPods: GET /api/v1/k8s/pods
-// Returns notebook pods (name contains "notebook") across all namespaces,
-// with namespace/name/uid/node/labels. The UI uses these to drive SVC creation:
-// selecting a pod auto-fills selector + ownerReference.
+// Returns notebook pods across all namespaces, batch-joining owner_name and
+// note from notebook_metadata by their stable key.
 func (h *k8sHandlers) listPods(c *gin.Context) {
 	if h.client == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
@@ -181,7 +208,98 @@ func (h *k8sHandlers) listPods(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	keys := make([]string, 0, len(pods))
+	for _, p := range pods {
+		if p.StableKey != "" {
+			keys = append(keys, p.StableKey)
+		}
+	}
+	if h.store != nil && len(keys) > 0 {
+		metaMap, _ := h.store.GetNotebookMetadataByKeys(c, keys)
+		for i := range pods {
+			if meta, ok := metaMap[pods[i].StableKey]; ok {
+				pods[i].OwnerName = meta.OwnerName
+				pods[i].Note = meta.Note
+				pods[i].UpdatedBy = meta.UpdatedBy
+				pods[i].MetadataUpdatedAt = &meta.UpdatedAt
+			}
+		}
+	}
 	c.JSON(http.StatusOK, pods)
+}
+
+// updateNotebookMetadata: PUT /api/v1/k8s/notebooks/:namespace/:name/metadata
+// Body: { "owner_name": string, "note": string }
+// Resolves the current Pod from Kubernetes, computes its stable key, and updates
+// or cleans up metadata in SQLite.
+func (h *k8sHandlers) updateNotebookMetadata(c *gin.Context) {
+	if h.client == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
+		return
+	}
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+	if namespace == "" || name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name required"})
+		return
+	}
+
+	var req struct {
+		OwnerName string `json:"owner_name"`
+		Note      string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ownerName := strings.TrimSpace(req.OwnerName)
+	note := strings.TrimSpace(req.Note)
+	if len([]rune(ownerName)) > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "owner_name cannot exceed 100 characters"})
+		return
+	}
+	if len([]rune(note)) > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "note cannot exceed 1000 characters"})
+		return
+	}
+
+	pod, err := h.client.CoreV1().Pods(namespace).Get(c, name, metav1.GetOptions{})
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("pod not found: %v", err)})
+		return
+	}
+
+	stableKey, kind, ws, proj := k8s.StableKeyForPod(namespace, string(pod.UID), pod.Labels)
+	actor := "admin"
+	if cl, ok := auth.ClaimsFrom(c); ok {
+		actor = cl.Username
+	}
+
+	if ownerName == "" && note == "" {
+		_ = h.store.DeleteNotebookMetadata(c, stableKey)
+		h.audit(c, "k8s.delete_notebook_metadata", namespace+"/"+name, "deleted")
+		c.JSON(http.StatusOK, gin.H{"deleted": true, "stable_key": stableKey})
+		return
+	}
+
+	m := db.NotebookMetadata{
+		StableKey:   stableKey,
+		KeyKind:     kind,
+		Namespace:   namespace,
+		WorkspaceID: ws,
+		ProjectID:   proj,
+		LastPodUID:  string(pod.UID),
+		OwnerName:   ownerName,
+		Note:        note,
+		UpdatedBy:   actor,
+	}
+	if err := h.store.UpsertNotebookMetadata(c, m); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "k8s.update_notebook_metadata", namespace+"/"+name, "success")
+	c.JSON(http.StatusOK, m)
 }
 
 // audit records an audit log entry. The actor is read from the JWT claims

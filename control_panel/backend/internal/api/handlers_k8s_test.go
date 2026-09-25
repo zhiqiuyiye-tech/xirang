@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -194,7 +195,7 @@ func TestCreateNetworkPolicyViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
 	body, _ := json.Marshal(map[string]any{
 		"namespace": "ns1", "pod_name": "p1", "pod_uid": "u1",
-		"pod_selector": map[string]string{"app": "p1"},
+		"pod_selector":  map[string]string{"app": "p1"},
 		"ingress_ports": []map[string]any{{"protocol": "TCP", "port": 31555}},
 	})
 	req := httptest.NewRequest("POST", "/api/v1/k8s/network-policies", bytes.NewReader(body))
@@ -352,4 +353,121 @@ func waitForK8s(t *testing.T, cs kubernetes.Interface, namespace string, want in
 	}
 	svcs, _ := k8s.ListServices(context.Background(), cs, namespace)
 	t.Fatalf("services never reached count %d (last=%d)", want, len(svcs))
+}
+
+func TestNotebookMetadataViaAPI(t *testing.T) {
+	r, _, tk, cs := newRouterWithK8s(t)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "notebook-ml", Namespace: "ns1", UID: "uid-original",
+			Labels: map[string]string{"workspace_id": "ws-1", "project_id": "proj-1"},
+		},
+	}
+	if _, err := cs.CoreV1().Pods("ns1").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"owner_name": "Dr. Wang",
+		"note":       "LLM fine-tuning job",
+	})
+	putReq := httptest.NewRequest("PUT", "/api/v1/k8s/notebooks/ns1/notebook-ml/metadata", bytes.NewReader(body))
+	putReq.Header.Set("Authorization", authHeader(t, tk))
+	putReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, putReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put metadata: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// 1. GET /k8s/pods joins metadata
+	getReq := httptest.NewRequest("GET", "/api/v1/k8s/pods", nil)
+	getReq.Header.Set("Authorization", authHeader(t, tk))
+	wGet := httptest.NewRecorder()
+	r.ServeHTTP(wGet, getReq)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("get pods: code=%d body=%s", wGet.Code, wGet.Body.String())
+	}
+	var pods []map[string]any
+	if err := json.Unmarshal(wGet.Body.Bytes(), &pods); err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0]["owner_name"] != "Dr. Wang" || pods[0]["note"] != "LLM fine-tuning job" {
+		t.Fatalf("metadata not joined on pod: %+v", pods)
+	}
+
+	// 2. Simulate Pod recreation: delete old pod and create new pod with new UID but same stable labels
+	_ = cs.CoreV1().Pods("ns1").Delete(context.Background(), "notebook-ml", metav1.DeleteOptions{})
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "notebook-ml", Namespace: "ns1", UID: "uid-recreated-new",
+			Labels: map[string]string{"workspace_id": "ws-1", "project_id": "proj-1"},
+		},
+	}
+	if _, err := cs.CoreV1().Pods("ns1").Create(context.Background(), newPod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	wRecreated := httptest.NewRecorder()
+	reqRecreated := httptest.NewRequest("GET", "/api/v1/k8s/pods", nil)
+	reqRecreated.Header.Set("Authorization", authHeader(t, tk))
+	r.ServeHTTP(wRecreated, reqRecreated)
+	var recreatedPods []map[string]any
+	_ = json.Unmarshal(wRecreated.Body.Bytes(), &recreatedPods)
+	if len(recreatedPods) != 1 || recreatedPods[0]["owner_name"] != "Dr. Wang" {
+		t.Fatalf("recreated pod did not inherit stable metadata: %+v", recreatedPods)
+	}
+
+	// 3. Clear metadata
+	clearBody, _ := json.Marshal(map[string]string{"owner_name": "", "note": ""})
+	clearReq := httptest.NewRequest("PUT", "/api/v1/k8s/notebooks/ns1/notebook-ml/metadata", bytes.NewReader(clearBody))
+	clearReq.Header.Set("Authorization", authHeader(t, tk))
+	clearReq.Header.Set("Content-Type", "application/json")
+	wClear := httptest.NewRecorder()
+	r.ServeHTTP(wClear, clearReq)
+	if wClear.Code != http.StatusOK {
+		t.Fatalf("clear metadata: code=%d", wClear.Code)
+	}
+	wCheck := httptest.NewRecorder()
+	reqCheck := httptest.NewRequest("GET", "/api/v1/k8s/pods", nil)
+	reqCheck.Header.Set("Authorization", authHeader(t, tk))
+	r.ServeHTTP(wCheck, reqCheck)
+	var clearedPods []map[string]any
+	_ = json.Unmarshal(wCheck.Body.Bytes(), &clearedPods)
+	if len(clearedPods) != 1 || (clearedPods[0]["owner_name"] != nil && clearedPods[0]["owner_name"] != "") {
+		t.Fatalf("metadata was not cleared: %+v", clearedPods)
+	}
+}
+
+func TestUpdateServiceViaAPI(t *testing.T) {
+	r, _, tk, cs := newRouterWithK8s(t)
+	_, err := cs.CoreV1().Services("ns1").Create(context.Background(), &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cp-svc-1", Namespace: "ns1", Labels: map[string]string{"managed-by": "control-panel"},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{{Port: 8888, TargetPort: intstr.FromInt(8888), NodePort: 31088, Protocol: corev1.ProtocolTCP}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"mappings": []map[string]any{
+			{"pod_port": 9000, "node_port": 31090},
+		},
+	})
+	req := httptest.NewRequest("PUT", "/api/v1/k8s/services/cp-svc-1?namespace=ns1", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader(t, tk))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp["task_id"] == nil {
+		t.Fatalf("invalid update response: %+v", resp)
+	}
 }

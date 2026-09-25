@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -33,14 +34,19 @@ func validatePort(p int) error {
 	return nil
 }
 
+type workerSSH interface {
+	ssh.Runner
+	TestConnection(ctx context.Context, w db.WorkerNode) error
+}
+
 type Service struct {
 	store *db.Store
 	c     *crypto.Cipher
-	sshm  *ssh.Manager
+	sshm  workerSSH
 	eng   *tasks.Engine
 }
 
-func NewService(store *db.Store, c *crypto.Cipher, sshm *ssh.Manager, eng *tasks.Engine) *Service {
+func NewService(store *db.Store, c *crypto.Cipher, sshm workerSSH, eng *tasks.Engine) *Service {
 	s := &Service{store: store, c: c, sshm: sshm, eng: eng}
 	eng.Register("set_root_password", &rootPasswordHandler{service: s})
 	return s
@@ -108,7 +114,16 @@ func (s *Service) TestConnection(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	return s.sshm.TestConnection(ctx, *w)
+	checkedAt := time.Now().UTC()
+	err = s.sshm.TestConnection(ctx, *w)
+	if err != nil {
+		_ = s.store.RecordWorkerHealth(ctx, id, false, checkedAt, err.Error(), 1)
+		return err
+	}
+	if updateErr := s.store.RecordWorkerHealth(ctx, id, true, checkedAt, "", 1); updateErr != nil {
+		return updateErr
+	}
+	return nil
 }
 
 func (s *Service) SetPrivateKey(ctx context.Context, id int64, pem string) error {

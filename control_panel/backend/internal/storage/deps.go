@@ -5,29 +5,53 @@ import (
 	"strings"
 )
 
-// DetectPMOutput returns the shell command that probes for the available
-// package manager. It echoes "yum", "dnf", or "apt" for whichever exists on
-// the target host. The command is a fixed string (no user input) to prevent
-// command injection.
+// DetectPMOutput returns one available package manager and exits zero as soon
+// as it finds one. A single conditional chain is important: independent
+// semicolon-separated probes would inherit the exit code of the final missing
+// command and falsely fail on RHEL hosts without apt.
 func DetectPMOutput() string {
-	return "command -v yum >/dev/null 2>&1 && echo yum; command -v dnf >/dev/null 2>&1 && echo dnf; command -v apt >/dev/null 2>&1 && echo apt"
+	return "if command -v dnf >/dev/null 2>&1; then echo dnf; exit 0; elif command -v yum >/dev/null 2>&1; then echo yum; exit 0; elif command -v apt-get >/dev/null 2>&1; then echo apt; exit 0; else exit 1; fi"
 }
 
 // ParsePM parses the output of DetectPMOutput and returns the package manager
-// to use. Priority: yum > dnf > apt (yum wins on RHEL8 where yum is a dnf
-// symlink and both echo). Uses substring containment so output order does not
-// matter - yum is always checked first regardless of which line appears first.
+// to use. Priority follows the detection chain: dnf > yum > apt.
 func ParsePM(stdout string) (string, error) {
-	if strings.Contains(stdout, "yum") {
-		return "yum", nil
-	}
 	if strings.Contains(stdout, "dnf") {
 		return "dnf", nil
+	}
+	if strings.Contains(stdout, "yum") {
+		return "yum", nil
 	}
 	if strings.Contains(stdout, "apt") {
 		return "apt", nil
 	}
 	return "", fmt.Errorf("unsupported distro (no yum/dnf/apt found): %q", stdout)
+}
+
+// DetectPrivilegeCmd determines whether commands can run directly as root or
+// through non-interactive sudo. Interactive sudo is intentionally unsupported.
+func DetectPrivilegeCmd() string {
+	return `if [ "$(id -u)" = "0" ]; then echo root; exit 0; elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then echo sudo; exit 0; else echo none; exit 1; fi`
+}
+
+func ParsePrivilege(stdout string) (string, error) {
+	for _, line := range strings.Fields(stdout) {
+		if line == "root" || line == "sudo" {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("root or passwordless sudo is required")
+}
+
+// PrivilegedCmd wraps a fixed command for execution via passwordless sudo.
+// The caller only supplies commands assembled by this package, never raw user
+// input. Single quotes are escaped using the standard POSIX shell sequence.
+func PrivilegedCmd(mode, command string) string {
+	if mode == "root" {
+		return command
+	}
+	escaped := strings.ReplaceAll(command, "'", `'"'"'`)
+	return "sudo -n sh -c '" + escaped + "'"
 }
 
 // CheckDepsCmd returns the shell command that checks whether lvm2 and nfs

@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"xirang/control_panel/internal/db"
-	"xirang/control_panel/internal/tasks"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/tasks"
 )
 
 // TestCreateSvcHandlerCreatesService drives the full task pipeline: submit a
@@ -172,7 +172,7 @@ func TestCreateNPHandlerCreatesNetworkPolicy(t *testing.T) {
 
 	params := map[string]any{
 		"namespace": "ns1", "pod_name": "p1", "pod_uid": "uid-1",
-		"pod_selector": map[string]string{"app": "p1"},
+		"pod_selector":  map[string]string{"app": "p1"},
 		"ingress_ports": []map[string]any{{"protocol": "TCP", "port": 31555}},
 	}
 	id, err := eng.Submit(context.Background(), "k8s_create_np", "k8s", 1, params)
@@ -237,6 +237,137 @@ func TestDeleteNPHandlerDeletesNetworkPolicy(t *testing.T) {
 	}
 }
 
+func TestCreateSvcHandlerSimplifiedMappingsAndAutomaticNodePort(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	cs := fake.NewSimpleClientset()
+	RegisterK8sHandlers(eng, cs)
+
+	params := map[string]any{
+		"namespace": "ns1", "pod_name": "p1", "pod_uid": "uid-1",
+		"selector": map[string]string{"app": "p1"},
+		"mappings": []map[string]any{
+			{"pod_port": 8888, "node_port": 31088},
+			{"pod_port": 6006},
+		},
+	}
+	id, err := eng.Submit(context.Background(), "k8s_create_svc", "k8s", 1, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "succeeded", 2*time.Second)
+
+	svcs, err := ListServices(context.Background(), cs, "ns1")
+	if err != nil || len(svcs) != 1 {
+		t.Fatalf("expected 1 svc: svcs=%+v err=%v", svcs, err)
+	}
+	svc := svcs[0]
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		t.Fatalf("type wrong: %v", svc.Spec.Type)
+	}
+	if len(svc.Spec.Ports) != 2 {
+		t.Fatalf("expected 2 ports, got %d: %+v", len(svc.Spec.Ports), svc.Spec.Ports)
+	}
+	if svc.Spec.Ports[0].Port != 8888 || svc.Spec.Ports[0].TargetPort.IntVal != 8888 || svc.Spec.Ports[0].NodePort != 31088 {
+		t.Fatalf("explicit node_port port wrong: %+v", svc.Spec.Ports[0])
+	}
+	if svc.Spec.Ports[1].Port != 6006 || svc.Spec.Ports[1].TargetPort.IntVal != 6006 || svc.Spec.Ports[1].NodePort != 0 {
+		t.Fatalf("automatic node_port port wrong: %+v", svc.Spec.Ports[1])
+	}
+
+	nps, _ := ListNetworkPolicies(context.Background(), cs, "ns1")
+	if len(nps) != 1 || len(nps[0].Spec.Ingress[0].Ports) != 2 {
+		t.Fatalf("network policy target ports wrong: %+v", nps)
+	}
+}
+
+func TestUpdateSvcHandlerReplacesPortsAndSyncsNetworkPolicy(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	cs := fake.NewSimpleClientset()
+	RegisterK8sHandlers(eng, cs)
+
+	createParams := map[string]any{
+		"name": "s1", "namespace": "ns1", "pod_name": "p1", "pod_uid": "uid-1",
+		"selector": map[string]string{"app": "p1"},
+		"mappings": []map[string]any{{"pod_port": 8888, "node_port": 31088}},
+	}
+	cid, err := eng.Submit(context.Background(), "k8s_create_svc", "k8s", 1, createParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, idWrap(cid), "succeeded", 2*time.Second)
+
+	svcName := "s1"
+
+	updateParams := map[string]any{
+		"namespace": "ns1", "name": svcName,
+		"mappings": []map[string]any{
+			{"pod_port": 9000, "node_port": 31090},
+			{"pod_port": 9001},
+		},
+	}
+	uid, err := eng.Submit(context.Background(), "k8s_update_svc", "k8s", 1, updateParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, idWrap(uid), "succeeded", 2*time.Second)
+
+	updatedSvc, err := cs.CoreV1().Services("ns1").Get(context.Background(), svcName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updatedSvc.Spec.Ports) != 2 || updatedSvc.Spec.Ports[0].Port != 9000 || updatedSvc.Spec.Ports[1].Port != 9001 {
+		t.Fatalf("updated svc ports wrong: %+v", updatedSvc.Spec.Ports)
+	}
+
+	nps, _ := ListNetworkPolicies(context.Background(), cs, "ns1")
+	if len(nps) != 1 || len(nps[0].Spec.Ingress[0].Ports) != 2 {
+		t.Fatalf("updated network policy ports wrong: %+v", nps)
+	}
+	if nps[0].Spec.Ingress[0].Ports[0].Port.IntVal != 9000 || nps[0].Spec.Ingress[0].Ports[1].Port.IntVal != 9001 {
+		t.Fatalf("updated policy target ports wrong: %+v", nps[0].Spec.Ingress[0].Ports)
+	}
+}
+
+func TestUpdateSvcHandlerEmptyMappingsDeletesServiceAndPolicy(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	cs := fake.NewSimpleClientset()
+	RegisterK8sHandlers(eng, cs)
+
+	createParams := map[string]any{
+		"name": "s2", "namespace": "ns1", "pod_name": "p1", "pod_uid": "uid-1",
+		"selector": map[string]string{"app": "p1"},
+		"mappings": []map[string]any{{"pod_port": 8888, "node_port": 31088}},
+	}
+	cid, _ := eng.Submit(context.Background(), "k8s_create_svc", "k8s", 1, createParams)
+	waitFor(t, store, idWrap(cid), "succeeded", 2*time.Second)
+
+	svcName := "s2"
+
+	updateParams := map[string]any{
+		"namespace": "ns1", "name": svcName,
+		"mappings": []map[string]any{},
+	}
+	uid, _ := eng.Submit(context.Background(), "k8s_update_svc", "k8s", 1, updateParams)
+	waitFor(t, store, idWrap(uid), "succeeded", 2*time.Second)
+
+	remainingSvcs, _ := ListServices(context.Background(), cs, "ns1")
+	if len(remainingSvcs) != 0 {
+		t.Fatalf("expected 0 svcs after empty update, got %d", len(remainingSvcs))
+	}
+	remainingNPs, _ := ListNetworkPolicies(context.Background(), cs, "ns1")
+	if len(remainingNPs) != 0 {
+		t.Fatalf("expected 0 nps after empty update, got %d", len(remainingNPs))
+	}
+}
+
+func idWrap(id int64) int64 { return id }
+
 // TestNilClientFailsTask verifies the nil-client guard: a k8s task submitted
 // while the panel runs without an in-cluster client (main.go registers the
 // handlers even then) fails cleanly instead of nil-deref panicking inside the
@@ -275,8 +406,12 @@ func waitFor(t *testing.T, store *db.Store, id int64, want string, timeout time.
 	}
 	got, _ := store.GetTask(context.Background(), id)
 	status := "(unknown)"
+	errStr := ""
 	if got != nil {
 		status = got.Status
+		if got.Error != nil {
+			errStr = *got.Error
+		}
 	}
-	t.Fatalf("task %d never reached %s (last status=%s)", id, want, status)
+	t.Fatalf("task %d never reached %s (last status=%s, err=%s)", id, want, status, errStr)
 }

@@ -3,6 +3,8 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -27,6 +29,48 @@ func setup(t *testing.T) *Service {
 	sshm := ssh.NewManager(c, 2, 0)
 	eng := tasks.NewEngine(s)
 	return NewService(s, c, sshm, eng)
+}
+
+type workerSSHStub struct {
+	testErr error
+}
+
+func (s *workerSSHStub) Run(_ context.Context, _ db.WorkerNode, _ string) (string, string, int, error) {
+	return "", "", 0, nil
+}
+func (s *workerSSHStub) RunWithStdin(_ context.Context, _ db.WorkerNode, _ string, _ io.Reader) (string, string, int, error) {
+	return "", "", 0, nil
+}
+func (s *workerSSHStub) TestConnection(_ context.Context, _ db.WorkerNode) error { return s.testErr }
+
+func TestConnectionPersistsWorkerStatus(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "health.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cipher, _ := crypto.New(make([]byte, 32))
+	engine := tasks.NewEngine(store)
+	stub := &workerSSHStub{}
+	svc := NewService(store, cipher, stub, engine)
+	id, _ := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
+
+	if err := svc.TestConnection(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := store.GetWorker(context.Background(), id)
+	if worker.Status != "online" || worker.LastSeenAt == nil || worker.LastCheckedAt == nil {
+		t.Fatalf("successful test did not persist online status: %+v", worker)
+	}
+
+	stub.testErr = errors.New("connection refused")
+	if err := svc.TestConnection(context.Background(), id); err == nil {
+		t.Fatal("expected connection failure")
+	}
+	worker, _ = store.GetWorker(context.Background(), id)
+	if worker.Status != "offline" || worker.StatusError == nil || *worker.StatusError != "connection refused" {
+		t.Fatalf("failed manual test did not persist offline status: %+v", worker)
+	}
 }
 
 func TestCreateAndGet(t *testing.T) {

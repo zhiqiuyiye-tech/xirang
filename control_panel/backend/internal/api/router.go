@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
@@ -21,9 +22,19 @@ type RouterOptions struct {
 	CSRFHeaderName string
 	RequireK8s     bool
 	TrustedProxies []string
+	Collector      storageCollector
+	StaleAfter     time.Duration
 }
 
 type RouterOption func(*RouterOptions)
+
+func WithCollector(c storageCollector) RouterOption {
+	return func(o *RouterOptions) { o.Collector = c }
+}
+
+func WithStaleAfter(d time.Duration) RouterOption {
+	return func(o *RouterOptions) { o.StaleAfter = d }
+}
 
 func WithRateLimiter(l *auth.RateLimiter) RouterOption {
 	return func(o *RouterOptions) { o.RateLimiter = l }
@@ -180,21 +191,30 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		kh := &k8sHandlers{eng: eng, store: store, client: k8sClient}
 		authed.POST("/k8s/services", kh.createService)
 		authed.GET("/k8s/services", kh.listServices)
+		authed.PUT("/k8s/services/:name", kh.updateService)
 		authed.DELETE("/k8s/services/:name", kh.deleteService)
 		authed.POST("/k8s/network-policies", kh.createNetworkPolicy)
 		authed.GET("/k8s/network-policies", kh.listNetworkPolicies)
 		authed.DELETE("/k8s/network-policies/:name", kh.deleteNetworkPolicy)
 		authed.GET("/k8s/nodes", kh.listNodes)
 		authed.GET("/k8s/pods", kh.listPods)
+		authed.PUT("/k8s/notebooks/:namespace/:name/metadata", kh.updateNotebookMetadata)
 
 		// Storage endpoints: provision and reclaim are async.
-		sh := &storageHandlers{eng: eng, store: store, runner: sshRunner}
+		sh := &storageHandlers{
+			eng:        eng,
+			store:      store,
+			runner:     sshRunner,
+			collector:  options.Collector,
+			staleAfter: options.StaleAfter,
+		}
 		authed.POST("/storage/provision", sh.provision)
 		authed.POST("/storage/reclaim", sh.reclaim)
 		authed.GET("/storage", sh.list)
 		authed.GET("/storage/vgs", sh.listVgs)
 		authed.GET("/storage/inventory", sh.listInventory)
 		authed.GET("/storage/nfs-hosts", sh.listNFSHosts)
+		authed.POST("/storage/refresh", sh.refresh)
 		authed.POST("/storage/vg", sh.createVG)
 		authed.POST("/storage/lv/resize", sh.resizeLV)
 		authed.POST("/storage/lv/delete", sh.deleteLV)
