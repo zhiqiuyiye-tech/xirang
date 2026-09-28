@@ -1,7 +1,7 @@
 # 控制面板 ECDSA P-256 私钥文件登录设计
 
 - 日期：2026-09-28
-- 状态：修订版，待用户复审
+- 状态：已审阅/冻结（实现 Baseline）
 
 ## 目标与信任边界
 
@@ -18,11 +18,11 @@
 
 `admin.auth_state` 使用以下状态：
 
-- `PASSWORD_BOOTSTRAP`：尚未登记公钥；只有首次登记接口允许验证 bcrypt 密码。
-- `KEY_ACTIVE`：公钥有效；密码登录和引导接口均关闭，`password_hash` 替换成不可验证的 `__DISABLED_AFTER_KEY_BOOTSTRAP__` 标记。
-- `RECOVERY_PENDING`：仅由运维离线恢复流程设置；服务启动时使用 `ADMIN_INIT_PASSWORD` 重新生成 bcrypt 哈希，并转为 `PASSWORD_BOOTSTRAP`。
+- `PASSWORD_BOOTSTRAP`：尚未登记公钥；`public_key_pem` 与 `public_key_fingerprint` 必须为 `NULL`，`password_hash` 必须是可验证的 bcrypt 哈希；只有首次登记接口允许验证密码。
+- `KEY_ACTIVE`：公钥有效；`public_key_pem` 必须是可解析的规范 P-256 SPKI PEM，指纹必须与规范 DER 的 SHA-256 一致，`password_hash` 必须为 `__DISABLED_AFTER_KEY_BOOTSTRAP__`；密码登录和引导接口均关闭。
+- `RECOVERY_PENDING`：仅允许作为离线恢复后的启动过渡态；公钥与指纹必须为 `NULL`，`password_hash` 必须为 `__PENDING_INIT__`。此状态不能提供任何 HTTP 服务；启动恢复后转为 `PASSWORD_BOOTSTRAP`。
 
-任何状态/公钥/密码哈希组合不一致时均失败关闭，不根据“公钥为空”单独启用密码引导。首次建库时，启动 seed 逻辑把 `__PENDING_INIT__` 哈希替换成 `ADMIN_INIT_PASSWORD` 的 bcrypt 哈希并设置为 `PASSWORD_BOOTSTRAP`；恢复启动按下文恢复状态转换执行。
+管理员记录必须严格符合上述字段组合。服务在创建 HTTP listener 前检查并拒绝任何不一致、无效公钥或未知状态；`ADMIN_INIT_PASSWORD` 缺失/为空时，配置加载必须在 HTTP 服务启动前失败，包括 `KEY_ACTIVE` 状态，因为它是唯一离线恢复凭据。首次建库时，启动 seed 逻辑把 `__PENDING_INIT__` 哈希替换成该 Secret 的 bcrypt 哈希并设置为 `PASSWORD_BOOTSTRAP`；恢复启动按下文转换。
 
 ## 数据迁移
 
@@ -32,6 +32,8 @@
 - 新增 `auth_challenges`：`challenge_id`、`nonce`、`purpose`、`auth_version`、`key_fingerprint`、`new_key_fingerprint`、`client_ip`、`created_at`、`expires_at`、`consumed_at`。
 - 对既有 admin 只递增一次 `auth_version`，撤销升级前签发的全部会话。
 - 为挑战过期时间与客户端 IP 建索引。每次创建挑战时清理过期记录，并清理超过 24 小时的已消费记录。
+- 当前版本只支持单进程、单副本和本地持久化 SQLite；Helm/原始部署必须保持 `replicas: 1`，不支持共享 SQLite 文件的多副本或水平扩展。
+- `db.Open` 在运行任何迁移前执行 `SELECT sqlite_version()` 并要求 runtime `>= 3.35.0`，以保证 `UPDATE ... RETURNING` 可用；缺少或低于要求时启动失败。当前 `modernc.org/sqlite v1.54.0` 实际查询结果为 `3.53.3`。
 
 ## 密钥与签名协议
 
@@ -56,7 +58,9 @@
 
 ## Challenge 状态机
 
-挑战有效期为 2 分钟，服务端用 `crypto/rand` 生成随机 ID 和 nonce，并在 SQLite 记录其用途、签发时 `auth_version`、当前/目标密钥指纹和客户端 IP。
+挑战有效期为 2 分钟，服务端用 `crypto/rand` 生成随机 ID 和 nonce，并在 SQLite 记录其用途、签发时 `auth_version`、当前/目标密钥指纹和客户端 IP。`client_ip` 只用于来源限流、pending 计数与审计，不参与签名消息、challenge 认证条件或 Session 绑定；改变客户端 IP 本身不能使有效签名失效。
+
+创建 challenge、清理旧记录、统计当前来源及全局未完成 challenge 数、判断上限和插入新行必须在同一个 SQLite 写事务中完成，使用立即取得写锁的事务模式或等价原子 SQL，避免并发请求同时越过 pending 上限。当前版本仅支持一个服务进程和单副本 SQLite。
 
 | 用途 | 签发条件 | 绑定字段 | 消费方式 |
 |---|---|---|---|
@@ -74,15 +78,15 @@
 2. 首次引导页面调用安全随机源生成 P-256 密钥对，生成 PKCS#8 PEM 并触发下载。前端不以“我已保存”复选框作为成功条件。
 3. 释放最初生成的密钥对象后，要求用户重新选择刚下载的 PEM。前端从文件重新解析私钥，计算公钥和指纹，并确认签名能通过本地解析；不声称浏览器能可靠擦除所有字符串/垃圾回收副本。
 4. 前端用新公钥申请 `BOOTSTRAP` challenge，提交初始化密码、公钥、challenge ID 和新私钥持有证明。
-5. 服务端校验 `auth_state`、密码、challenge 版本/用途/候选指纹及 PoP；在单一数据库事务中用 `auth_state='PASSWORD_BOOTSTRAP' AND public_key_pem IS NULL AND auth_version=?` 条件写入公钥与指纹、把状态改为 `KEY_ACTIVE`、把密码哈希设为禁用标记并递增 `auth_version`。只有一个并发首次登记可以成功。
-6. 成功后设置 Cookie 会话并写审计记录；任何密码接口在 `KEY_ACTIVE` 下都不能创建会话。
+5. 服务端校验 `auth_state`、密码、challenge 版本/用途/候选指纹及 PoP；在单一数据库事务中用 `auth_state='PASSWORD_BOOTSTRAP' AND public_key_pem IS NULL AND auth_version=?` 条件写入公钥与指纹、把状态改为 `KEY_ACTIVE`、把密码哈希设为禁用标记，并通过同一 CAS/事务返回递增后的 `auth_version`。只有一个并发首次登记可以成功。
+6. 成功后仅用事务返回的 `auth_version` 签发 Cookie Session 并写审计记录；禁止在提交后重新读取“当前最新版本”来生成 Session。若期间版本再变化，该 Session 必须保持旧版本并在后续请求中失败。
 
 ## 日常登录流程
 
 1. 用户选择私钥 PEM；浏览器限大小读取并解析，不保存到 `localStorage`、`IndexedDB`、URL 或 DOM。
 2. `POST /api/v1/auth/challenges/login` 创建 `LOGIN` challenge，响应包含 ID、nonce、签发时版本、当前密钥指纹和过期时间。
 3. 浏览器按上述登录消息计算一次 SHA-256，并使用当前私钥产生 raw `r || s` 签名；提交给 `POST /api/v1/auth/login`。
-4. 服务端原子消费 challenge，校验状态、版本、指纹、公钥曲线和签名；成功后仅设置会话及 CSRF Cookie。
+4. 服务端原子消费 challenge，校验状态、版本、指纹、公钥曲线和签名；仅当管理员当前版本仍等于 challenge 的 `auth_version` 时签发 Session，Session 必须使用 `challenge.auth_version`。禁止验证成功后重新读取最新版本再签发；若并发轮换先完成，旧 challenge 登录失败或得到旧版本且立即无效的 Session。
 
 认证失败使用通用响应。Challenge 过期、已消费、用途/版本/指纹不匹配、曲线错误、签名错误都拒绝。challenge、签名、私钥和密码内容不得进入应用日志或错误消息。
 
@@ -94,8 +98,9 @@
 2. 浏览器生成新密钥并下载新的 PEM，随后释放生成状态并要求操作者重新选择该新文件；从重新导入的文件派生公钥、计算指纹，避免下载内容与提交公钥不一致。
 3. 浏览器以当前 Session + CSRF 调用 `POST /api/v1/auth/challenges/rotate`，提交候选新公钥。服务端验证并绑定当前 `auth_version`、当前指纹和候选新指纹。
 4. 操作者当前私钥签署轮换授权消息，新私钥签署 PoP 消息。`PUT /api/v1/auth/key` 必须同时验证 Session + CSRF、challenge、版本、两把公钥指纹及两份签名。
-5. 数据库使用 CAS 更新：仅当 `auth_state='KEY_ACTIVE'`、`auth_version` 和当前指纹仍与 challenge 完全相同时替换公钥、指纹并递增版本；检查 `RowsAffected == 1`。失败返回冲突并要求重新开始，不允许最后写入覆盖。
-6. 成功后撤销所有旧会话和旧密钥，给当前操作者设置新版本 Cookie；所有共用密钥的人必须通过受控渠道获取新文件。
+5. 数据库使用 CAS 更新并在同一事务返回新 `auth_version`：仅当 `auth_state='KEY_ACTIVE'`、`auth_version` 和当前指纹仍与 challenge 完全相同时替换公钥/指纹并递增版本；检查 `RowsAffected == 1`。失败返回冲突并要求重新开始，不允许最后写入覆盖。
+6. 成功后只能用该 CAS/事务返回的新版本签发当前浏览器的 Cookie Session，禁止提交后重新读取“最新版本”。
+7. 版本递增撤销所有其他旧会话和旧密钥；当前浏览器得到新版本 Cookie。所有共用密钥的人必须通过受控渠道获取新文件。
 
 如果 Session 被动泄漏，持有人可在会话有效期内执行其他完整权限操作，但没有当前私钥便不能把认证根密钥替换为自己的密钥。主动 MITM 仍可窃取私钥，HTTP 无法提供对此的保护。
 
@@ -108,20 +113,25 @@
 - `POST /api/v1/auth/bootstrap`：接受 `{password, public_key_pem, challenge_id, proof_signature}`；仅首次引导有效。
 - `POST /api/v1/auth/challenges/rotate`：认证并通过 CSRF 校验，接受新公钥并创建 `KEY_ROTATE` challenge。
 - `PUT /api/v1/auth/key`：认证并通过 CSRF 校验，接受 `{challenge_id, new_public_key_pem, current_signature, proof_signature}`。
+- `POST /api/v1/auth/logout`：仅清除当前浏览器的 session/CSRF Cookie 并记录 `auth.logout_current`，不递增全局 `auth_version`；已复制的 Cookie 和其他浏览器会话继续有效直至过期/撤销。
+- `POST /api/v1/auth/logout-all`：要求认证与 CSRF 校验，递增全局 `auth_version` 使所有会话失效，并清除发起请求的浏览器 Cookie，记录 `auth.logout_all`。
 - `PUT /api/v1/auth/password` 和密码修改 UI 移除。
 - Browser auth 成功响应不在 JSON 中回显 JWT 或 CSRF token；前端只用当前同源 Cookie。现有鉴权中间件在每个受保护 HTTP 请求上读取数据库对比 `auth_version`，此行为必须保留并测试。任务 SSE 使用同源 Cookie。
 
 ## 会话、限流与代理来源
 
-- HTTP 下会话 Cookie 保持 `HttpOnly=true`、`Secure=false`（仅因部署限制）、`SameSite=Strict`、`Path=/`、不设 `Domain`。登录、引导、轮换都重新设置会话和 CSRF Cookie；退出仍递增 `auth_version` 并过期 Cookie。
-- JWT 默认有效期从现有 4 小时缩短为 30 分钟，保留 `JWT_TTL` 运维配置；HTTP 生产配置不得超过 30 分钟，不增加 refresh token。缩短时长只能限制被动窃取 Session 的可用窗口，不能防止当前窗口内的管理员操作。
-- 认证中间件对每个受保护 HTTP 请求从数据库校验 `auth_version`；SSE 在建立连接时也校验版本，且必须在心跳时重新校验 JWT 过期时间和当前版本，过期或撤销后关闭连接。
-- Challenge 创建本身单独限流，不依赖“失败次数”限流：默认每 IP 每分钟 10 次、每 IP 最多 5 个未完成 challenge、全局最多 1000 个未完成 challenge；具体值可配置。达到上限返回 429/503，不插入新记录。认证失败继续使用现有失败锁定机制。
+- HTTP 下会话 Cookie 保持 `HttpOnly=true`、`Secure=false`（仅因部署限制）、`SameSite=Strict`、`Path=/`、不设 `Domain`。登录、引导、轮换都重新设置会话和 CSRF Cookie；普通退出仅清除当前浏览器 Cookie，全局退出才递增 `auth_version` 并撤销所有会话。
+- JWT TTL 默认及上限均为 30 分钟；`JWT_TTL` 超过 30 分钟时配置加载拒绝启动，不增加 refresh token。启动时强制校验上限，而不只依赖文档约定。缩短时长只能限制被动窃取 Session 的可用窗口，不能防止当前窗口内的管理员操作。
+- 认证中间件对每个受保护 HTTP 请求从数据库校验 `auth_version`；SSE 使用同源 Cookie，在连接建立后持续检查过期时间和当前版本，最多每 30 秒重新验证一次（有事件时可提前检查）；版本撤销或过期后关闭流，撤销延迟上限为 30 秒。
+- Challenge 创建本身单独限流，不依赖“失败次数”限流：默认每 IP 每分钟 10 次、每 IP 最多 5 个未完成 challenge、全局最多 1000 个未完成 challenge；具体值可配置。达到上限返回 429/503，不插入新记录。
+- 签名失败只触发按解析后来源 IP 计数的进程内限流/有界退避；不得持久化 `admin` 锁定状态、不得让一个来源锁住其他来源，也不得在签名失败时递增 `auth_version`。失败审计受限流约束，避免数据库被日志写入耗尽。
 - 限流 IP 只可来自安全解析的 `RemoteAddr` 或显式配置的可信代理。路由器必须总是显式配置 Gin trusted proxies：没有 `TRUSTED_PROXIES` 时禁用所有转发头信任并使用 `RemoteAddr`；有配置时仅信任配置的 CIDR，代理必须清洗客户端传入的 XFF。无效代理配置应导致启动失败，禁止直接相信任意 `X-Forwarded-For`。
-- 审计记录初始化、成功/失败登录、限流、密钥轮换与恢复；不记录密码、私钥、nonce 或签名。认证相关响应、登录 HTML 和静态签名逻辑资源设置 `Cache-Control: no-store`。
+- `client_ip` 只参与上述来源限流、pending 计数和审计，不参与签名、密钥选择、Session 认证或 IP 绑定。
+- 审计记录初始化、成功/失败登录、限流、密钥轮换和两种退出操作；不记录密码、私钥、nonce 或签名。认证相关响应、登录 HTML 和静态签名逻辑资源设置 `Cache-Control: no-store`。
 
 ## 前端密码学与 XSS 防护
 
+- 登录页根据 `/auth/status` 显示首次密钥登记或私钥文件登录；首次登记和轮换均要求下载后重新选择 PEM 验证。设置区提供独立的密钥轮换、“退出当前浏览器”和“退出所有会话”操作。
 - 随项目发布固定版本、固定来源并附许可证的成熟 P-256 JavaScript 库；不从 CDN 加载，不自行实现椭圆曲线或伪随机数。
 - 私钥生成必须只使用 `crypto.getRandomValues()`；该 API 不可用时立即失败，不回退到 `Math.random()`、时间戳或自行实现的 PRNG。ECDSA 签名优先使用 RFC 6979 deterministic ECDSA；若库依赖随机签名 nonce，必须使用上述 CSPRNG 且通过固定互操作向量验证。
 - 选择库时记录版本、源码/发布物 hash 和许可证；升级必须重跑 Go ↔ JS 双向固定向量测试。测试比较“JS 签名、Go 验证”和“Go 签名、JS 验证”，不要求不同随机签名每次字节相同。
@@ -138,10 +148,12 @@
 ## 验证标准
 
 - 单元与数据库测试：正确/错误签名、错误长度、非 P-256、错误 PEM、r/s 越界、非 canonical base64url、超大请求、过期挑战、重复消费、purpose 不匹配、版本变化、指纹变化。
-- 并发测试：100 个 goroutine 同时提交一个登录 challenge 只能一个成功；两个相同 `auth_version` 的轮换只能一个 CAS 成功；并发首次登记只能一个成功。
+- 并发测试：100 个 goroutine 同时提交一个登录 challenge 只能一个成功；两个相同 `auth_version` 的轮换只能一个 CAS 成功；并发首次登记只能一个成功；并发 challenge 创建不能突破 per-IP/global pending 上限。
 - 轮换/引导测试：登录签名有效但缺当前轮换签名则拒绝；新公钥无 PoP 或 PoP 不匹配则拒绝；重新导入下载 PEM 后导出的指纹必须与待登记公钥一致；旧 key/challenge 在版本变化后失败。
-- 状态与会话测试：公钥存在时密码永远不能登录；bootstrap 成功禁用 password hash；恢复只通过 `RECOVERY_PENDING` 重建；认证 middleware 每个请求校验版本；SSE 在会话过期/版本撤销后关闭；登录/轮换后旧 Session 失效，只为当前请求签发一个新版本 Session；cookie 配置、JWT TTL 上限和 no-store 响应正确。
-- 限流/来源测试：challenge flood 触发 per-IP/global/pending 上限；伪造 `X-Forwarded-For` 在未配置可信代理时不能绕过限流；只接受配置 CIDR 的代理转发地址。
+- 状态与会话测试：公钥存在时密码永远不能登录；bootstrap 成功禁用 password hash；恢复只通过 `RECOVERY_PENDING` 重建；所有状态字段组合、缺失 Secret、无效公钥和 SQLite 版本不足均在 HTTP listener 建立前失败；认证 middleware 每个请求校验版本。
+- Session 版本测试：登录只能签发 challenge 记录中的 `auth_version`；bootstrap/rotation 只能使用 CAS/事务返回的新版本；测试并发版本变化时不会重新读取最新版本为旧 challenge 签发新权限 Session。验证当前浏览器退出不撤销其他 Session，全局退出撤销全部 Session。
+- SSE 在会话过期/版本撤销后 30 秒内关闭；JWT TTL 超过 30 分钟时应用启动失败；Cookie、no-store 与只在 Cookie 中返回凭证的响应正确。
+- 限流/来源测试：challenge flood 触发 per-IP/global/pending 上限；pending 统计和创建原子执行；伪造 `X-Forwarded-For` 在未配置可信代理时不能绕过限流；单一来源失败不会锁住其他来源或写入全局锁定状态；只接受配置 CIDR 的代理转发地址。
 - 审计和前端测试：审计不泄漏凭据；固定 Go↔JS 双向签名向量；浏览器文件重选流程、HTTP 内网首次登记/登录/轮换/恢复；私钥不进入持久化存储、URL、DOM、console 或 API 请求。
 - 在 `control_panel/backend` 目录运行 `go test ./...`，并验证静态 JS、CSP、部署模板和 Helm README。
 - 更新 `control_panel/deploy/README.md`、`control_panel/charts/control-panel/README.md` 与 Helm 默认配置，记录新的 cookie/session/challenge 限值、代理设置和 HTTP 风险。
