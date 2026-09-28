@@ -26,6 +26,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # PVCs and PVs: read-only (resolve Notebook Pod NFS mounts).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "persistentvolumes"]
+    verbs: ["get", "list"]
   # Nodes: read-only (discover cluster nodes to prefill worker records).
   - apiGroups: [""]
     resources: ["nodes"]

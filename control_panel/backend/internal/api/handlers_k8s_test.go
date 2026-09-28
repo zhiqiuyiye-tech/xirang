@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -469,5 +470,136 @@ func TestUpdateServiceViaAPI(t *testing.T) {
 	var resp map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp["task_id"] == nil {
 		t.Fatalf("invalid update response: %+v", resp)
+	}
+}
+
+func TestListPodsResolvesNFSClaimAndContainerMounts(t *testing.T) {
+	r, store, tk, cs := newRouterWithK8s(t)
+	ctx := context.Background()
+	workerID, err := store.CreateWorker(ctx, db.WorkerNode{
+		Name: "worker-a", Host: "WORKER-A.EXAMPLE.", Port: 22, Username: "root",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectedAt := time.Now().UTC()
+	payload := `{"nfs":{"active":true,"exports":["/exports/notebook"]},"lvs":[{"name":"lv_nb_200g","vg_name":"vg_data","size_gb":200,"size_known":true,"used_gb":83.5,"used_known":true,"free_gb":116.5,"free_known":true,"use_pct":"42%","use_pct_known":true,"mount_point":"/exports/notebook","is_nfs_export":true}]}`
+	if err := store.SaveInventorySnapshot(ctx, db.InventorySnapshot{
+		WorkerID: workerID, SchemaVersion: 1, PayloadJSON: payload,
+		CollectedAt: &collectedAt, LastAttemptedAt: collectedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "notebook-alice", Namespace: "ns1", UID: "pod-uid"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{Name: "workspace", VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "workspace-data"},
+			}}},
+			Containers: []corev1.Container{{Name: "notebook", VolumeMounts: []corev1.VolumeMount{{
+				Name: "workspace", MountPath: "/workspace/data", ReadOnly: true,
+			}}}},
+			InitContainers: []corev1.Container{{Name: "init", VolumeMounts: []corev1.VolumeMount{{
+				Name: "workspace", MountPath: "/init/data",
+			}}}},
+		},
+	}
+	if _, err := cs.CoreV1().Pods("ns1").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().PersistentVolumeClaims("ns1").Create(ctx, &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "workspace-data", Namespace: "ns1"},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-workspace"},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CoreV1().PersistentVolumes().Create(ctx, &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-workspace"},
+		Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{
+			NFS: &corev1.NFSVolumeSource{Server: "worker-a.example", Path: "/exports/notebook/user-data"},
+		}},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	stableKey, kind, workspaceID, projectID := k8s.StableKeyForPod("ns1", "pod-uid", nil)
+	if err := store.UpsertNotebookMetadata(ctx, db.NotebookMetadata{
+		StableKey: stableKey, KeyKind: kind, Namespace: "ns1", WorkspaceID: workspaceID,
+		ProjectID: projectID, LastPodUID: "pod-uid", OwnerName: "Alice", Note: "training data",
+		UpdatedBy: "admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/k8s/pods", nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var pods []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &pods); err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0]["nfs_mounts_status"] != "available" {
+		t.Fatalf("expected one Pod with an available NFS relation: %s", w.Body.String())
+	}
+	mounts, ok := pods[0]["nfs_mounts"].([]any)
+	if !ok || len(mounts) != 1 {
+		t.Fatalf("expected one PVC/PV relation: %s", w.Body.String())
+	}
+	mount := mounts[0].(map[string]any)
+	if mount["status"] != "matched" || mount["worker_id"] != float64(workerID) ||
+		mount["worker_name"] != "worker-a" || mount["lv_name"] != "lv_nb_200g" ||
+		mount["export_path"] != "/exports/notebook" || mount["pvc_name"] != "workspace-data" || mount["pv_name"] != "pv-workspace" {
+		t.Fatalf("resolved mount identity is wrong: %+v", mount)
+	}
+	if pods[0]["owner_name"] != "Alice" || pods[0]["note"] != "training data" {
+		t.Fatalf("existing Pod metadata was not retained: %+v", pods[0])
+	}
+	containerMounts, ok := mount["container_mounts"].([]any)
+	if !ok || len(containerMounts) != 2 {
+		t.Fatalf("expected regular and init container mounts: %+v", mount["container_mounts"])
+	}
+	capacity, ok := mount["capacity"].(map[string]any)
+	if !ok || capacity["known"] != true || capacity["scope"] != "volume" || capacity["lv_size_gb"] != float64(200) || capacity["filesystem_used_gb"] != 83.5 {
+		t.Fatalf("volume capacity has wrong values or scope: %+v", mount["capacity"])
+	}
+
+	hostReq := httptest.NewRequest("GET", "/api/v1/storage/nfs-hosts", nil)
+	hostReq.Header.Set("Authorization", authHeader(t, tk))
+	hostResp := httptest.NewRecorder()
+	r.ServeHTTP(hostResp, hostReq)
+	if hostResp.Code != http.StatusOK {
+		t.Fatalf("nfs-hosts code=%d body=%s", hostResp.Code, hostResp.Body.String())
+	}
+	var hosts []map[string]any
+	if err := json.Unmarshal(hostResp.Body.Bytes(), &hosts); err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 1 || hosts[0]["mount_association_status"] != "available" {
+		t.Fatalf("NFS host association summary missing: %s", hostResp.Body.String())
+	}
+	virtualDisks := hosts[0]["virtual_disks"].([]any)
+	mountedPods := virtualDisks[0].(map[string]any)["mounted_pods"].([]any)
+	if len(mountedPods) != 1 || mountedPods[0].(map[string]any)["owner_name"] != "Alice" {
+		t.Fatalf("reverse LV-to-Pod association missing: %s", hostResp.Body.String())
+	}
+
+	inventoryReq := httptest.NewRequest("GET", "/api/v1/storage/inventory?worker_id="+strconv.FormatInt(workerID, 10), nil)
+	inventoryReq.Header.Set("Authorization", authHeader(t, tk))
+	inventoryResp := httptest.NewRecorder()
+	r.ServeHTTP(inventoryResp, inventoryReq)
+	if inventoryResp.Code != http.StatusOK {
+		t.Fatalf("inventory code=%d body=%s", inventoryResp.Code, inventoryResp.Body.String())
+	}
+	var inventory map[string]any
+	if err := json.Unmarshal(inventoryResp.Body.Bytes(), &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if inventory["mount_association_status"] != "available" || inventory["unmatched_mounts"] == nil {
+		t.Fatalf("inventory association summary missing: %s", inventoryResp.Body.String())
 	}
 }

@@ -1421,3 +1421,103 @@ input.port-num-input {
         padding: 16px;
     }
 }
+
+/* NFS mount relationship details */
+.nfs-mount-list {
+    display: grid;
+    gap: 12px;
+}
+
+.nfs-mount-card {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    padding: 14px 16px;
+}
+
+.nfs-mount-card-header,
+.nfs-mount-identifiers {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.nfs-mount-identifiers {
+    justify-content: flex-start;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.nfs-mount-location,
+.nfs-container-mounts,
+.nfs-volume-capacity {
+    display: grid;
+    gap: 5px;
+    margin-top: 10px;
+    font-size: 12px;
+}
+
+.nfs-mount-location code,
+.nfs-container-mounts code,
+.nfs-mount-identifiers code {
+    overflow-wrap: anywhere;
+}
+
+.nfs-container-mounts,
+.nfs-volume-capacity {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 9px;
+}
+
+.nfs-volume-capacity {
+    background: var(--slate-50);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+}
+
+.nfs-mount-reason {
+    margin-top: 8px;
+    color: var(--warning-text);
+    font-size: 12px;
+}
+
+.nfs-mounted-pod-list {
+    min-width: 180px;
+}
+
+.nfs-mounted-pod-item + .nfs-mounted-pod-item {
+    border-top: 1px solid var(--border-subtle);
+    margin-top: 6px;
+    padding-top: 6px;
+}
+
+.nfs-mounted-pod-item {
+    font-size: 11.5px;
+    line-height: 1.5;
+}
+
+.nfs-mounted-pod-note {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.nfs-worker-warning:not(:empty) {
+    margin: 8px 0;
+    padding: 9px 12px;
+    border: 1px solid var(--warning-border);
+    border-radius: var(--radius-md);
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    font-size: 12px;
+}
+
+.nfs-worker-warning ul {
+    margin: 6px 0 0 18px;
+}
+
+.nfs-worker-warning li + li {
+    margin-top: 4px;
+}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,9 +26,10 @@ import (
 // nil client also return 503 - the underlying task handler would fail anyway,
 // and surfacing this synchronously gives the caller a clear signal.
 type k8sHandlers struct {
-	eng    *tasks.Engine
-	store  *db.Store
-	client kubernetes.Interface
+	eng        *tasks.Engine
+	store      *db.Store
+	client     kubernetes.Interface
+	staleAfter time.Duration
 }
 
 // --- Services ---
@@ -196,36 +198,22 @@ func (h *k8sHandlers) listNodes(c *gin.Context) {
 }
 
 // listPods: GET /api/v1/k8s/pods
-// Returns notebook pods across all namespaces, batch-joining owner_name and
-// note from notebook_metadata by their stable key.
+// Returns Notebook Pods with existing SQLite ownership metadata and their
+// request-time PVC/PV-to-NFS association state.
 func (h *k8sHandlers) listPods(c *gin.Context) {
 	if h.client == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
 		return
 	}
-	pods, err := k8s.ListNotebookPods(c, h.client)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	result := queryNFSAssociationsFromStore(c, h.client, h.store, h.staleAfter)
+	if result.podListFailed {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "pod_list_failed"})
 		return
 	}
-	keys := make([]string, 0, len(pods))
-	for _, p := range pods {
-		if p.StableKey != "" {
-			keys = append(keys, p.StableKey)
-		}
+	if result.pods == nil {
+		result.pods = []notebookPodMountResponse{}
 	}
-	if h.store != nil && len(keys) > 0 {
-		metaMap, _ := h.store.GetNotebookMetadataByKeys(c, keys)
-		for i := range pods {
-			if meta, ok := metaMap[pods[i].StableKey]; ok {
-				pods[i].OwnerName = meta.OwnerName
-				pods[i].Note = meta.Note
-				pods[i].UpdatedBy = meta.UpdatedBy
-				pods[i].MetadataUpdatedAt = &meta.UpdatedAt
-			}
-		}
-	}
-	c.JSON(http.StatusOK, pods)
+	c.JSON(http.StatusOK, result.pods)
 }
 
 // updateNotebookMetadata: PUT /api/v1/k8s/notebooks/:namespace/:name/metadata

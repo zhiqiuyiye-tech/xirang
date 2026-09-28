@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"math"
 	"path"
 	"regexp"
 	"sort"
@@ -17,20 +18,24 @@ import (
 // LVInfo is a logical volume on a worker node, with its size, mount point,
 // filesystem type, disk space usage, and NFS export status.
 type LVInfo struct {
-	VGName        string   `json:"vg_name"`
-	Name          string   `json:"name"`
-	SizeGB        float64  `json:"size_gb"`
-	UsedGB        float64  `json:"used_gb"`        // used space in GB (from df); 0 if unmounted
-	FreeGB        float64  `json:"free_gb"`        // remaining free space in GB (from df)
-	UsePct        string   `json:"use_pct"`        // usage percentage, e.g. "5%"
-	Path          string   `json:"path"`           // /dev/<vg>/<lv> (lv_path)
-	MountPoint    string   `json:"mount_point"`    // from lsblk join; empty if unmounted
-	FSType        string   `json:"fs_type"`        // from lsblk (reads superblock, works unmounted)
-	IsNFSExport   bool     `json:"is_nfs_export"`  // true if exported via NFS
-	NFSExportOpt  string   `json:"nfs_export_opt"` // export options e.g. "*(rw,sync)"
-	PVs           []string `json:"pvs"`
-	PhysicalDisks []string `json:"physical_disks"`
-	FreeKnown     bool     `json:"free_known"`
+	VGName                string   `json:"vg_name"`
+	Name                  string   `json:"name"`
+	SizeGB                float64  `json:"size_gb"`
+	SizeKnown             bool     `json:"size_known"`
+	CapacityValidityKnown bool     `json:"capacity_validity_known,omitempty"`
+	UsedGB                float64  `json:"used_gb"` // used space in GB (from df); 0 if unmounted
+	UsedKnown             bool     `json:"used_known"`
+	FreeGB                float64  `json:"free_gb"` // remaining free space in GB (from df)
+	UsePct                string   `json:"use_pct"` // usage percentage, e.g. "5%"
+	UsePctKnown           bool     `json:"use_pct_known"`
+	Path                  string   `json:"path"`           // /dev/<vg>/<lv> (lv_path)
+	MountPoint            string   `json:"mount_point"`    // from lsblk join; empty if unmounted
+	FSType                string   `json:"fs_type"`        // from lsblk (reads superblock, works unmounted)
+	IsNFSExport           bool     `json:"is_nfs_export"`  // true if exported via NFS
+	NFSExportOpt          string   `json:"nfs_export_opt"` // export options e.g. "*(rw,sync)"
+	PVs                   []string `json:"pvs"`
+	PhysicalDisks         []string `json:"physical_disks"`
+	FreeKnown             bool     `json:"free_known"`
 }
 
 // DiskInfo is an unused whole disk discovered on the worker - not mounted, has
@@ -122,9 +127,12 @@ type pvDetail struct {
 }
 
 type dfDetail struct {
-	UsedBytes  int64
-	AvailBytes int64
-	Capacity   string
+	UsedBytes     int64
+	AvailBytes    int64
+	Capacity      string
+	UsedKnown     bool
+	AvailKnown    bool
+	CapacityKnown bool
 }
 
 // NFSHostStatus represents an overall summary of a worker host running NFS,
@@ -266,11 +274,18 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 			// df -B1 -P output: Filesystem 1024-blocks Used Available Capacity Mounted on
 			fields := strings.Fields(line)
 			if len(fields) >= 6 && fields[0] != "Filesystem" {
-				usedB, _ := strconv.ParseInt(fields[2], 10, 64)
-				availB, _ := strconv.ParseInt(fields[3], 10, 64)
+				usedB, usedErr := strconv.ParseInt(fields[2], 10, 64)
+				availB, availErr := strconv.ParseInt(fields[3], 10, 64)
 				cap := fields[4]
+				pctText := strings.TrimSuffix(cap, "%")
+				pct, pctErr := strconv.ParseFloat(pctText, 64)
 				mp := strings.Join(fields[5:], " ")
-				dfMap[mp] = dfDetail{UsedBytes: usedB, AvailBytes: availB, Capacity: cap}
+				dfMap[mp] = dfDetail{
+					UsedBytes: usedB, AvailBytes: availB, Capacity: cap,
+					UsedKnown:     usedErr == nil && usedB >= 0,
+					AvailKnown:    availErr == nil && availB >= 0,
+					CapacityKnown: strings.HasSuffix(cap, "%") && pctErr == nil && pct >= 0 && !math.IsNaN(pct) && !math.IsInf(pct, 0),
+				}
 			}
 		case "nfs":
 			lower := strings.ToLower(line)
@@ -357,7 +372,9 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 				lv.UsedGB = bytesToGB(detail.UsedBytes)
 				lv.FreeGB = bytesToGB(detail.AvailBytes)
 				lv.UsePct = detail.Capacity
-				lv.FreeKnown = true
+				lv.UsedKnown = detail.UsedKnown
+				lv.FreeKnown = detail.AvailKnown
+				lv.UsePctKnown = detail.CapacityKnown
 			}
 			if opt, ok := exportsMap[lv.MountPoint]; ok {
 				lv.IsNFSExport = true
@@ -586,7 +603,8 @@ func parseLVLine(line string) (LVInfo, bool) {
 	name := strings.TrimSpace(parts[1])
 	sizeStr := strings.TrimSpace(parts[2])
 	lvPath := strings.TrimSpace(parts[3])
-	sizeGB, _ := strconv.ParseFloat(strings.TrimSuffix(sizeStr, "g"), 64)
+	sizeGB, sizeErr := strconv.ParseFloat(strings.TrimSuffix(sizeStr, "g"), 64)
+	sizeKnown := sizeErr == nil && sizeGB > 0 && !math.IsNaN(sizeGB) && !math.IsInf(sizeGB, 0)
 	pvs := make([]string, 0)
 	for _, rawDevice := range parts[4:] {
 		device := strings.TrimSpace(rawDevice)
@@ -597,7 +615,7 @@ func parseLVLine(line string) (LVInfo, bool) {
 			pvs = append(pvs, device)
 		}
 	}
-	return LVInfo{VGName: vg, Name: name, SizeGB: sizeGB, Path: lvPath, PVs: sortedUnique(pvs)}, true
+	return LVInfo{VGName: vg, Name: name, SizeGB: sizeGB, SizeKnown: sizeKnown, CapacityValidityKnown: true, Path: lvPath, PVs: sortedUnique(pvs)}, true
 }
 
 // lsblkPairRe matches key="value" pairs in lsblk -P output. Values may contain

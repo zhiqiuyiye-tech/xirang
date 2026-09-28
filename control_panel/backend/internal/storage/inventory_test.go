@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"testing"
 
@@ -326,4 +327,50 @@ func (e *errRunner) Run(_ context.Context, _ db.WorkerNode, _ string) (string, s
 }
 func (e *errRunner) RunWithStdin(_ context.Context, _ db.WorkerNode, _ string, _ io.Reader) (string, string, int, error) {
 	return "", "", 1, nil
+}
+
+func TestParseInventory_CapacityValidityIsIndependent(t *testing.T) {
+	const out = "###LVS###\n" +
+		"vg_data,lv_valid,200.00g,/dev/vg_data/lv_valid\n" +
+		"vg_data,lv_partial,invalid,/dev/vg_data/lv_partial\n" +
+		"###DF###\n" +
+		"Filesystem 1024-blocks Used Available Capacity Mounted on\n" +
+		"/dev/mapper/vg_data-lv_valid 200000000000 0 200000000000 0% /valid\n" +
+		"/dev/mapper/vg_data-lv_partial 1000000000 invalid 700000000 invalid /partial\n" +
+		"###LSBLK###\n" +
+		`NAME="vg_data-lv_valid" TYPE="lvm" SIZE="200000000000" MOUNTPOINT="/valid" FSTYPE="xfs" PKNAME=""` + "\n" +
+		`NAME="vg_data-lv_partial" TYPE="lvm" SIZE="1000000000" MOUNTPOINT="/partial" FSTYPE="xfs" PKNAME=""`
+
+	inv := parseInventory(out)
+	byName := map[string]LVInfo{}
+	for _, lv := range inv.LVs {
+		byName[lv.Name] = lv
+	}
+	assertJSONBool := func(name, field string, want bool) {
+		t.Helper()
+		encoded, err := json.Marshal(byName[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := fields[field].(bool)
+		if !ok || got != want {
+			t.Errorf("%s.%s = %v (present=%v), want %v; json=%s", name, field, got, ok, want, encoded)
+		}
+	}
+
+	assertJSONBool("lv_valid", "size_known", true)
+	assertJSONBool("lv_valid", "used_known", true)
+	assertJSONBool("lv_valid", "free_known", true)
+	assertJSONBool("lv_valid", "use_pct_known", true)
+	assertJSONBool("lv_partial", "size_known", false)
+	assertJSONBool("lv_partial", "used_known", false)
+	assertJSONBool("lv_partial", "free_known", true)
+	assertJSONBool("lv_partial", "use_pct_known", false)
+	if byName["lv_valid"].UsedGB != 0 || byName["lv_valid"].SizeGB != 200 {
+		t.Fatalf("zero used space or existing LV size was changed: %+v", byName["lv_valid"])
+	}
 }

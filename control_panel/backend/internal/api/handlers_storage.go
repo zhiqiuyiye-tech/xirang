@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/ssh"
@@ -29,6 +30,7 @@ type storageHandlers struct {
 	runner     ssh.Runner
 	collector  storageCollector
 	staleAfter time.Duration
+	client     kubernetes.Interface
 }
 
 // provision: POST /api/v1/storage/provision
@@ -125,25 +127,62 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 	}
 
 	refreshing := h.collector != nil && h.collector.IsInventoryRefreshing(wid)
-	snapshot, err := h.store.GetInventorySnapshot(c, wid)
-	if err != nil {
+	snapshot, snapshotErr := h.store.GetInventorySnapshot(c, wid)
+	if snapshotErr != nil {
+		snapshot = nil
 		if h.collector != nil && !refreshing {
 			h.collector.EnqueueInventory(wid)
 			refreshing = true
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"vgs":               []storage.VGInfo{},
-			"lvs":               []storage.LVInfo{},
-			"physical_disks":    []storage.PhysicalDiskInfo{},
-			"unused_disks":      []storage.DiskInfo{},
-			"nfs":               storage.NFSStatusInfo{Active: false, Exports: []string{}},
-			"data":              nil,
-			"collected_at":      nil,
-			"last_attempted_at": nil,
-			"stale":             true,
-			"refreshing":        refreshing,
-			"last_error":        nil,
-		})
+	}
+
+	workers, workerErr := h.store.ListWorkers(c)
+	snapshots, snapshotsErr := h.store.ListInventorySnapshots(c)
+	preflightErrorCode := ""
+	if workerErr != nil {
+		workers = []db.WorkerNode{}
+		preflightErrorCode = "worker_list_failed"
+	} else if snapshotsErr != nil {
+		snapshots = []db.InventorySnapshot{}
+		preflightErrorCode = "inventory_snapshot_list_failed"
+	}
+	associations := queryNFSAssociations(c, h.client, h.store, workers, parseNFSWorkerInventories(snapshots), h.staleAfter, preflightErrorCode)
+	state := associations.workers[wid]
+	if state == nil {
+		state = &workerMountAssociation{
+			status: "lookup_failed", errorCode: preflightErrorCode,
+			unmatchedMounts: []unmatchedNFSMountInfo{}, mountedPodsByLV: map[string][]mountedPodInfo{},
+		}
+		if associations.errorCode != "" {
+			state.errorCode = associations.errorCode
+		}
+		if state.errorCode == "" {
+			state.status = "none"
+		} else {
+			state.status = "lookup_failed"
+		}
+	}
+
+	if snapshot == nil {
+		emptyInventory := storage.InventoryInfo{
+			NFS: storage.NFSStatusInfo{Active: false, Exports: []string{}},
+			VGs: []storage.VGInfo{}, LVs: []storage.LVInfo{},
+			PhysicalDisks: []storage.PhysicalDiskInfo{}, UnusedDisks: []storage.DiskInfo{},
+		}
+		enriched := inventoryResponseWithMounts(emptyInventory, state)
+		response := gin.H{
+			"vgs": enriched.VGs, "lvs": enriched.LVs,
+			"physical_disks": enriched.PhysicalDisks, "unused_disks": enriched.UnusedDisks,
+			"nfs": enriched.NFS, "data": nil,
+			"collected_at": nil, "last_attempted_at": nil,
+			"stale": true, "refreshing": refreshing, "last_error": nil,
+			"mount_association_status": enriched.MountAssociationStatus,
+			"unmatched_mounts":         enriched.UnmatchedMounts,
+		}
+		if enriched.MountAssociationError != "" {
+			response["mount_association_error"] = enriched.MountAssociationError
+		}
+		c.JSON(http.StatusOK, response)
 		return
 	}
 
@@ -173,19 +212,20 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 		inv.NFS.Exports = []string{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"vgs":               inv.VGs,
-		"lvs":               inv.LVs,
-		"physical_disks":    inv.PhysicalDisks,
-		"unused_disks":      inv.UnusedDisks,
-		"nfs":               inv.NFS,
-		"data":              inv,
-		"collected_at":      snapshot.CollectedAt,
-		"last_attempted_at": snapshot.LastAttemptedAt,
-		"stale":             stale,
-		"refreshing":        refreshing,
-		"last_error":        snapshot.LastError,
-	})
+	enriched := inventoryResponseWithMounts(inv, state)
+	response := gin.H{
+		"vgs": enriched.VGs, "lvs": enriched.LVs,
+		"physical_disks": enriched.PhysicalDisks, "unused_disks": enriched.UnusedDisks,
+		"nfs": enriched.NFS, "data": enriched,
+		"collected_at": snapshot.CollectedAt, "last_attempted_at": snapshot.LastAttemptedAt,
+		"stale": stale, "refreshing": refreshing, "last_error": snapshot.LastError,
+		"mount_association_status": enriched.MountAssociationStatus,
+		"unmatched_mounts":         enriched.UnmatchedMounts,
+	}
+	if enriched.MountAssociationError != "" {
+		response["mount_association_error"] = enriched.MountAssociationError
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // listNFSHosts: GET /api/v1/storage/nfs-hosts?all=true|false
@@ -198,11 +238,19 @@ func (h *storageHandlers) listNFSHosts(c *gin.Context) {
 		return
 	}
 	nfsOnly := c.Query("all") != "true"
-	snapshots, _ := h.store.ListInventorySnapshots(c)
+	snapshots, snapshotsErr := h.store.ListInventorySnapshots(c)
+	if snapshotsErr != nil {
+		snapshots = []db.InventorySnapshot{}
+	}
 	snapMap := make(map[int64]db.InventorySnapshot, len(snapshots))
 	for _, snap := range snapshots {
 		snapMap[snap.WorkerID] = snap
 	}
+	preflightErrorCode := ""
+	if snapshotsErr != nil {
+		preflightErrorCode = "inventory_snapshot_list_failed"
+	}
+	associations := queryNFSAssociations(c, h.client, h.store, workers, parseNFSWorkerInventories(snapshots), h.staleAfter, preflightErrorCode)
 
 	results := make([]map[string]any, 0, len(workers))
 	for _, w := range workers {
@@ -240,26 +288,42 @@ func (h *storageHandlers) listNFSHosts(c *gin.Context) {
 			}
 		}
 
-		if nfsOnly && !inv.NFS.Active && len(inv.NFS.Exports) == 0 && !hasExportedLV {
+		state := associations.workers[w.ID]
+		if state == nil {
+			state = &workerMountAssociation{
+				status: "none", unmatchedMounts: []unmatchedNFSMountInfo{},
+				mountedPodsByLV: map[string][]mountedPodInfo{},
+			}
+			if associations.errorCode != "" {
+				state.status = "lookup_failed"
+				state.errorCode = associations.errorCode
+			}
+		}
+		if nfsOnly && !inv.NFS.Active && len(inv.NFS.Exports) == 0 && !hasExportedLV && state.status != "available" && state.status != "partial" {
 			continue
 		}
 
 		hostItem := map[string]any{
-			"worker_id":         w.ID,
-			"worker_name":       w.Name,
-			"host":              w.Host,
-			"port":              w.Port,
-			"status":            w.Status,
-			"nfs_active":        inv.NFS.Active,
-			"total_disks":       len(inv.PhysicalDisks),
-			"physical_disks":    inv.PhysicalDisks,
-			"virtual_disks":     inv.LVs,
-			"nfs_exports":       inv.NFS.Exports,
-			"collected_at":      snap.CollectedAt,
-			"last_attempted_at": lastAttempted,
-			"stale":             stale,
-			"refreshing":        refreshing,
-			"error_message":     errMsg,
+			"worker_id":                w.ID,
+			"worker_name":              w.Name,
+			"host":                     w.Host,
+			"port":                     w.Port,
+			"status":                   w.Status,
+			"nfs_active":               inv.NFS.Active,
+			"total_disks":              len(inv.PhysicalDisks),
+			"physical_disks":           inv.PhysicalDisks,
+			"virtual_disks":            withMountedPods(inv.LVs, state),
+			"nfs_exports":              inv.NFS.Exports,
+			"collected_at":             snap.CollectedAt,
+			"last_attempted_at":        lastAttempted,
+			"stale":                    stale,
+			"refreshing":               refreshing,
+			"error_message":            errMsg,
+			"mount_association_status": state.status,
+			"unmatched_mounts":         nonNilUnmatched(state.unmatchedMounts),
+		}
+		if state.errorCode != "" {
+			hostItem["mount_association_error"] = state.errorCode
 		}
 		results = append(results, hostItem)
 	}

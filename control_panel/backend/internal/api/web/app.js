@@ -611,6 +611,142 @@
     }
 
     // ====================================================================
+    // NFS MOUNT DISPLAY HELPERS
+    function nfsMountStatusBadge(status) {
+        var labels = {
+            matched: ['badge-success', '已匹配'],
+            pending: ['badge-warning', 'PVC 待绑定'],
+            missing_claim: ['badge-danger', 'PVC 不存在'],
+            missing_pv: ['badge-danger', 'PV 不存在'],
+            unmatched: ['badge-warning', '未匹配'],
+            ambiguous: ['badge-warning', '存在歧义'],
+            unsupported: ['badge-muted', '来源不支持'],
+            lookup_failed: ['badge-danger', '关联查询暂不可用'],
+            none: ['badge-muted', '无 NFS 挂载'],
+            available: ['badge-success', '关联正常'],
+            partial: ['badge-warning', '部分关联需核查']
+        };
+        var entry = labels[status] || ['badge-muted', '状态未知'];
+        return '<span class="badge ' + entry[0] + '">' + entry[1] + '</span>';
+    }
+
+    function nfsMountReasonLabel(reason) {
+        var labels = {
+            pvc_not_found: 'Kubernetes 中未找到此 PVC',
+            pv_not_found: 'PVC 指向的 PV 当前不存在',
+            pvc_not_bound: 'PVC 尚未绑定 PV，NFS 用途尚无法确认',
+            worker_not_found: 'NFS 服务地址不属于已登记 Worker',
+            export_not_found: 'Worker 快照中没有匹配的 NFS 导出路径',
+            lv_not_found: '没有包含该导出路径的逻辑卷',
+            multiple_workers: '多个 Worker 使用相同服务地址',
+            multiple_exports: '存在多个同等匹配的导出路径',
+            multiple_lvs: '存在多个同等匹配的逻辑卷',
+            missing_nfs_server: 'NFS 服务地址缺失',
+            missing_nfs_path: 'NFS 导出路径缺失',
+            missing_csi_share: 'NFS CSI share 属性缺失',
+            unsupported_nfs_format: 'NFS 来源字段格式不受支持'
+        };
+        return labels[reason] || '暂时无法确认具体原因';
+    }
+
+    function podNFSMountSummary(pod) {
+        var status = pod.nfs_mounts_status || 'none';
+        var mounts = Array.isArray(pod.nfs_mounts) ? pod.nfs_mounts : [];
+        if (status === 'lookup_failed') return nfsMountStatusBadge(status);
+        if (status === 'none' || mounts.length === 0) return '<span class="muted">无 PVC 型 NFS 关联</span>';
+        if (status === 'pending') return nfsMountStatusBadge(status);
+        if (status === 'available') {
+            var matched = mounts.filter(function (mount) { return mount.status === 'matched'; }).length;
+            return '<span class="badge badge-success">' + matched + ' 个 NFS 卷</span>';
+        }
+        return '<span class="badge badge-warning">' + mounts.length + ' 项需核查</span>';
+    }
+
+    function capacityGB(value) {
+        return typeof value === 'number' && isFinite(value) ? value.toFixed(1) + ' GB' : '—';
+    }
+
+    function renderPodNFSMountDetails(pod) {
+        var status = pod.nfs_mounts_status || 'none';
+        var mounts = Array.isArray(pod.nfs_mounts) ? pod.nfs_mounts : [];
+        if (status === 'lookup_failed') {
+            return '<div class="error-msg">关联查询暂不可用。错误分类：' + esc(pod.nfs_mounts_error || 'unknown') + '。Pod 与备注仍来自当前查询结果。</div>';
+        }
+        if (mounts.length === 0) {
+            return '<div class="muted" style="padding:12px 0;">当前 Pod 没有可确认或未决的 PVC 型 NFS 挂载。</div>';
+        }
+        return '<div class="nfs-mount-list">' + mounts.map(function (mount) {
+            var identity = '<div class="nfs-mount-identifiers">' +
+                '<span>PVC: <code>' + esc(mount.pvc_name || '—') + '</code></span>' +
+                '<span>PV: <code>' + esc(mount.pv_name || '—') + '</code></span>' +
+                '</div>';
+            var location = mount.status === 'matched'
+                ? '<div class="nfs-mount-location">' +
+                    '<div>Worker: <strong>' + esc(mount.worker_name || '—') + '</strong>' + (mount.worker_id != null ? ' <span class="muted">(#' + esc(mount.worker_id) + ')</span>' : '') + '</div>' +
+                    '<div>虚拟盘: <code>' + esc((mount.vg_name || '—') + '/' + (mount.lv_name || '—')) + '</code></div>' +
+                    '<div>NFS 导出路径: <code>' + esc(mount.export_path || '—') + '</code></div>' +
+                    '</div>'
+                : '<div class="nfs-mount-reason">' + esc(nfsMountReasonLabel(mount.reason)) + '</div>';
+            var containerMounts = Array.isArray(mount.container_mounts) ? mount.container_mounts : [];
+            var containerHTML = containerMounts.length
+                ? '<div class="nfs-container-mounts"><strong>容器挂载路径</strong>' + containerMounts.map(function (containerMount) {
+                    return '<div><code>' + esc(containerMount.container_name || 'container') + ':' + esc(containerMount.mount_path || '—') + '</code> ' +
+                        (containerMount.read_only ? '<span class="badge badge-muted">只读</span>' : '<span class="muted">可读写</span>') + '</div>';
+                }).join('') + '</div>'
+                : '<div class="nfs-container-mounts muted">Pod 尚未声明对应的容器挂载路径。</div>';
+            var capacity = mount.capacity;
+            var capacityHTML = mount.status === 'matched'
+                ? '<div class="nfs-volume-capacity"><strong>虚拟盘整体容量</strong>' +
+                    '<div class="muted">总量 ' + capacityGB(capacity && capacity.lv_size_gb) +
+                    ' · 已用 ' + capacityGB(capacity && capacity.filesystem_used_gb) +
+                    ' · 可用 ' + capacityGB(capacity && capacity.filesystem_free_gb) +
+                    ' · 使用率 ' + (capacity && capacity.filesystem_use_pct != null ? esc(capacity.filesystem_use_pct) : '—') + '</div>' +
+                    '<div class="muted">' + (capacity && capacity.known ? '容量指标完整' : '部分容量指标未知') +
+                    (capacity && capacity.stale ? ' · 快照较旧' : '') +
+                    ' · 采集时间 ' + esc(fmtTime(capacity && capacity.collected_at)) + '</div>' +
+                    '<div class="muted">总量、已用、可用和使用率属于整个虚拟盘/文件系统，不代表此 Pod 或 PVC 的独立占用。</div>' +
+                    '</div>'
+                : '';
+            return '<section class="nfs-mount-card">' +
+                '<div class="nfs-mount-card-header">' + nfsMountStatusBadge(mount.status) + identity + '</div>' +
+                location + containerHTML + capacityHTML +
+                '</section>';
+        }).join('') + '</div>';
+    }
+
+    function renderLVMountedPods(mountedPods, associationStatus) {
+        if (associationStatus === 'lookup_failed') return nfsMountStatusBadge('lookup_failed');
+        if (!Array.isArray(mountedPods) || mountedPods.length === 0) {
+            return associationStatus === 'partial'
+                ? '<span class="badge badge-warning">存在未决挂载，请查看告警</span>'
+                : '<span class="muted">暂无唯一匹配的 Notebook Pod</span>';
+        }
+        return '<div class="nfs-mounted-pod-list">' + mountedPods.map(function (pod) {
+            return '<div class="nfs-mounted-pod-item">' +
+                '<div><span class="badge badge-muted font-mono">' + esc(pod.namespace || '—') + '</span> <strong>' + esc(pod.pod_name || '—') + '</strong></div>' +
+                '<div>' + (pod.owner_name ? '<strong>' + esc(pod.owner_name) + '</strong>' : '<span class="muted">使用人未设置</span>') + '</div>' +
+                (pod.note ? '<div class="muted nfs-mounted-pod-note">' + esc(pod.note) + '</div>' : '') +
+                '</div>';
+        }).join('') + '</div>';
+    }
+
+    function renderNFSWorkerWarnings(unmatchedMounts, associationStatus, errorCode) {
+        if (associationStatus === 'lookup_failed') {
+            return '<div class="error-msg nfs-worker-warning">关联查询暂不可用；当前仅展示存储快照。错误分类：' + esc(errorCode || 'unknown') + '。</div>';
+        }
+        if (!Array.isArray(unmatchedMounts) || unmatchedMounts.length === 0) return '';
+        return '<div class="nfs-worker-warning"><strong>以下 NFS 关系尚未唯一匹配到虚拟盘：</strong><ul>' + unmatchedMounts.map(function (mount) {
+            return '<li>' + nfsMountStatusBadge(mount.status) + ' ' +
+                (mount.candidate_worker ? '<span class="badge badge-muted">候选 Worker</span> ' : '') +
+                '<span class="font-mono">' + esc(mount.namespace || '—') + '/' + esc(mount.pod_name || '—') +
+                '</span> · PVC <code>' + esc(mount.pvc_name || '—') + '</code> / PV <code>' + esc(mount.pv_name || '—') +
+                '</code> · ' + esc(nfsMountReasonLabel(mount.reason)) +
+                ((mount.nfs_server || mount.nfs_path) ? ' · NFS <code>' + esc(mount.nfs_server || '—') + ':' + esc(mount.nfs_path || '—') + '</code>' : '') +
+                '</li>';
+        }).join('') + '</ul></div>';
+    }
+
+    // ====================================================================
     // K8S PAGE (Pod-centric port mapping)
     var k8sServices = [];
 
@@ -633,8 +769,8 @@
             '</div>' +
             '<div class="table-responsive">' +
             '<table class="data-table" id="pods-table"><thead><tr>' +
-            '<th>Pod 名称</th><th>使用人 / 备注</th><th>命名空间</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th style="text-align:right;">操作</th>' +
-            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="8" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
+            '<th>Pod 名称</th><th>使用人 / 备注</th><th>命名空间</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th>NFS 挂载</th><th style="text-align:right;">操作</th>' +
+            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="9" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
             '</div></div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
@@ -675,14 +811,14 @@
     async function loadPods(content) {
         var tbody = document.getElementById('pods-tbody');
         var msgEl = document.getElementById('pods-msg');
-        tbody.innerHTML = '<tr><td colspan="8" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
         try {
             var results = await Promise.all([apiJSON('/k8s/pods'), apiJSON('/k8s/services')]);
             var pr = results[0], sr = results[1];
             if (!pr.resp.ok) { setMsg(msgEl, '错误: ' + (pr.data && pr.data.error), 'error'); tbody.innerHTML = ''; return; }
             k8sServices = (sr.resp.ok && Array.isArray(sr.data)) ? sr.data : [];
             var pods = pr.data || [];
-            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="8" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
+            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="9" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
             tbody.innerHTML = pods.map(function (p) {
                 var cnt = servicesForPod(p.uid).length;
                 var ownerDisplay = p.owner_name
@@ -696,6 +832,7 @@
                     '<td>' + statusBadge(p.status) + '</td>' +
                     '<td><span class="font-mono">' + esc((p.ips || []).join(', ')) + '</span></td>' +
                     '<td class="pod-mappings-cell">' + (cnt > 0 ? '<span class="badge badge-success">' + cnt + ' 条映射</span>' : '<span class="muted">-</span>') + '</td>' +
+                    '<td class="pod-nfs-cell">' + podNFSMountSummary(p) + '</td>' +
                     '<td style="text-align:right;"><button class="btn btn-sm btn-primary" data-pod=\'' + esc(JSON.stringify(p)) + '\'>配置端口映射与备注</button></td>' +
                     '</tr>';
             }).join('');
@@ -717,6 +854,7 @@
 
         var currentServices = servicesForPod(pod.uid);
         var initialSvcCount = currentServices.length;
+        var initialNFSMountCount = Array.isArray(pod.nfs_mounts) ? pod.nfs_mounts.length : 0;
 
         var html = '<div class="modal-overlay" id="port-modal">' +
             '<div class="modal modal-structured port-modal-dialog">' +
@@ -744,6 +882,10 @@
             '<svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd"/></svg>' +
             '<span>端口映射规则</span>' +
             '<span class="badge badge-primary font-mono tab-badge-count" id="tab-ports-count">' + initialSvcCount + '</span>' +
+            '</button>' +
+            '<button type="button" class="port-tab-btn" id="tab-btn-nfs" data-tab="nfs">' +
+            '<span>NFS 挂载</span>' +
+            '<span class="badge ' + (pod.nfs_mounts_status === 'lookup_failed' ? 'badge-warning' : 'badge-muted') + ' tab-badge-count" id="tab-nfs-count">' + (pod.nfs_mounts_status === 'lookup_failed' ? '!' : initialNFSMountCount) + '</span>' +
             '</button>' +
             '<button type="button" class="port-tab-btn" id="tab-btn-meta" data-tab="meta">' +
             '<svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/></svg>' +
@@ -800,7 +942,18 @@
             '</div>' +
             '</div>' + // end pane-ports
 
-            // Pane 2: Metadata / Ownership
+            // Pane 2: NFS volumes
+            '<div id="pane-nfs" style="display:none;">' +
+            '<div class="port-section-card">' +
+            '<div class="card-header-clean"><div>' +
+            '<div class="section-title" style="margin-bottom:0;">Notebook NFS 挂载</div>' +
+            '<div class="muted" style="font-size:12px;margin-top:2px;">沿 PVC → PV → NFS 导出路径展示后端唯一匹配结果及当前容器挂载路径。</div>' +
+            '</div>' + nfsMountStatusBadge(pod.nfs_mounts_status || 'none') + '</div>' +
+            renderPodNFSMountDetails(pod) +
+            '</div>' +
+            '</div>' + // end pane-nfs
+
+            // Pane 3: Metadata / Ownership
             '<div id="pane-meta" style="display:none;">' +
             '<div class="port-section-card">' +
             '<div class="card-header-clean">' +
@@ -880,32 +1033,32 @@
 
         // Tab Switching Logic
         var btnTabPorts = document.getElementById('tab-btn-ports');
+        var btnTabNFS = document.getElementById('tab-btn-nfs');
         var btnTabMeta = document.getElementById('tab-btn-meta');
         var panePorts = document.getElementById('pane-ports');
+        var paneNFS = document.getElementById('pane-nfs');
         var paneMeta = document.getElementById('pane-meta');
         var submitBtn = document.getElementById('btn-submit-port');
         var submitBtnText = document.getElementById('btn-submit-port-text');
 
         function switchTab(tab) {
             activeTab = tab;
-            if (tab === 'ports') {
-                btnTabPorts.classList.add('active');
-                btnTabMeta.classList.remove('active');
-                panePorts.style.display = 'block';
-                paneMeta.style.display = 'none';
-                submitBtn.style.display = 'inline-flex';
-                submitBtnText.textContent = editingSvc ? '保存并更新规则' : '立即创建映射';
-            } else {
-                btnTabMeta.classList.add('active');
-                btnTabPorts.classList.remove('active');
-                paneMeta.style.display = 'block';
-                panePorts.style.display = 'none';
-                submitBtn.style.display = 'none';
-            }
+            var showPorts = tab === 'ports';
+            var showNFS = tab === 'nfs';
+            var showMeta = tab === 'meta';
+            btnTabPorts.classList.toggle('active', showPorts);
+            btnTabNFS.classList.toggle('active', showNFS);
+            btnTabMeta.classList.toggle('active', showMeta);
+            panePorts.style.display = showPorts ? 'block' : 'none';
+            paneNFS.style.display = showNFS ? 'block' : 'none';
+            paneMeta.style.display = showMeta ? 'block' : 'none';
+            submitBtn.style.display = showPorts ? 'inline-flex' : 'none';
+            if (showPorts) submitBtnText.textContent = editingSvc ? '保存并更新规则' : '立即创建映射';
             setMsg(document.getElementById('port-modal-status-msg'), '', 'error');
         }
 
         btnTabPorts.addEventListener('click', function () { switchTab('ports'); });
+        btnTabNFS.addEventListener('click', function () { switchTab('nfs'); });
         btnTabMeta.addEventListener('click', function () { switchTab('meta'); });
 
         // Metadata Save Handler (Zero lag - updates DOM directly without full table reload)
@@ -1371,6 +1524,7 @@
             '</div>' +
             '<div class="form-field"><label>选择 Worker 节点</label><select id="st-worker-select"><option value="">-- 请选择 Worker 节点 --</option></select></div>' +
             '<div id="st-inv-msg" class="info-msg"></div>' +
+            '<div id="st-inv-mount-warnings"></div>' +
             '</div>' +
             // Block A: VG pool management
             '<div class="card mt-2">' +
@@ -1393,8 +1547,8 @@
             '<span class="muted" style="font-size:12px;">包含全部底层识别的 LV 虚拟盘，实时监控所属物理盘、挂载目录、空间已用/剩余与 NFS 导出状态</span>' +
             '</div>' +
             '<div class="table-responsive">' +
-            '<table class="data-table" id="st-lv-table"><thead><tr><th>虚拟盘名称</th><th>所属 VG</th><th>底层物理盘</th><th>总容量</th><th>挂载目录</th><th>已用空间</th><th>剩余可用</th><th>使用率</th><th>NFS 导出</th><th style="text-align:right;">操作</th></tr></thead>' +
-            '<tbody id="st-lv-tbody"><tr><td colspan="10" class="muted">请先在上方选择 Worker 节点。</td></tr></tbody></table>' +
+            '<table class="data-table" id="st-lv-table"><thead><tr><th>虚拟盘名称</th><th>所属 VG</th><th>底层物理盘</th><th>总容量</th><th>挂载目录</th><th>已用空间</th><th>剩余可用</th><th>使用率</th><th>NFS 导出</th><th>Notebook Pod / 使用人</th><th style="text-align:right;">操作</th></tr></thead>' +
+            '<tbody id="st-lv-tbody"><tr><td colspan="11" class="muted">请先在上方选择 Worker 节点。</td></tr></tbody></table>' +
             '</div></div>' +
             // Block C: create NFS share
             '<div class="card mt-2">' +
@@ -1480,6 +1634,7 @@
                             var disksBadge = (lv.physical_disks && lv.physical_disks.length)
                                 ? lv.physical_disks.map(function (x) { return '<span class="badge badge-mono font-mono" style="font-size:10.5px;">' + esc(x) + '</span>'; }).join(' ')
                                 : '<span class="muted">-</span>';
+                            var podCell = renderLVMountedPods(lv.mounted_pods, h.mount_association_status);
                             return '<tr>' +
                                 '<td><strong>' + esc(lv.name) + '</strong></td>' +
                                 '<td><span class="badge badge-muted font-mono" style="font-size:11px;">' + esc(lv.vg_name || '-') + '</span></td>' +
@@ -1490,6 +1645,7 @@
                                 '<td><span class="font-mono">' + freeStr + '</span></td>' +
                                 '<td>' + (lv.mount_point ? ('<div style="display:flex;align-items:center;gap:6px;"><div style="flex:1;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;min-width:40px;"><div style="width:' + Math.min(pctNum, 100) + '%;height:100%;background:' + pctColor + ';"></div></div><span style="font-size:11px;min-width:28px;">' + esc(lv.use_pct || '0%') + '</span></div>') : '-') + '</td>' +
                                 '<td>' + nfsBadge + '</td>' +
+                                '<td>' + podCell + '</td>' +
                                 '<td>' + platBtn + '</td>' +
                                 '</tr>';
                         }).join('');
@@ -1498,7 +1654,7 @@
                     function renderLVTableContainer(rowsHtml) {
                         return '<div class="table-responsive" style="margin-top:6px;">' +
                             '<table class="data-table" style="font-size:12px;">' +
-                            '<thead><tr><th>虚拟盘名称</th><th>所属卷组</th><th>底层物理盘</th><th>挂载目录</th><th>总容量</th><th>已用空间</th><th>剩余空间</th><th>使用率</th><th>NFS 状态</th><th>操作</th></tr></thead>' +
+                            '<thead><tr><th>虚拟盘名称</th><th>所属卷组</th><th>底层物理盘</th><th>挂载目录</th><th>总容量</th><th>已用空间</th><th>剩余空间</th><th>使用率</th><th>NFS 状态</th><th>Notebook Pod / 使用人</th><th>操作</th></tr></thead>' +
                             '<tbody>' + rowsHtml + '</tbody></table></div>';
                     }
 
@@ -1568,6 +1724,7 @@
                     var errHtml = h.error_message
                         ? '<div class="error-msg" style="margin-top:6px;font-size:12px;">最近采集提示: ' + esc(h.error_message) + ' (展示历史快照)</div>'
                         : '';
+                    var mountWarningsHtml = renderNFSWorkerWarnings(h.unmatched_mounts, h.mount_association_status, h.mount_association_error);
 
                     return '<div style="border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:12px;background:rgba(255,255,255,0.015);">' +
                         '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:10px;margin-bottom:10px;">' +
@@ -1576,13 +1733,14 @@
                         '<span class="badge badge-muted font-mono">' + esc(h.host) + ':' + h.port + '</span>' +
                         (h.nfs_active ? '<span class="badge badge-success"><span class="badge-dot"></span>NFS 服务运行中</span>' : '<span class="badge badge-muted">NFS 未激活</span>') +
                         syncBadge +
+                        nfsMountStatusBadge(h.mount_association_status || 'none') +
                         '<button class="btn btn-xs btn-outline" data-act="refresh-worker" data-wid="' + h.worker_id + '">🔄 刷新此节点</button>' +
                         '</div>' +
                         '<div style="font-size:12px;color:var(--text-muted);">' +
                         '物理硬盘: <strong class="font-mono">' + (h.total_disks || disks.length) + '</strong> 块 · 虚拟盘: <strong class="font-mono">' + vdisks.length + '</strong> 个 · 导出路径: <strong class="font-mono">' + exports.length + '</strong> 个' +
                         '</div>' +
                         '</div>' +
-                        errHtml +
+                        errHtml + mountWarningsHtml +
                         '<div style="margin-bottom:10px;">' +
                         '<div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">物理硬盘情况 (分别有 ' + (h.total_disks || disks.length) + ' 块硬盘，及其剩余容量)：</div>' +
                         '<div style="display:flex;flex-wrap:wrap;gap:8px;">' + disksHtml + '</div>' +
@@ -1636,7 +1794,6 @@
             }
         });
         loadNFSHosts();
-        loadNFSHosts();
 
         try {
             var r = await apiJSON('/workers');
@@ -1653,6 +1810,7 @@
 
         async function loadInventory(wid) {
             var invMsg = document.getElementById('st-inv-msg');
+            var mountWarningsEl = document.getElementById('st-inv-mount-warnings');
             var vgTbody = document.getElementById('st-vg-tbody');
             var lvTbody = document.getElementById('st-lv-tbody');
             var vsel = document.getElementById('st-vg-select');
@@ -1683,22 +1841,29 @@
             vsel.innerHTML = '<option value="">正在分析节点存储...</option>';
             vfree.textContent = ''; summary.textContent = '';
             if (disksContainer) disksContainer.innerHTML = '';
+            if (mountWarningsEl) mountWarningsEl.innerHTML = '';
             vgTbody.innerHTML = '<tr><td colspan="3" class="muted">正在获取存储池 (VG) 数据...</td></tr>';
-            lvTbody.innerHTML = '<tr><td colspan="10" class="muted">正在获取逻辑卷 (虚拟盘) 数据...</td></tr>';
+            lvTbody.innerHTML = '<tr><td colspan="11" class="muted">正在获取逻辑卷 (虚拟盘) 数据...</td></tr>';
             try {
                 var r = await apiJSON('/storage/inventory?worker_id=' + encodeURIComponent(wid));
                 if (!r.resp.ok) {
                     var err = (r.data && r.data.error) || '加载失败';
                     setMsg(invMsg, '加载存储清单失败: ' + err + ' (若未安装 lvm2/nfs,请先在 Worker 页面点击「安装依赖」)', 'error');
                     vgTbody.innerHTML = '<tr><td colspan="3" class="muted">存储池清单获取失败</td></tr>';
-                    lvTbody.innerHTML = '<tr><td colspan="10" class="muted">逻辑卷清单获取失败</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="11" class="muted">逻辑卷清单获取失败</td></tr>';
                     vsel.innerHTML = '<option value="">-- 加载失败 --</option>';
                     return;
                 }
                 var inv = (r.data && r.data.data) ? r.data.data : (r.data || { vgs: [], lvs: [], unused_disks: [] });
                 lastInventory = inv;
+                var associationStatus = (r.data && r.data.mount_association_status) || inv.mount_association_status || 'none';
+                var unmatchedMounts = (r.data && r.data.unmatched_mounts) || inv.unmatched_mounts || [];
+                var associationError = (r.data && r.data.mount_association_error) || inv.mount_association_error || '';
+                if (mountWarningsEl) mountWarningsEl.innerHTML = renderNFSWorkerWarnings(unmatchedMounts, associationStatus, associationError);
 
-                if (r.data && r.data.refreshing) {
+                if (associationStatus === 'lookup_failed') {
+                    setMsg(invMsg, 'NFS 挂载关系查询暂不可用；当前仍展示存储快照。错误分类：' + (associationError || 'unknown') + '。', 'error');
+                } else if (r.data && r.data.refreshing) {
                     setMsg(invMsg, '后台正在同步探测该节点存储，当前展示最近快照...', 'info');
                 } else if (r.data && r.data.last_error) {
                     setMsg(invMsg, '最近采集提醒: ' + r.data.last_error + ' (当前展示历史有效快照)', 'info');
@@ -1761,7 +1926,7 @@
 
                 var lvs = inv.lvs || [];
                 if (lvs.length === 0) {
-                    lvTbody.innerHTML = '<tr><td colspan="10" class="muted">该节点当前无划分的虚拟盘。</td></tr>';
+                    lvTbody.innerHTML = '<tr><td colspan="11" class="muted">该节点当前无划分的虚拟盘。</td></tr>';
                 } else {
                     lvTbody.innerHTML = lvs.map(function (lv) {
                         var data = JSON.stringify({ vg: lv.vg_name, name: lv.name, size: lv.size_gb, mp: lv.mount_point, fs: lv.fs_type });
@@ -1779,6 +1944,7 @@
                         var disksCol = (lv.physical_disks && lv.physical_disks.length)
                             ? lv.physical_disks.map(function (x) { return '<span class="badge badge-mono font-mono" style="font-size:10.5px;">' + esc(x) + '</span>'; }).join(' ')
                             : '<span class="muted">' + esc(lv.vg_name || '-') + '</span>';
+                        var podCell = renderLVMountedPods(lv.mounted_pods, associationStatus);
 
                         return '<tr>' +
                             '<td><strong>' + esc(lv.name) + '</strong></td>' +
@@ -1790,6 +1956,7 @@
                             '<td><span class="font-mono">' + freeCol + '</span></td>' +
                             '<td>' + pctCol + '</td>' +
                             '<td>' + nfsBadge + '</td>' +
+                            '<td>' + podCell + '</td>' +
                             '<td style="text-align:right;">' +
                             '<div class="actions-cell" style="justify-content: flex-end;">' +
                             platBtn +

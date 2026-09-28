@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -54,40 +55,59 @@ func StableKeyForPod(namespace, uid string, labels map[string]string) (key strin
 // server-side selector is not possible, but the cached read avoids an etcd
 // quorum read on large clusters.
 func ListNotebookPods(ctx context.Context, client kubernetes.Interface) ([]PodInfo, error) {
-	list, err := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		ResourceVersion: "0",
-	})
+	objects, err := ListNotebookPodObjects(ctx, client)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]PodInfo, 0, len(list.Items))
-	for _, p := range list.Items {
-		if !strings.Contains(strings.ToLower(p.Name), "notebook") {
-			continue
-		}
-		ips := []string{}
-		if p.Status.PodIP != "" {
-			ips = append(ips, p.Status.PodIP)
-		}
-		for _, ip := range p.Status.PodIPs {
-			if ip.IP != "" && ip.IP != p.Status.PodIP {
-				ips = append(ips, ip.IP)
-			}
-		}
-		stableKey, kind, ws, proj := StableKeyForPod(p.Namespace, string(p.UID), p.Labels)
-		out = append(out, PodInfo{
-			Name:        p.Name,
-			Namespace:   p.Namespace,
-			UID:         string(p.UID),
-			Node:        p.Spec.NodeName,
-			Status:      string(p.Status.Phase),
-			IPs:         ips,
-			Labels:      p.Labels,
-			StableKey:   stableKey,
-			KeyKind:     kind,
-			WorkspaceID: ws,
-			ProjectID:   proj,
-		})
+	out := make([]PodInfo, 0, len(objects))
+	for _, pod := range objects {
+		out = append(out, NotebookPodInfo(pod))
 	}
 	return out, nil
+}
+
+// ListNotebookPodObjects returns the filtered Kubernetes Pod objects so the
+// API layer can resolve PVC references from the same batch Pod list used to
+// construct the public PodInfo response.
+func ListNotebookPodObjects(ctx context.Context, client kubernetes.Interface) ([]corev1.Pod, error) {
+	list, err := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]corev1.Pod, 0, len(list.Items))
+	for i := range list.Items {
+		pod := list.Items[i]
+		if strings.Contains(strings.ToLower(pod.Name), "notebook") {
+			out = append(out, pod)
+		}
+	}
+	return out, nil
+}
+
+// NotebookPodInfo converts a Kubernetes Pod object into the existing public
+// Pod DTO while preserving the stable metadata key behavior.
+func NotebookPodInfo(pod corev1.Pod) PodInfo {
+	ips := []string{}
+	if pod.Status.PodIP != "" {
+		ips = append(ips, pod.Status.PodIP)
+	}
+	for _, ip := range pod.Status.PodIPs {
+		if ip.IP != "" && ip.IP != pod.Status.PodIP {
+			ips = append(ips, ip.IP)
+		}
+	}
+	stableKey, kind, ws, proj := StableKeyForPod(pod.Namespace, string(pod.UID), pod.Labels)
+	return PodInfo{
+		Name:        pod.Name,
+		Namespace:   pod.Namespace,
+		UID:         string(pod.UID),
+		Node:        pod.Spec.NodeName,
+		Status:      string(pod.Status.Phase),
+		IPs:         ips,
+		Labels:      pod.Labels,
+		StableKey:   stableKey,
+		KeyKind:     kind,
+		WorkspaceID: ws,
+		ProjectID:   proj,
+	}
 }

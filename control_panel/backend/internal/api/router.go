@@ -188,7 +188,7 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.GET("/audit-log", auditHandler(store))
 
 		// K8s endpoints: all Bearer/Cookie protected.
-		kh := &k8sHandlers{eng: eng, store: store, client: k8sClient}
+		kh := &k8sHandlers{eng: eng, store: store, client: k8sClient, staleAfter: options.StaleAfter}
 		authed.POST("/k8s/services", kh.createService)
 		authed.GET("/k8s/services", kh.listServices)
 		authed.PUT("/k8s/services/:name", kh.updateService)
@@ -207,6 +207,7 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 			runner:     sshRunner,
 			collector:  options.Collector,
 			staleAfter: options.StaleAfter,
+			client:     k8sClient,
 		}
 		authed.POST("/storage/provision", sh.provision)
 		authed.POST("/storage/reclaim", sh.reclaim)
