@@ -12,7 +12,8 @@ test('generated crypto bundle has no trailing whitespace', () => {
 });
 
 test('NOTICE records the generated crypto bundle hash', () => {
-  const hash = createHash('sha256').update(bundle).digest('hex');
+  const canonicalBundle = bundle.replace(/\r\n/g, '\n');
+  const hash = createHash('sha256').update(canonicalBundle).digest('hex');
   const noticeHash = notice.match(/Generated `p256\.bundle\.js` SHA-256: `([a-f0-9]{64})`/)?.[1];
   assert.ok(noticeHash, 'NOTICE is missing the generated bundle hash');
   assert.equal(noticeHash, hash, 'NOTICE bundle hash is stale');
