@@ -3,40 +3,44 @@ package config
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	AESKey                   []byte
-	JWTSecret                string
-	AdminInitPassword        string
-	DBPath                   string
-	ListenAddr               string
-	SSHPoolSize              int
-	SSHIdleTimeout           time.Duration
-	JWTTTL                   time.Duration
-	JWTIssuer                string
-	JWTAudience              string
-	TaskTimeout              time.Duration
-	CookieName               string
-	CookieSecure             bool
-	CookieSameSite           string
-	CSRFCookieName           string
-	CSRFHeaderName           string
-	TrustedProxies           []string
-	RateLimitMaxFailures     int
-	RateLimitLockoutDuration time.Duration
-	RateLimitWindow          time.Duration
-	RequireK8s               bool
-	WorkerHeartbeatInterval  time.Duration
-	WorkerHeartbeatTimeout   time.Duration
-	StorageRefreshInterval   time.Duration
-	StorageProbeTimeout      time.Duration
-	CollectorConcurrency     int
-	StorageStaleAfter        time.Duration
-	ReservedMountPoints      []string
+	AESKey                      []byte
+	JWTSecret                   string
+	AdminInitPassword           string
+	DBPath                      string
+	ListenAddr                  string
+	SSHPoolSize                 int
+	SSHIdleTimeout              time.Duration
+	JWTTTL                      time.Duration
+	JWTIssuer                   string
+	JWTAudience                 string
+	TaskTimeout                 time.Duration
+	CookieName                  string
+	CookieSecure                bool
+	CookieSameSite              string
+	CSRFCookieName              string
+	CSRFHeaderName              string
+	TrustedProxies              []string
+	RateLimitMaxFailures        int
+	RateLimitLockoutDuration    time.Duration
+	RateLimitWindow             time.Duration
+	ChallengeRateLimitPerMinute int
+	ChallengeMaxPendingPerIP    int
+	ChallengeMaxPendingGlobal   int
+	RequireK8s                  bool
+	WorkerHeartbeatInterval     time.Duration
+	WorkerHeartbeatTimeout      time.Duration
+	StorageRefreshInterval      time.Duration
+	StorageProbeTimeout         time.Duration
+	CollectorConcurrency        int
+	StorageStaleAfter           time.Duration
+	ReservedMountPoints         []string
 }
 
 func Load() (Config, error) {
@@ -68,9 +72,11 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("SSH_POOL_SIZE must be > 0")
 	}
 	c.SSHIdleTimeout = envDurOr("SSH_IDLE_TIMEOUT", 5*time.Minute)
-	c.JWTTTL = envDurOr("JWT_TTL", 4*time.Hour)
-	if c.JWTTTL <= 0 {
-		return c, fmt.Errorf("JWT_TTL must be > 0")
+	if c.JWTTTL, err = positiveDurationEnv("JWT_TTL", 30*time.Minute); err != nil {
+		return c, err
+	}
+	if c.JWTTTL > 30*time.Minute {
+		return c, fmt.Errorf("JWT_TTL must not exceed 30m for this control panel")
 	}
 	c.JWTIssuer = envOr("JWT_ISSUER", "xirang-control-panel")
 	c.JWTAudience = envOr("JWT_AUDIENCE", "xirang-control-panel-api")
@@ -83,21 +89,20 @@ func Load() (Config, error) {
 
 	c.CookieName = envOr("COOKIE_NAME", "cp_session")
 	c.CookieSecure = envBoolOr("COOKIE_SECURE", false)
-	sameSite := strings.ToLower(envOr("COOKIE_SAMESITE", "Lax"))
-	switch sameSite {
-	case "lax":
-		c.CookieSameSite = "Lax"
-	case "strict":
-		c.CookieSameSite = "Strict"
-	case "none":
-		c.CookieSameSite = "None"
-	default:
-		return c, fmt.Errorf("COOKIE_SAMESITE must be Lax, Strict, or None, got %q", sameSite)
+	sameSite := strings.ToLower(envOr("COOKIE_SAMESITE", "Strict"))
+	if sameSite != "strict" {
+		return c, fmt.Errorf("COOKIE_SAMESITE must be Strict for this control panel, got %q", sameSite)
 	}
+	c.CookieSameSite = "Strict"
 
 	c.CSRFCookieName = envOr("CSRF_COOKIE_NAME", "cp_csrf")
 	c.CSRFHeaderName = envOr("CSRF_HEADER_NAME", "X-CSRF-Token")
 	c.TrustedProxies = envSliceOr("TRUSTED_PROXIES", nil)
+	for _, proxy := range c.TrustedProxies {
+		if _, _, err := net.ParseCIDR(proxy); err != nil {
+			return c, fmt.Errorf("TRUSTED_PROXIES entry %q must be a CIDR: %w", proxy, err)
+		}
+	}
 
 	c.RateLimitMaxFailures = envIntOr("LOGIN_RATE_LIMIT_MAX_FAILURES", 5)
 	if c.RateLimitMaxFailures <= 0 {
@@ -110,6 +115,15 @@ func Load() (Config, error) {
 	c.RateLimitWindow = envDurOr("LOGIN_RATE_LIMIT_WINDOW", 15*time.Minute)
 	if c.RateLimitWindow <= 0 {
 		return c, fmt.Errorf("LOGIN_RATE_LIMIT_WINDOW must be > 0")
+	}
+	if c.ChallengeRateLimitPerMinute, err = positiveIntEnv("AUTH_CHALLENGE_RATE_LIMIT_PER_MINUTE", 10); err != nil {
+		return c, err
+	}
+	if c.ChallengeMaxPendingPerIP, err = positiveIntEnv("AUTH_CHALLENGE_MAX_PENDING_PER_IP", 5); err != nil {
+		return c, err
+	}
+	if c.ChallengeMaxPendingGlobal, err = positiveIntEnv("AUTH_CHALLENGE_MAX_PENDING_GLOBAL", 1000); err != nil {
+		return c, err
 	}
 
 	c.RequireK8s = envBoolOr("REQUIRE_K8S", false)

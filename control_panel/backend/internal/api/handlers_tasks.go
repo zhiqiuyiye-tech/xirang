@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,10 +14,30 @@ import (
 )
 
 type taskHandlers struct {
-	store      *db.Store
-	eng        *tasks.Engine
-	tk         *auth.Tokens
-	cookieName string
+	store               *db.Store
+	eng                 *tasks.Engine
+	tk                  *auth.Tokens
+	cookieName          string
+	authRecheckInterval time.Duration
+}
+
+func (h *taskHandlers) authSessionValid(ctx context.Context, token string) bool {
+	claims, err := h.tk.Parse(token)
+	if err != nil {
+		return false
+	}
+	if h.store == nil {
+		return true
+	}
+	version, err := h.store.GetAdminAuthVersion(ctx, claims.AdminID)
+	return err == nil && version == claims.AuthVersion
+}
+
+func (h *taskHandlers) authRecheckEvery() time.Duration {
+	if h.authRecheckInterval > 0 {
+		return h.authRecheckInterval
+	}
+	return 30 * time.Second
 }
 
 func (h *taskHandlers) list(c *gin.Context) {
@@ -128,6 +149,8 @@ func (h *taskHandlers) stream(c *gin.Context) {
 	// connection between step events.
 	hb := time.NewTicker(30 * time.Second)
 	defer hb.Stop()
+	authTicker := time.NewTicker(h.authRecheckEvery())
+	defer authTicker.Stop()
 	for {
 		select {
 		case ev, ok := <-ch:
@@ -150,6 +173,10 @@ func (h *taskHandlers) stream(c *gin.Context) {
 				if flusher != nil {
 					flusher.Flush()
 				}
+			}
+		case <-authTicker.C:
+			if !h.authSessionValid(c.Request.Context(), tok) {
+				return
 			}
 		case <-hb.C:
 			if _, err := c.Writer.WriteString(": keepalive\n\n"); err != nil {

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>息壤 控制面板 · Xirang Console</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%232563eb'/><path d='M8 20L16 8l8 12H8z' fill='%23ffffff'/><circle cx='16' cy='18' r='3' fill='%2360a5fa'/></svg>">
-    <link rel="stylesheet" href="/static/styles.css?v=0.7.3-nfs-mounts">
+    <link rel="stylesheet" href="/static/styles.css?v=key-login-1">
 </head>
 <body>
     <!-- Login View -->
@@ -33,39 +33,17 @@
                 <h1 class="login-title">息壤 控制面板</h1>
                 <p class="login-subtitle">云原生算力与分布式存储基础设施管控系统</p>
             </div>
-            <form id="login-form" method="POST" action="javascript:void(0);" onsubmit="return false;">
-                <div class="form-field">
-                    <label for="login-username">管理员账号</label>
-                    <div class="input-icon-wrapper">
-                        <svg class="input-icon" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
-                        </svg>
-                        <input type="text" id="login-username" placeholder="请输入管理员用户名" required autocomplete="username">
-                    </div>
-                </div>
-                <div class="form-field">
-                    <label for="login-password">访问密码</label>
-                    <div class="input-icon-wrapper">
-                        <svg class="input-icon" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd" />
-                        </svg>
-                        <input type="password" id="login-password" placeholder="请输入访问密钥或密码" required autocomplete="current-password">
-                    </div>
-                </div>
-                <button type="submit" class="btn btn-primary btn-block btn-lg">
-                    <span>登 录 控 制 台</span>
-                    <svg class="btn-arrow-icon" viewBox="0 0 20 20" fill="currentColor">
-                        <path fill-rule="evenodd" d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z" clip-rule="evenodd" />
-                    </svg>
-                </button>
-                <div id="login-error" class="error-msg"></div>
+            <form id="login-form" method="POST" action="/" novalidate>
+                <div id="login-controls"></div>
+                <div id="login-error" class="error-msg" role="status" aria-live="polite"></div>
             </form>
+            <div class="login-security-warning" role="note">HTTP 内网模式：白名单限制只能缩小访问范围，无法防止主动中间人窃取密钥或会话。</div>
             <div class="login-footer">
                 <span class="security-badge">
                     <svg class="security-icon" viewBox="0 0 16 16" fill="currentColor">
                         <path fill-rule="evenodd" d="M8 0c-.69 0-1.843.265-2.928.56-1.11.3-2.229.655-2.887.87a1.54 1.54 0 0 0-1.044 1.262c-.596 4.477.787 7.795 2.464 9.99 1.694 2.216 3.71 3.144 4.195 3.303a.5.5 0 0 0 .4 0c.485-.16 2.501-1.087 4.195-3.303 1.677-2.195 3.06-5.513 2.464-9.99a1.54 1.54 0 0 0-1.044-1.263 62.72 62.72 0 0 0-2.887-.87C9.843.266 8.69 0 8 0zm2.146 5.146a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-1.5-1.5a.5.5 0 1 1 .708-.708L7.5 7.793l2.646-2.647z"/>
                     </svg>
-                    TLS 传输加密 · 敏感凭证 AES-256 安全隔离
+                    HTTP 内网访问 · P-256 Challenge 签名登录
                 </span>
             </div>
         </div>
@@ -152,17 +130,13 @@
                         </div>
                         <span class="user-name">系统管理员</span>
                     </div>
-                    <button id="change-pwd-btn" class="btn btn-secondary btn-sm" title="修改管理员密码" style="display:inline-flex;align-items:center;gap:4px;margin-right:6px;">
-                        <svg viewBox="0 0 20 20" fill="currentColor" style="width:14px;height:14px;">
-                            <path fill-rule="evenodd" d="M18 8a6 6 0 01-7.743 5.743L10 14l-1 1-1 1H6v2H2v-4l4.257-4.257A6 6 0 1118 8zm-6-4a1 1 0 100 2 2 2 0 012 2 1 1 0 102 0 4 4 0 00-4-4z" clip-rule="evenodd"/>
-                        </svg>
-                        <span>修改密码</span>
-                    </button>
-                    <button id="logout-btn" class="btn btn-logout" title="退出当前登录">
+                    <button id="rotate-key-btn" class="btn btn-secondary btn-sm" title="更换共享 P-256 登录密钥">轮换登录密钥</button>
+                    <button id="logout-all-btn" class="btn btn-secondary btn-sm" title="撤销共享账号的全部会话">退出所有会话</button>
+                    <button id="logout-btn" class="btn btn-logout" title="仅退出当前浏览器">
                         <svg class="logout-icon" viewBox="0 0 20 20" fill="currentColor">
                             <path fill-rule="evenodd" d="M3 3a1 1 0 00-1 1v12a1 1 0 102 0V4a1 1 0 00-1-1zm10.293 9.293a1 1 0 001.414 1.414l3-3a1 1 0 000-1.414l-3-3a1 1 0 10-1.414 1.414L14.586 9H7a1 1 0 100 2h7.586l-1.293 1.293z" clip-rule="evenodd"/>
                         </svg>
-                        <span>退出</span>
+                        <span>退出此浏览器</span>
                     </button>
                 </div>
             </nav>
@@ -173,6 +147,8 @@
         </main>
     </div>
 
-    <script src="/static/app.js?v=0.7.3-nfs-mounts"></script>
+    <script src="/static/p256.bundle.js?v=key-login-1"></script>
+    <script src="/static/key_login.js?v=key-login-1"></script>
+    <script src="/static/app.js?v=key-login-1"></script>
 </body>
 </html>

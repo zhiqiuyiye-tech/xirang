@@ -151,6 +151,49 @@ CREATE INDEX IF NOT EXISTS idx_notebook_metadata_namespace ON notebook_metadata(
 				return err
 			},
 		},
+		{
+			version: 4,
+			apply: func(tx *sql.Tx) error {
+				for _, col := range []struct {
+					name string
+					ddl  string
+				}{
+					{"auth_state", "ALTER TABLE admin ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'PASSWORD_BOOTSTRAP'"},
+					{"public_key_pem", "ALTER TABLE admin ADD COLUMN public_key_pem TEXT"},
+					{"public_key_fingerprint", "ALTER TABLE admin ADD COLUMN public_key_fingerprint TEXT"},
+				} {
+					has, err := tableHasColumn(tx, "admin", col.name)
+					if err != nil {
+						return err
+					}
+					if !has {
+						if _, err := tx.Exec(col.ddl); err != nil {
+							return err
+						}
+					}
+				}
+				if _, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS auth_challenges (
+  challenge_id        TEXT PRIMARY KEY,
+  nonce               TEXT NOT NULL,
+  purpose             TEXT NOT NULL CHECK (purpose IN ('LOGIN','BOOTSTRAP','KEY_ROTATE')),
+  auth_version        INTEGER NOT NULL,
+  key_fingerprint     TEXT NOT NULL DEFAULT '',
+  new_key_fingerprint TEXT NOT NULL DEFAULT '',
+  client_ip           TEXT NOT NULL,
+  created_at          TIMESTAMP NOT NULL,
+  expires_at          TIMESTAMP NOT NULL,
+  consumed_at         TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_expiry ON auth_challenges(expires_at);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_client_expiry ON auth_challenges(client_ip, expires_at);
+UPDATE admin SET auth_version=auth_version+1;
+`); err != nil {
+					return err
+				}
+				return nil
+			},
+		},
 	}
 
 	for _, m := range migrations {

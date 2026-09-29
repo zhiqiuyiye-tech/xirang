@@ -58,11 +58,15 @@ securityContext: {}
 # Application environment configuration
 config:
   requireK8s: true
-  cookieSecure: false  # Set to true when accessed over HTTPS
-  cookieSameSite: "Lax"
+  cookieSecure: false  # Required for the current HTTP-only internal deployment
+  cookieSameSite: "Strict"
+  jwtTTL: "30m"
   trustedProxies: []
   rateLimitMaxFailures: 5
   rateLimitLockoutDuration: "15m"
+  challengeRateLimitPerMinute: 10
+  challengeMaxPendingPerIP: 5
+  challengeMaxPendingGlobal: 1000
 
 # Persistent storage for the SQLite database.
 # MUST use a block-based or local StorageClass (local-path, hostPath, Ceph RBD, Longhorn).
@@ -76,7 +80,7 @@ persistence:
 secrets:
   aesKey: ""         # leave empty to auto-generate (base64 32-byte)
   jwtSecret: ""      # leave empty to auto-generate (base64)
-  adminPassword: ""  # leave empty to auto-generate (retrieve after install)
+  adminPassword: ""  # leave empty to auto-generate bootstrap/recovery secret
 
 scheduling:
   nodeSelector: {}

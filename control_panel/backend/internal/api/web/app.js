@@ -1,46 +1,27 @@
 /* Xirang Control Panel - Frontend SPA
- * Native HTML/CSS/JS - no build tools, no frameworks.
+ * Native HTML/CSS/JS with a locally bundled P-256 helper.
  * Hash-based routing, HttpOnly Cookie session, CSRF double-submit, SSE via EventSource.
  */
 
 (function () {
     'use strict';
 
-    // ===== URL Credentials Sanitizer (Security Guard) =====
-    // If user enters with credentials in query params (e.g. from accidental form GET submissions),
-    // immediately strip them from address bar & browser history, while safely filling into inputs.
-    (function sanitizeUrlCredentials() {
+    // Strip credential-like query parameters without copying their values into the page.
+    (function stripCredentialQueryParameters() {
         try {
             if (!window.location.search) return;
-            var search = window.location.search;
-            if (search.indexOf('password=') === -1 && search.indexOf('username=') === -1) return;
-
-            var params = new URLSearchParams(search);
-            var u = params.get('username') || '';
-            var p = params.get('password') || '';
-            params.delete('password');
-            params.delete('username');
-
+            var params = new URLSearchParams(window.location.search);
+            var removed = false;
+            ['username', 'password', 'private_key', 'private_key_pem'].forEach(function (name) {
+                if (params.has(name)) {
+                    params.delete(name);
+                    removed = true;
+                }
+            });
+            if (!removed) return;
             var remaining = params.toString();
             var cleanUrl = window.location.pathname + (remaining ? '?' + remaining : '') + window.location.hash;
             window.history.replaceState(null, document.title, cleanUrl);
-
-            function fillCredentials() {
-                if (u) {
-                    var uInput = document.getElementById('login-username');
-                    if (uInput && !uInput.value) uInput.value = u;
-                }
-                if (p) {
-                    var pInput = document.getElementById('login-password');
-                    if (pInput && !pInput.value) pInput.value = p;
-                }
-            }
-
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', fillCredentials);
-            } else {
-                fillCredentials();
-            }
         } catch (e) {}
     })();
 
@@ -94,12 +75,10 @@
     // ===== View Management =====
     function showLogin(msg) {
         isAuthenticated = false;
+        closeSSE();
         document.getElementById('login-view').style.display = 'flex';
         document.getElementById('app-view').style.display = 'none';
-        var errEl = document.getElementById('login-error');
-        if (errEl) {
-            errEl.textContent = msg || '';
-        }
+        if (window.XirangKeyLogin) window.XirangKeyLogin.renderLogin(msg || '');
     }
 
     function showApp() {
@@ -109,102 +88,19 @@
         handleRoute();
     }
 
-    // ===== Login =====
-    async function handleLogin(e) {
-        e.preventDefault();
-        var username = document.getElementById('login-username').value;
-        var password = document.getElementById('login-password').value;
-        var errEl = document.getElementById('login-error');
-        errEl.textContent = '';
-        var submitBtn = e.target.querySelector('button[type="submit"]');
-        if (submitBtn) submitBtn.disabled = true;
-
-        try {
-            var resp = await fetch('/api/v1/auth/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'same-origin',
-                body: JSON.stringify({ username: username, password: password })
-            });
-            if (!resp.ok) {
-                var d = await resp.json().catch(function () { return {}; });
-                errEl.textContent = d.error || '登录失败，请检查账号密码';
-                return;
-            }
-            clearLegacyTokens();
-            showApp();
-        } catch (err) {
-            errEl.textContent = '网络连接异常: ' + err.message;
-        } finally {
-            if (submitBtn) submitBtn.disabled = false;
-        }
-    }
+    window.XirangApp = {
+        showApp: showApp,
+        showLogin: showLogin,
+        clearLegacyTokens: clearLegacyTokens
+    };
 
     // ===== Logout =====
     async function handleLogout() {
-        try {
-            await apiFetch('/auth/logout', { method: 'POST' });
-        } catch (e) { /* ignore */ }
-        clearLegacyTokens();
-        showLogin();
+        if (window.XirangKeyLogin) await window.XirangKeyLogin.logoutCurrent();
     }
 
-    // ===== Change Password Modal =====
-    function showChangePasswordModal() {
-        var existing = document.getElementById('pwd-modal');
-        if (existing) existing.remove();
-
-        var html = '<div class="modal-overlay" id="pwd-modal">' +
-            '<div class="modal" style="max-width: 460px;">' +
-            '<h3 class="modal-title">修改管理员密码</h3>' +
-            '<form id="pwd-form">' +
-            '<div class="form-field"><label>当前密码</label><input type="password" name="old_password" required placeholder="请输入当前管理员密码"></div>' +
-            '<div class="form-field"><label>新密码 (12-72 字符)</label><input type="password" name="new_password" required minlength="12" maxlength="72" placeholder="请输入至少 12 位新密码"></div>' +
-            '<div class="form-field"><label>确认新密码</label><input type="password" name="confirm_password" required minlength="12" maxlength="72" placeholder="再次输入新密码"></div>' +
-            '<div id="pwd-error" class="error-msg"></div>' +
-            '<div class="modal-actions">' +
-            '<button type="button" class="btn btn-secondary" id="pwd-cancel">取消</button>' +
-            '<button type="submit" class="btn btn-primary">保存修改</button>' +
-            '</div>' +
-            '</form>' +
-            '</div></div>';
-
-        document.body.insertAdjacentHTML('beforeend', html);
-        var modal = document.getElementById('pwd-modal');
-        document.getElementById('pwd-cancel').addEventListener('click', function () { modal.remove(); });
-
-        document.getElementById('pwd-form').addEventListener('submit', async function (e) {
-            e.preventDefault();
-            var errEl = document.getElementById('pwd-error');
-            errEl.textContent = '';
-            var oldP = e.target.old_password.value;
-            var newP = e.target.new_password.value;
-            var confirmP = e.target.confirm_password.value;
-
-            if (newP !== confirmP) {
-                errEl.textContent = '两次输入的新密码不一致';
-                return;
-            }
-            if (newP.length < 12 || newP.length > 72) {
-                errEl.textContent = '新密码长度必须在 12 到 72 位之间';
-                return;
-            }
-
-            try {
-                var res = await apiJSON('/auth/password', {
-                    method: 'PUT',
-                    body: JSON.stringify({ old_password: oldP, new_password: newP })
-                });
-                if (!res.resp.ok) {
-                    errEl.textContent = (res.data && res.data.error) || '修改失败，请重试';
-                    return;
-                }
-                modal.remove();
-                alert('管理员密码修改成功，新会话已更新！');
-            } catch (err) {
-                errEl.textContent = '操作异常: ' + err.message;
-            }
-        });
+    async function handleLogoutAll() {
+        if (window.XirangKeyLogin) await window.XirangKeyLogin.logoutAll();
     }
 
     // ===== Utility =====
@@ -2041,10 +1937,8 @@
     });
 
     function genUUID() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-            var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
+        if (!window.XirangCrypto) throw new Error('Secure random generator unavailable');
+        return window.XirangCrypto.generateRandomUUID();
     }
 
     function showPlatformRegistrationModal(content, info) {
@@ -2536,121 +2430,79 @@
     });
 
     // ====================================================================
-    // SECURITY & PASSWORD PAGE
+    // SECURITY & SHARED KEY PAGE
     // ====================================================================
 
     registerRoute('/security', async function (content) {
-        content.innerHTML = '<div class="page-header">' +
-            '<div>' +
-            '<h2 class="page-title">系统安全与凭证管理</h2>' +
-            '<p class="page-subtitle">修改管理员访问密码、查看会话安全状态与加固策略</p>' +
+        content.innerHTML = '<div class="page-header"><div>' +
+            '<h2 class="page-title">系统安全与共享登录密钥</h2>' +
+            '<p class="page-subtitle">管理共享 P-256 私钥、会话状态与内网 HTTP 安全边界</p>' +
+            '</div></div>' +
+            '<div class="security-grid">' +
+            '<div id="key-rotation-card"></div>' +
+            '<div class="card"><h3 class="card-title">认证与传输状态</h3>' +
+            '<div class="security-facts">' +
+            '<div><span class="muted">管理员账号</span><strong id="sec-user">admin</strong></div>' +
+            '<div><span class="muted">登录方式</span><span class="badge badge-success">ECDSA P-256 challenge</span></div>' +
+            '<div><span class="muted">Session Cookie</span><span class="badge badge-success">HttpOnly · SameSite=Strict · 30 分钟</span></div>' +
+            '<div><span class="muted">CSRF 防护</span><span class="badge badge-success">双提交 Cookie + 同源请求</span></div>' +
+            '<div><span class="muted">当前会话版本</span><span id="sec-version" class="badge-mono font-mono">-</span></div>' +
+            '<div><span class="muted">当前公钥指纹</span><code id="sec-fingerprint" class="key-fingerprint">读取中</code></div>' +
             '</div>' +
-            '</div>' +
-            '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-top:16px;">' +
-            '<div class="card">' +
-            '<h3 class="card-title" style="margin-bottom:14px;">修改管理员密码</h3>' +
-            '<form id="page-pwd-form">' +
-            '<div class="form-field"><label>当前密码</label><input type="password" name="old_password" required placeholder="请输入当前管理员密码"></div>' +
-            '<div class="form-field"><label>新密码 (12-72 字符)</label><input type="password" name="new_password" required minlength="12" maxlength="72" placeholder="请输入至少 12 位新密码"></div>' +
-            '<div class="form-field"><label>确认新密码</label><input type="password" name="confirm_password" required minlength="12" maxlength="72" placeholder="再次输入新密码"></div>' +
-            '<div id="page-pwd-msg" class="error-msg" style="margin-bottom:12px;"></div>' +
-            '<button type="submit" class="btn btn-primary" style="width:100%;">保存并更新密码</button>' +
-            '</form>' +
-            '</div>' +
-            '<div class="card">' +
-            '<h3 class="card-title" style="margin-bottom:14px;">系统安全防护状态</h3>' +
-            '<div style="display:flex;flex-direction:column;gap:12px;font-size:0.9rem;">' +
-            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">当前登录账号</span><strong id="sec-user">admin</strong></div>' +
-            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">凭证存储机制</span><span class="badge badge-success">bcrypt + 动态盐</span></div>' +
-            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">会话隔离机制</span><span class="badge badge-success">HttpOnly + SameSite Cookie</span></div>' +
-            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">跨站请求伪造</span><span class="badge badge-success">CSRF 双提交 Cookie + 同源校验</span></div>' +
-            '<div style="display:flex;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.06);padding-bottom:8px;"><span class="muted">暴力破解防御</span><span class="badge badge-success">连续 5 次失败封禁 15 分钟</span></div>' +
-            '<div style="display:flex;justify-content:space-between;"><span class="muted">会话认证版本</span><span id="sec-version" class="badge-mono font-mono">-</span></div>' +
-            '</div>' +
-            '</div>' +
-            '</div>';
+            '<div class="security-warning">当前部署使用 HTTP。网络监听者仍可能窃取有效 Session；主动中间人可以篡改页面并读取被选中的私钥文件。IP 白名单不能替代 TLS。</div>' +
+            '</div></div>';
 
         try {
             var meResp = await apiJSON('/auth/me');
             if (meResp.resp.ok && meResp.data) {
-                var uEl = document.getElementById('sec-user');
-                var vEl = document.getElementById('sec-version');
-                if (uEl) uEl.textContent = meResp.data.username || 'admin';
-                if (vEl) vEl.textContent = 'v' + (meResp.data.auth_version || 1);
+                var userEl = document.getElementById('sec-user');
+                var versionEl = document.getElementById('sec-version');
+                if (userEl) userEl.textContent = meResp.data.username || 'admin';
+                if (versionEl) versionEl.textContent = 'v' + (meResp.data.auth_version || '-');
             }
-        } catch (e) {}
-
-        var form = document.getElementById('page-pwd-form');
-        if (form) {
-            form.addEventListener('submit', async function (e) {
-                e.preventDefault();
-                var msgEl = document.getElementById('page-pwd-msg');
-                msgEl.style.color = 'var(--danger)';
-                msgEl.textContent = '';
-                var oldP = form.old_password.value;
-                var newP = form.new_password.value;
-                var confirmP = form.confirm_password.value;
-
-                if (newP !== confirmP) {
-                    msgEl.textContent = '两次输入的新密码不一致';
-                    return;
-                }
-                if (newP.length < 12 || newP.length > 72) {
-                    msgEl.textContent = '新密码长度必须在 12 到 72 位之间';
-                    return;
-                }
-
-                try {
-                    var res = await apiJSON('/auth/password', {
-                        method: 'PUT',
-                        body: JSON.stringify({ old_password: oldP, new_password: newP })
-                    });
-                    if (!res.resp.ok) {
-                        msgEl.textContent = (res.data && res.data.error) || '修改失败，请检查原密码';
-                        return;
-                    }
-                    form.reset();
-                    msgEl.style.color = '#10b981';
-                    msgEl.textContent = '密码修改成功！旧会话已全部失效，当前会话已刷新。';
-                    try {
-                        var r2 = await apiJSON('/auth/me');
-                        if (r2.resp.ok && r2.data) {
-                            var vEl2 = document.getElementById('sec-version');
-                            if (vEl2) vEl2.textContent = 'v' + (r2.data.auth_version || 1);
-                        }
-                    } catch (err) {}
-                } catch (err) {
-                    msgEl.textContent = '操作异常: ' + err.message;
-                }
-            });
+            var authStatus = await window.XirangKeyLogin.refreshStatus();
+            var fingerprintEl = document.getElementById('sec-fingerprint');
+            if (fingerprintEl) fingerprintEl.textContent = authStatus.key_fingerprint || '未登记';
+        } catch (err) {
+            var fingerprintError = document.getElementById('sec-fingerprint');
+            if (fingerprintError) fingerprintError.textContent = '暂不可用';
+        }
+        if (window.XirangKeyLogin) {
+            window.XirangKeyLogin.renderRotation(document.getElementById('key-rotation-card'));
         }
     });
 
     // ===== Init =====
     async function checkAuth() {
         try {
-            var resp = await fetch('/api/v1/auth/me', { credentials: 'same-origin' });
+            var resp = await fetch('/api/v1/auth/me', { credentials: 'same-origin', cache: 'no-store' });
             if (resp.ok) {
                 var adminInfo = await resp.json().catch(function () { return null; });
                 if (adminInfo && adminInfo.username) {
                     var nameEl = document.querySelector('.user-name');
-                    if (nameEl) nameEl.textContent = adminInfo.username;
+                    if (nameEl) nameEl.textContent = adminInfo.username || 'admin';
+                }
+                if (window.XirangKeyLogin) {
+                    await window.XirangKeyLogin.refreshStatus().catch(function () {});
                 }
                 showApp();
                 return;
             }
         } catch (e) {}
+        if (window.XirangKeyLogin) {
+            await window.XirangKeyLogin.refreshStatus().catch(function () {});
+        }
         showLogin();
     }
 
     document.addEventListener('DOMContentLoaded', function () {
-        document.getElementById('login-form').addEventListener('submit', handleLogin);
-        document.getElementById('logout-btn').addEventListener('click', handleLogout);
-
-        var chgBtn = document.getElementById('change-pwd-btn');
-        if (chgBtn) {
-            chgBtn.addEventListener('click', showChangePasswordModal);
-        }
+        if (window.XirangKeyLogin) window.XirangKeyLogin.init();
+        var logoutButton = document.getElementById('logout-btn');
+        if (logoutButton) logoutButton.addEventListener('click', handleLogout);
+        var logoutAllButton = document.getElementById('logout-all-btn');
+        if (logoutAllButton) logoutAllButton.addEventListener('click', handleLogoutAll);
+        var rotateKeyButton = document.getElementById('rotate-key-btn');
+        if (rotateKeyButton) rotateKeyButton.addEventListener('click', function () { window.location.hash = '#/security'; });
 
         window.addEventListener('hashchange', function () {
             closeSSE();

@@ -26,7 +26,10 @@ func TestHealthLiveAndReady(t *testing.T) {
 	sshm := ssh.NewManager(nil, 1, time.Minute)
 	ws := workers.NewService(store, nil, sshm, eng)
 
-	r := NewRouter(tk, ws, store, eng, nil, sshm)
+	r, err := NewRouter(tk, ws, store, eng, nil, sshm)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// 1. Live probe
 	reqLive := httptest.NewRequest("GET", "/health/live", nil)
@@ -45,7 +48,10 @@ func TestHealthLiveAndReady(t *testing.T) {
 	}
 
 	// 3. Ready probe with requireK8s = true and nil client -> 503
-	rStrict := NewRouter(tk, ws, store, eng, nil, sshm, WithRequireK8s(true))
+	rStrict, err := NewRouter(tk, ws, store, eng, nil, sshm, WithRequireK8s(true))
+	if err != nil {
+		t.Fatal(err)
+	}
 	wStrict := httptest.NewRecorder()
 	rStrict.ServeHTTP(wStrict, reqReady)
 	if wStrict.Code != http.StatusServiceUnavailable {

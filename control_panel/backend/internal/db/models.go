@@ -2,12 +2,44 @@ package db
 
 import "time"
 
+type AuthState string
+
+const (
+	AuthStatePasswordBootstrap AuthState = "PASSWORD_BOOTSTRAP"
+	AuthStateKeyActive         AuthState = "KEY_ACTIVE"
+	AuthStateRecoveryPending   AuthState = "RECOVERY_PENDING"
+)
+
 type Admin struct {
-	ID           int64     `json:"id"`
-	Username     string    `json:"username"`
-	PasswordHash string    `json:"-"`
-	AuthVersion  int64     `json:"auth_version"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                   int64     `json:"id"`
+	Username             string    `json:"username"`
+	PasswordHash         string    `json:"-"`
+	AuthVersion          int64     `json:"auth_version"`
+	AuthState            AuthState `json:"-"`
+	PublicKeyPEM         *string   `json:"-"`
+	PublicKeyFingerprint *string   `json:"-"`
+	CreatedAt            time.Time `json:"created_at"`
+}
+
+type AuthChallengePurpose string
+
+const (
+	AuthChallengeLogin     AuthChallengePurpose = "LOGIN"
+	AuthChallengeBootstrap AuthChallengePurpose = "BOOTSTRAP"
+	AuthChallengeKeyRotate AuthChallengePurpose = "KEY_ROTATE"
+)
+
+type AuthChallenge struct {
+	ChallengeID       string               `json:"challenge_id"`
+	Nonce             string               `json:"nonce"`
+	Purpose           AuthChallengePurpose `json:"purpose"`
+	AuthVersion       int64                `json:"auth_version"`
+	KeyFingerprint    string               `json:"key_fingerprint"`
+	NewKeyFingerprint string               `json:"new_key_fingerprint"`
+	ClientIP          string               `json:"-"`
+	CreatedAt         time.Time            `json:"created_at"`
+	ExpiresAt         time.Time            `json:"expires_at"`
+	ConsumedAt        *time.Time           `json:"-"`
 }
 
 type WorkerNode struct {

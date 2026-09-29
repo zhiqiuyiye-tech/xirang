@@ -45,7 +45,11 @@ func newRouterWithK8s(t *testing.T) (*gin.Engine, *db.Store, *auth.Tokens, kuber
 	tk := auth.NewTokens("secret", time.Hour)
 	cs := fake.NewSimpleClientset()
 	k8s.RegisterK8sHandlers(eng, cs)
-	return NewRouter(tk, ws, s, eng, cs, sshm), s, tk, cs
+	router, err := NewRouter(tk, ws, s, eng, cs, sshm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return router, s, tk, cs
 }
 
 // TestCreateServiceViaAPI drives the full HTTP path: POST /api/v1/k8s/services
@@ -328,7 +332,10 @@ func TestK8sEndpointsUnavailableWithoutClient(t *testing.T) {
 	ws := workers.NewService(s, c, sshm, eng)
 	tk := auth.NewTokens("secret", time.Hour)
 	// Pass nil as the k8s client - simulates non-cluster / local dev.
-	r := NewRouter(tk, ws, s, eng, nil, sshm)
+	r, err := NewRouter(tk, ws, s, eng, nil, sshm)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, path := range []string{"/api/v1/k8s/services?namespace=ns1", "/api/v1/k8s/network-policies?namespace=ns1"} {
 		req := httptest.NewRequest("GET", path, nil)

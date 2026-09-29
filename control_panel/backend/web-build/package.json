@@ -1,0 +1,17 @@
+{
+  "name": "xirang-control-panel-key-login-build",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "asn1js": "3.0.10"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

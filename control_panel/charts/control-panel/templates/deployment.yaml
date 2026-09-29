@@ -72,6 +72,8 @@ spec:
               value: "{{ .Values.config.cookieSecure }}"
             - name: COOKIE_SAMESITE
               value: "{{ .Values.config.cookieSameSite }}"
+            - name: JWT_TTL
+              value: "{{ .Values.config.jwtTTL }}"
             {{- if .Values.config.trustedProxies }}
             - name: TRUSTED_PROXIES
               value: "{{ join "," .Values.config.trustedProxies }}"
@@ -80,6 +82,12 @@ spec:
               value: "{{ .Values.config.rateLimitMaxFailures }}"
             - name: LOGIN_RATE_LIMIT_LOCKOUT_DURATION
               value: "{{ .Values.config.rateLimitLockoutDuration }}"
+            - name: AUTH_CHALLENGE_RATE_LIMIT_PER_MINUTE
+              value: "{{ .Values.config.challengeRateLimitPerMinute }}"
+            - name: AUTH_CHALLENGE_MAX_PENDING_PER_IP
+              value: "{{ .Values.config.challengeMaxPendingPerIP }}"
+            - name: AUTH_CHALLENGE_MAX_PENDING_GLOBAL
+              value: "{{ .Values.config.challengeMaxPendingGlobal }}"
           volumeMounts:
             - name: data
               mountPath: /data

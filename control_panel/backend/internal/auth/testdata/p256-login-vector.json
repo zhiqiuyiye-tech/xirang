@@ -1,0 +1,12 @@
+{
+  "_warning": "TEST ONLY. Private scalar 1 is publicly known and must never be used outside interoperability tests.",
+  "private_key_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAAAGhRANCAARrF9Hy4SxCR/i85uVjpEDydwN9gS3r\nM6D0oTlF2JjClk/jQuL+Gn+bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1\n-----END PRIVATE KEY-----\n",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaxfR8uEsQkf4vOblY6RA8ncDfYEt\n6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9Q==\n-----END PUBLIC KEY-----\n",
+  "message": "xirang-control-panel-login-v1\nAQIDBAUGBwgJCgsMDQ4PEA\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n1\n5cd252fb0ce8932436faf8ccd1040981b89ee4ad6b9fe9e2a2b7e71aacb27cd3",
+  "digest_hex": "80040acc8d35cbeb0340621d1ee268220ce26755eec09127aa2b65333ee90966",
+  "signature": "s04AO7on-BvfsL3tZimCE_AX9xVW1kMhsLjBgCRGYZ6P1GiocOeE9rPVO59ZzFLD_-LmFIZLaiOiUDP1pH8W2Q",
+  "js_signature": "DDKoHI6sD-KSel68pei_40VB1lTntvTlnKPL4XXAgm9aN5J7wyyvRHd8qux3WCAqtO2oiB6p5d_J-jYrzHG23w",
+  "browser_generated_private_key_pem": "-----BEGIN PRIVATE KEY-----\nMEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCAAQ1xhtFBRuIbsGrFp\nNgAKpQyoG/6ZatQcDCkZLCiLsg==\n-----END PRIVATE KEY-----\n",
+  "browser_generated_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEx9H3no1pai4hmI4HUau1nGSqPFza\nffrD5etpwAuWeQ774aKEQBTtrLBWyekdux/lqL6F/loLV+/5U6p7ACZdjA==\n-----END PUBLIC KEY-----\n",
+  "browser_generated_fingerprint": "a71df32b771d273a0c458ccfe7ec338091688a57e09e7450b17587dca964698e"
+}

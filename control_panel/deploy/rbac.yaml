@@ -3,7 +3,7 @@
 #
 # Least-privilege: the control panel only manages Services and NetworkPolicies
 # (full CRUD) plus read-only Pod access (for ownerReferences UID lookup). It
-# does NOT touch Secrets/ConfigMaps - the AES/JWT/admin-password Secret is
+# does NOT touch Secrets/ConfigMaps - the AES/JWT/bootstrap-recovery Secret is
 # consumed only via env var secretKeyRef on the Deployment, which is resolved
 # by the kubelet, not by the application's service account.
 

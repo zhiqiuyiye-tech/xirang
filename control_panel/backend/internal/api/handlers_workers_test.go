@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"k8s.io/client-go/kubernetes/fake"
 	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -21,7 +22,6 @@ import (
 	"xirang/control_panel/internal/storage"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
-	"k8s.io/client-go/kubernetes/fake"
 )
 
 func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.Tokens) {
@@ -40,11 +40,15 @@ func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.To
 	cs := fake.NewSimpleClientset()
 	k8s.RegisterK8sHandlers(eng, cs)
 	storage.RegisterStorageHandlers(eng, sshm, s)
-	return NewRouter(tk, ws, s, eng, cs, sshm), ws, s, tk
+	router, err := NewRouter(tk, ws, s, eng, cs, sshm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return router, ws, s, tk
 }
 
 func authHeader(t *testing.T, tk *auth.Tokens) string {
-	tok, _ := tk.Issue(1, "admin")
+	tok, _ := tk.Issue(1, "admin", 2)
 	return "Bearer " + tok
 }
 

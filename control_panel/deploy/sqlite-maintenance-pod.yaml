@@ -1,0 +1,32 @@
+# Apply only after scaling control-panel to zero. This one-shot pod mounts the
+# same local SQLite PVC and is for consistent backup or offline auth recovery.
+# Delete it and restore the app replica after the database operation.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: control-panel-sqlite-maintenance
+  namespace: control-panel
+  labels:
+    app.kubernetes.io/name: control-panel-sqlite-maintenance
+spec:
+  restartPolicy: Never
+  containers:
+    - name: sqlite
+      image: registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+          readOnly: false
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: control-panel-data

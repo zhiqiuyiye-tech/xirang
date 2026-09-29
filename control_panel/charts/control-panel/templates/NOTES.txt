@@ -4,7 +4,7 @@ Control panel is deploying to namespace '{{ .Release.Namespace }}'.
 
    kubectl -n {{ .Release.Namespace }} rollout status deployment/control-panel
 
-2. Retrieve the auto-generated initial admin password (username: admin):
+2. Retrieve the bootstrap/recovery password from the Secret (username: admin):
 
    kubectl -n {{ .Release.Namespace }} get secret control-panel-secrets \
      -o jsonpath='{.data.ADMIN_INIT_PASSWORD}' | base64 -d ; echo
@@ -22,16 +22,17 @@ Control panel is deploying to namespace '{{ .Release.Namespace }}'.
 
 {{- end }}
 
-First-time setup: add Worker nodes (host/port/username), set their SSH private key
-or panel-side password via the UI, click "安装依赖" to auto-install lvm2/nfs-utils,
-then manage K8s SVC/NetworkPolicy and NFS storage from the UI.
+First-time login: use the retrieved bootstrap password once to generate and
+register a shared P-256 private-key file. Re-select the downloaded PEM to verify
+it, then distribute the same file to authorized operators over a controlled
+channel. Subsequent sign-ins use the private-key file only. All Worker, K8s,
+and NFS operations are available to every holder of that shared key.
 
 Notes:
-- AES_KEY/JWT_SECRET/admin password are generated once on first install and
-  reused across `helm upgrade` (lookup reuses the existing Secret), so the
-  admin password and encrypted worker credentials keep working after an image
-  bump. To force a rotation, pin secrets.aesKey / secrets.jwtSecret /
-  secrets.adminPassword in values (only on first install or when rotating).
+- AES_KEY/JWT_SECRET/bootstrap-recovery secret are generated once on first install
+  and reused across `helm upgrade`. Keep ADMIN_INIT_PASSWORD for operator recovery;
+  it is not a fallback login once a public key is active. Changing secrets.adminPassword
+  alone does not replace the active key or reset the database auth state.
 - The pod pulls {{ .Values.image.repository }}:{{ .Values.image.tag }} with
   imagePullPolicy: {{ .Values.image.pullPolicy }}. Ensure cluster nodes can reach
   the registry; if it needs auth, set image.imagePullSecrets in values.

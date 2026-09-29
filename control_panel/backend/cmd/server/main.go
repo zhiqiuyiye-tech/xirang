@@ -105,10 +105,11 @@ func main() {
 	})
 
 	gin.SetMode(gin.ReleaseMode)
-	r := api.NewRouter(tk, ws, store, eng, k8sClient, sshm,
+	r, err := api.NewRouter(tk, ws, store, eng, k8sClient, sshm,
 		api.WithCollector(inventoryCollector),
 		api.WithStaleAfter(cfg.StorageStaleAfter),
 		api.WithRateLimiter(limiter),
+		api.WithChallengeLimits(cfg.ChallengeRateLimitPerMinute, cfg.ChallengeMaxPendingPerIP, cfg.ChallengeMaxPendingGlobal),
 		api.WithCookieName(cfg.CookieName),
 		api.WithCookieSecure(cfg.CookieSecure),
 		api.WithCookieSameSite(cfg.CookieSameSite),
@@ -117,6 +118,9 @@ func main() {
 		api.WithRequireK8s(cfg.RequireK8s),
 		api.WithTrustedProxies(cfg.TrustedProxies),
 	)
+	if err != nil {
+		log.Fatalf("router: %v", err)
+	}
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: r}
 	go func() {
@@ -146,12 +150,14 @@ func seedAdmin(ctx context.Context, store *db.Store, initPw string) error {
 	if err != nil {
 		return err
 	}
-	if seeded {
-		return nil
+	if !seeded {
+		hash, err := auth.HashPassword(initPw)
+		if err != nil {
+			return err
+		}
+		if err := store.InitializeAdminAuth(ctx, hash); err != nil {
+			return err
+		}
 	}
-	hash, err := auth.HashPassword(initPw)
-	if err != nil {
-		return err
-	}
-	return store.UpsertAdminPassword(ctx, "admin", hash)
+	return store.ValidateAdminAuthState(ctx)
 }

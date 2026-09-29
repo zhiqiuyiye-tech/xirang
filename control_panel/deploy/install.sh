@@ -5,20 +5,19 @@
 # This script:
 #   1. Validates that kubectl is available and connected to a cluster.
 #   2. If the Secret 'control-panel-secrets' already exists: REUSES its values
-#      (AES_KEY/JWT_SECRET/ADMIN_INIT_PASSWORD) unchanged, so the admin password
-#      and encrypted worker credentials keep working across upgrades. Only
-#      re-renders secret.yaml (a no-op on the cluster) and re-applies the other
-#      manifests (picking up any image/deployment changes).
+#      (AES_KEY/JWT_SECRET/ADMIN_INIT_PASSWORD) unchanged, preserving encrypted
+#      worker credentials and the bootstrap/recovery secret. Only re-renders
+#      secret.yaml and re-applies the remaining manifests.
 #   3. On first install (or with --reset-secrets): generates fresh AES_KEY and
-#      JWT_SECRET via openssl and prompts for the initial admin password.
+#      JWT_SECRET via openssl and prompts for the bootstrap/recovery password.
 #   4. Renders the Secret into secret.yaml (git-ignored).
 #   5. Applies all manifests in this directory to the cluster.
 #   6. Prints the NodePort access URL.
 #
 # Idempotent and upgrade-safe: re-running to pick up a new image preserves the
-# existing Secret by default. Use --reset-secrets to force regeneration (this
-# invalidates existing encrypted worker credentials and the retrievable admin
-# password - back up first).
+# existing Secret by default. Use --reset-secrets to force regeneration; this
+# invalidates existing encrypted worker credentials and changes the stored
+# bootstrap/recovery Secret. Back up the old AES_KEY and recovery Secret first.
 #
 # Usage:
 #   ./install.sh [--reset-secrets]
@@ -77,12 +76,12 @@ Usage: ./install.sh [--reset-secrets]
 
 Installs or upgrades the control panel. By default, if the Secret
 'control-panel-secrets' already exists, its values (AES_KEY, JWT_SECRET,
-ADMIN_INIT_PASSWORD) are REUSED unchanged so the admin password and encrypted
-worker credentials keep working across image upgrades.
+ADMIN_INIT_PASSWORD) are REUSED unchanged so encrypted worker credentials and
+the bootstrap/recovery secret remain stable across image upgrades.
 
-  --reset-secrets   Force regeneration of AES_KEY/JWT_SECRET/admin password.
-                    Invalidates existing encrypted worker credentials and the
-                    retrievable admin password - back up first.
+  --reset-secrets   Force regeneration of AES_KEY/JWT_SECRET/bootstrap secret.
+                    Invalidates existing encrypted worker credentials and
+                    changes the recovery secret - back up first.
 EOF
             exit 0 ;;
         *) die "unknown argument: ${arg} (see --help)" ;;
@@ -104,13 +103,13 @@ read_secret_key() {
 }
 
 if [ "${SECRET_EXISTS}" = "1" ] && [ "${RESET_SECRETS}" = "0" ]; then
-    # Upgrade / re-run: reuse the existing Secret values verbatim. The admin
-    # password is bcrypt-hashed in the SQLite DB (on the PVC) and the per-worker
-    # SSH credentials are AES-encrypted with AES_KEY in the same DB - reusing
-    # these values keeps both working. Re-rendering secret.yaml with identical
-    # values is a no-op on the cluster; re-applying picks up image/deployment
+    # Upgrade / re-run: reuse the existing Secret values verbatim. ADMIN_INIT_PASSWORD
+    # remains the offline recovery secret; after key enrollment its database hash
+    # is disabled until an operator performs the documented recovery procedure.
+    # AES_KEY continues to encrypt per-worker SSH credentials in the same DB.
+    # Re-rendering secret.yaml with identical values is a no-op on the cluster;
     # changes only.
-    log "Secret '${SECRET_NAME}' exists - reusing its values (passwords unchanged)."
+    log "Secret '${SECRET_NAME}' exists - reusing its values (recovery secret unchanged)."
     AES_KEY="$(read_secret_key AES_KEY)"
     JWT_SECRET="$(read_secret_key JWT_SECRET)"
     ADMIN_INIT_PASSWORD_B64="$(read_secret_key ADMIN_INIT_PASSWORD)"
@@ -124,7 +123,7 @@ else
         warn "Re-applying will OVERWRITE the existing values:"
         warn "  - Rotate AES_KEY: existing encrypted per-worker SSH private keys become unreadable (back up the old key first if needed)."
         warn "  - Rotate JWT_SECRET: all current login sessions are invalidated."
-        warn "  - Reset ADMIN_INIT_PASSWORD: the retrievable password changes (the DB bcrypt hash is only seeded on first startup, so the old password keeps working until you change it)."
+        warn "  - Reset ADMIN_INIT_PASSWORD: the new value becomes the recovery/bootstrap secret after an explicit offline reset; it does not replace an active public key."
         read -r -p "Overwrite? Type 'yes' to continue: " CONFIRM
         [ "${CONFIRM}" = "yes" ] || die "aborted by user."
     fi
@@ -137,9 +136,9 @@ else
     JWT_SECRET="$(openssl rand 32 | base64 | tr -d '\n')"
     if [ -z "${JWT_SECRET}" ]; then die "failed to generate JWT_SECRET"; fi
 
-    log "Prompt for initial admin password (input hidden)..."
+    log "Prompt for bootstrap/recovery password (input hidden)..."
     while true; do
-        read -r -s -p "  Initial admin password (min 8 chars): " ADMIN_PW
+        read -r -s -p "  Bootstrap/recovery password (min 8 chars): " ADMIN_PW
         echo
         if [ "${#ADMIN_PW}" -lt 8 ]; then
             warn "Password must be at least 8 characters. Please try again."
@@ -202,7 +201,7 @@ echo "Access the web UI via NodePort (30180):"
 echo "  http://<any-node-ip>:30180/"
 echo
 echo "Default admin username: admin"
-echo "Login with the password you just set."
+echo "On first access, use the bootstrap password to generate and enroll the shared P-256 key file."
 echo
 echo "Manifests applied:"
 echo "  - Namespace, ServiceAccount, ClusterRole, ClusterRoleBinding (rbac.yaml)"

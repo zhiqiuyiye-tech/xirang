@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -34,6 +36,15 @@ func Open(path string) (*Store, error) {
 		d.Close()
 		return nil, err
 	}
+	var sqliteVersion string
+	if err := d.QueryRow("SELECT sqlite_version()").Scan(&sqliteVersion); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("read sqlite runtime version: %w", err)
+	}
+	if !sqliteVersionAtLeast(sqliteVersion, 3, 35, 0) {
+		d.Close()
+		return nil, fmt.Errorf("SQLite runtime %q is older than required 3.35.0", sqliteVersion)
+	}
 	s := &Store{db: d}
 	if err := runMigrations(d); err != nil {
 		d.Close()
@@ -46,3 +57,25 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // Ping verifies that the underlying database connection is still alive.
 func (s *Store) Ping() error { return s.db.Ping() }
+
+func sqliteVersionAtLeast(version string, major, minor, patch int) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	actual := [3]int{}
+	for i, part := range parts {
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return false
+		}
+		actual[i] = value
+	}
+	required := [3]int{major, minor, patch}
+	for i := range actual {
+		if actual[i] != required[i] {
+			return actual[i] > required[i]
+		}
+	}
+	return true
+}

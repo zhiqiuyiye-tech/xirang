@@ -12,6 +12,7 @@ const (
 )
 
 func setMinimalEnv() {
+	unsetMinimalEnv()
 	os.Setenv("AES_KEY", base64_32bytes)
 	os.Setenv("JWT_SECRET", "s3cret")
 	os.Setenv("ADMIN_INIT_PASSWORD", "initpass")
@@ -35,6 +36,9 @@ func unsetMinimalEnv() {
 	os.Unsetenv("LOGIN_RATE_LIMIT_MAX_FAILURES")
 	os.Unsetenv("LOGIN_RATE_LIMIT_LOCKOUT_DURATION")
 	os.Unsetenv("LOGIN_RATE_LIMIT_WINDOW")
+	os.Unsetenv("AUTH_CHALLENGE_RATE_LIMIT_PER_MINUTE")
+	os.Unsetenv("AUTH_CHALLENGE_MAX_PENDING_PER_IP")
+	os.Unsetenv("AUTH_CHALLENGE_MAX_PENDING_GLOBAL")
 	os.Unsetenv("REQUIRE_K8S")
 	os.Unsetenv("WORKER_HEARTBEAT_INTERVAL")
 	os.Unsetenv("WORKER_HEARTBEAT_TIMEOUT")
@@ -62,8 +66,11 @@ func TestLoad_OK(t *testing.T) {
 	if cfg.ListenAddr != ":8080" {
 		t.Fatalf("ListenAddr default = %q", cfg.ListenAddr)
 	}
-	if cfg.JWTTTL != 4*time.Hour {
-		t.Fatalf("JWTTTL default = %v, want 4h", cfg.JWTTTL)
+	if cfg.JWTTTL != 30*time.Minute {
+		t.Fatalf("JWTTTL default = %v, want 30m", cfg.JWTTTL)
+	}
+	if cfg.ChallengeRateLimitPerMinute != 10 || cfg.ChallengeMaxPendingPerIP != 5 || cfg.ChallengeMaxPendingGlobal != 1000 {
+		t.Fatalf("challenge limits = rate:%d perIP:%d global:%d", cfg.ChallengeRateLimitPerMinute, cfg.ChallengeMaxPendingPerIP, cfg.ChallengeMaxPendingGlobal)
 	}
 	if cfg.JWTIssuer != "xirang-control-panel" {
 		t.Fatalf("JWTIssuer default = %q", cfg.JWTIssuer)
@@ -77,8 +84,8 @@ func TestLoad_OK(t *testing.T) {
 	if cfg.CookieSecure != false {
 		t.Fatalf("CookieSecure = %v, want false", cfg.CookieSecure)
 	}
-	if cfg.CookieSameSite != "Lax" {
-		t.Fatalf("CookieSameSite = %q, want Lax", cfg.CookieSameSite)
+	if cfg.CookieSameSite != "Strict" {
+		t.Fatalf("CookieSameSite = %q, want Strict", cfg.CookieSameSite)
 	}
 	if cfg.RateLimitMaxFailures != 5 {
 		t.Fatalf("RateLimitMaxFailures = %d, want 5", cfg.RateLimitMaxFailures)
@@ -98,6 +105,9 @@ func TestLoad_CustomValues(t *testing.T) {
 	os.Setenv("COOKIE_SECURE", "true")
 	os.Setenv("COOKIE_SAMESITE", "strict")
 	os.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.0/24")
+	os.Setenv("AUTH_CHALLENGE_RATE_LIMIT_PER_MINUTE", "20")
+	os.Setenv("AUTH_CHALLENGE_MAX_PENDING_PER_IP", "8")
+	os.Setenv("AUTH_CHALLENGE_MAX_PENDING_GLOBAL", "2000")
 	os.Setenv("LOGIN_RATE_LIMIT_MAX_FAILURES", "3")
 	os.Setenv("LOGIN_RATE_LIMIT_LOCKOUT_DURATION", "10m")
 	os.Setenv("REQUIRE_K8S", "true")
@@ -114,6 +124,9 @@ func TestLoad_CustomValues(t *testing.T) {
 	}
 	if len(cfg.TrustedProxies) != 2 || cfg.TrustedProxies[0] != "10.0.0.0/8" || cfg.TrustedProxies[1] != "192.168.1.0/24" {
 		t.Fatalf("unexpected TrustedProxies: %+v", cfg.TrustedProxies)
+	}
+	if cfg.ChallengeRateLimitPerMinute != 20 || cfg.ChallengeMaxPendingPerIP != 8 || cfg.ChallengeMaxPendingGlobal != 2000 {
+		t.Fatalf("unexpected challenge limits: rate:%d perIP:%d global:%d", cfg.ChallengeRateLimitPerMinute, cfg.ChallengeMaxPendingPerIP, cfg.ChallengeMaxPendingGlobal)
 	}
 	if cfg.RateLimitMaxFailures != 3 {
 		t.Fatalf("RateLimitMaxFailures = %d, want 3", cfg.RateLimitMaxFailures)
@@ -136,6 +149,11 @@ func TestLoad_InvalidOptions(t *testing.T) {
 	}
 
 	os.Setenv("COOKIE_SAMESITE", "Lax")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected HTTP session policy to reject non-Strict SameSite")
+	}
+
+	os.Setenv("COOKIE_SAMESITE", "Strict")
 	os.Setenv("LOGIN_RATE_LIMIT_MAX_FAILURES", "0")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for 0 max failures")
@@ -145,6 +163,21 @@ func TestLoad_InvalidOptions(t *testing.T) {
 	os.Setenv("JWT_TTL", "-1m")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for negative JWT_TTL")
+	}
+
+	os.Setenv("JWT_TTL", "31m")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for JWT_TTL above 30m")
+	}
+	os.Setenv("JWT_TTL", "30m")
+	os.Setenv("TRUSTED_PROXIES", "10.0.0.1")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for trusted proxy without CIDR mask")
+	}
+	os.Unsetenv("TRUSTED_PROXIES")
+	os.Setenv("AUTH_CHALLENGE_MAX_PENDING_PER_IP", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for zero challenge pending cap")
 	}
 }
 
@@ -217,6 +250,16 @@ func TestLoad_MissingAESKey(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for missing AES_KEY")
+	}
+}
+
+func TestLoad_MissingAdminInitPassword(t *testing.T) {
+	os.Setenv("AES_KEY", base64_32bytes)
+	os.Setenv("JWT_SECRET", "s3cret")
+	os.Unsetenv("ADMIN_INIT_PASSWORD")
+	defer unsetMinimalEnv()
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for missing ADMIN_INIT_PASSWORD recovery secret")
 	}
 }
 

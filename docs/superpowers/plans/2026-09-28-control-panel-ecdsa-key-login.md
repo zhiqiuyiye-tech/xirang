@@ -68,7 +68,7 @@
 - [ ] **Step 3: Add the migration and startup DB checks**; set old records to `PASSWORD_BOOTSTRAP`, add canonical-key/state columns, create challenge storage, and bump old session versions once.
 - [ ] **Step 4: Add failing tests** for strict state invariants, `RECOVERY_PENDING` re-seeding, bootstrap/rotation CAS return versions, duplicate challenge rejection, expiry/purpose checks, and 100 concurrent challenge consumers with exactly one success.
 - [ ] **Step 5: Implement auth-store transactions**. Consume with conditional `UPDATE ... RETURNING`; create challenges, clean old rows, count source/global pending rows, and insert within one serialized SQLite write transaction; bootstrap/rotation use conditional updates and return the exact incremented version.
-- [ ] **Step 6: Add a concurrency test** that starts 100 goroutines creating challenges from one IP and proves per-IP/global limits are never exceeded; run `go test -race ./internal/db`.
+- [ ] **Step 6: Add a concurrency test** that starts 100 goroutines creating challenges from one IP and proves per-IP/global limits are never exceeded; run `go test -race ./internal/db` when a CGo compiler is available.
 
 ### Task 3: Enforce startup invariants, TTL, proxy trust and source-only throttling
 
@@ -79,6 +79,7 @@
 - Test: `control_panel/backend/internal/auth/ratelimit_test.go`
 - Modify: `control_panel/backend/internal/api/router.go`
 - Test: `control_panel/backend/internal/api/health_test.go`
+- Create: `control_panel/backend/internal/api/router_security_test.go`
 - Modify: `control_panel/backend/cmd/server/main.go`
 
 **Interfaces:**
@@ -99,7 +100,7 @@
 **Files:**
 - Modify: `control_panel/backend/internal/api/handlers_auth.go`
 - Modify: `control_panel/backend/internal/api/router.go`
-- Test: `control_panel/backend/internal/api/handlers_auth_test.go`
+- Test: `control_panel/backend/internal/api/handlers_auth_key_test.go`
 - Modify: `control_panel/backend/internal/auth/middleware.go` only if needed to preserve per-request version checking.
 
 **Interfaces:**
@@ -113,13 +114,14 @@
 - [ ] **Step 3: Add logout tests** proving ordinary logout clears only the request browser's cookies without changing `auth_version`, while logout-all bumps it and rejects every prior session.
 - [ ] **Step 4: Implement handler flows** using the protocol helpers from Task 1 and atomic store methods from Task 2; keep failure logging credential-free and rate-limited.
 - [ ] **Step 5: Wire routes and CSRF policies**; remove `/auth/password`, ensure key challenge endpoints have explicit purposes, enforce 8-KiB auth request bodies, and attach no-store headers.
-- [ ] **Step 6: Run** `go test ./internal/api -run 'Test(Auth|Challenge|Bootstrap|Rotate|Logout)' -count=1` and `go test -race ./internal/api ./internal/db`.
+- [ ] **Step 6: Run** `go test ./internal/api -run 'Test(Auth|Challenge|Bootstrap|Rotate|Logout)' -count=1` and run `go test -race ./internal/api ./internal/db` when a CGo compiler is available.
 
 ### Task 5: Bound authenticated SSE lifetime and revocation delay
 
 **Files:**
 - Modify: `control_panel/backend/internal/api/handlers_tasks.go`
 - Test: `control_panel/backend/internal/api/handlers_tasks_test.go`
+- Create: `control_panel/backend/internal/api/handlers_tasks_auth_lifetime_test.go`
 
 **Interfaces:**
 - SSE still authenticates with same-origin cookie and checks JWT expiry plus database `auth_version` at connection start.
@@ -142,6 +144,7 @@
 - Create: `control_panel/backend/internal/api/web/p256.bundle.js` (generated and committed)
 - Modify: `control_panel/backend/internal/api/web/index.html`
 - Modify: `control_panel/backend/internal/api/web/app.js`
+- Create: `control_panel/backend/internal/api/web/key_login.js`
 - Modify: `control_panel/backend/internal/api/web/styles.css`
 - Modify: `control_panel/backend/internal/api/static.go`
 - Modify: `control_panel/backend/internal/api/router.go`
@@ -155,28 +158,33 @@
 - [ ] **Step 1: Add Node failing tests** using the fixed Go vectors for PKCS#8 import/export, exact message digest, JS-sign/Go-verify and Go-sign/JS-verify; reject wrong curves, malformed/oversized PEM, and missing `crypto.getRandomValues()`.
 - [ ] **Step 2: Run** `npm test` in `control_panel/backend/web-build`; confirm the new crypto tests fail before implementation.
 - [ ] **Step 3: Implement browser crypto source** with deterministic ECDSA from the pinned library, strict DER/OID validation and no application-defined ECC arithmetic; run tests.
-- [ ] **Step 4: Build and pin the static artifact** with `npm ci && npm run build`; inspect the output/license bundle and verify no external import or CDN reference.
+- [ ] **Step 4: Build and pin the static artifact**: run `npm ci`, then `npm run build`; inspect the output/license bundle and verify no external import or CDN reference.
 - [ ] **Step 5: Add UI tests/manual steps** for key-state rendering, bootstrap re-selection, login challenge, key rotation dual proof, current-browser logout, and logout-all.
 - [ ] **Step 6: Update CSP/static routes**: `default-src 'self'`, `script-src 'self'`, `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`, `form-action 'self'`, `connect-src 'self'`, `img-src 'self' data:`, and `style-src 'self' 'unsafe-inline'`; no inline/eval script or third-party URLs; remove the login form's inline handler and `javascript:` action, set no-referrer, and mark login HTML/static signing code no-store.
-- [ ] **Step 7: Run** `npm test && npm run build` and backend `go test ./internal/api`.
+- [ ] **Step 7: Run separately** from `control_panel/backend/web-build`: `npm test` and `npm run build`; then run `go test ./internal/api` from `control_panel/backend`.
 
 ### Task 7: Update deployment configuration, recovery and operator docs
 
 **Files:**
+- Modify: `control_panel/backend/Dockerfile`
+- Create: `control_panel/backend/.dockerignore`
 - Modify: `control_panel/backend/cmd/server/main.go`
 - Modify: `control_panel/deploy/deployment.yaml`
+- Create: `control_panel/deploy/sqlite-maintenance-pod.yaml`
 - Modify: `control_panel/deploy/README.md`
 - Modify: `control_panel/charts/control-panel/values.yaml`
 - Modify: `control_panel/charts/control-panel/templates/deployment.yaml`
 - Modify: `control_panel/charts/control-panel/README.md`
 
 **Interfaces:**
-- Raw deployment and Helm remain `replicas: 1`; expose explicit JWT TTL, Strict SameSite, trusted proxy and challenge rate/pending configuration.
+- Raw deployment and Helm remain `replicas: 1`; the runtime image includes the SQLite CLI for online backup and an offline maintenance Pod procedure, while `.dockerignore` excludes `web-build/node_modules` from the Go build context. Expose explicit JWT TTL, Strict SameSite, trusted proxy and challenge rate/pending configuration.
 - Document the current `ADMIN_INIT_PASSWORD` as the bootstrap/recovery secret, the state-safe SQLite backup/reset procedure, shared-key non-attribution, file distribution/rotation, HTTP passive/active threat boundaries, current/global logout and 30-second SSE revocation window.
 
-- [ ] **Step 1: Update Helm defaults and raw deployment env** to set the frozen values and limits; keep secret generation unchanged.
-- [ ] **Step 2: Update both deployment READMEs** to remove password-login/change-password claims and document bootstrap, private-key backup, rotation, logout choices, offline recovery, SQLite single-replica/version requirement, and HTTP risks.
-- [ ] **Step 3: Run** `helm lint ./control_panel/charts/control-panel` and inspect rendered deployment values with `helm template`.
+- [ ] **Step 1: Add the runtime SQLite CLI and `.dockerignore`**; verify `sqlite3` exists in the Alpine image while `web-build/node_modules` is excluded from `docker build` context.
+- [ ] **Step 2: Update Helm defaults and raw deployment env** to set the frozen values and limits; keep secret generation unchanged.
+- [ ] **Step 3: Add the maintenance Pod manifest** for the shared `control-panel-data` PVC; keep the normal application deployment at one replica and document scale-down, consistent `.backup`, offline recovery SQL, cleanup, and restart steps.
+- [ ] **Step 4: Update both deployment READMEs** to remove password-login/change-password claims and document bootstrap, private-key backup, rotation, logout choices, offline recovery, SQLite single-replica/version requirement, and HTTP risks.
+- [ ] **Step 5: Run** `helm lint ./control_panel/charts/control-panel` and inspect rendered deployment values with `helm template`.
 
 ### Task 8: Run full regression and security-boundary verification
 
@@ -184,7 +192,7 @@
 - Verify all modified Go, JS, HTML, Helm and documentation files.
 
 - [ ] **Step 1: Run** `go test ./...` from `control_panel/backend`.
-- [ ] **Step 2: Run** `go test -race ./internal/auth ./internal/db ./internal/api` from `control_panel/backend`.
-- [ ] **Step 3: Run** `go vet ./...` from `control_panel/backend` and `npm ci && npm test && npm run build` from `control_panel/backend/web-build`.
-- [ ] **Step 4: Run** `helm lint` and `helm template`, then `git diff --check`.
+- [ ] **Step 2: Run** `go test -race ./internal/auth ./internal/db ./internal/api` when CGo and a C compiler are available; if unavailable, record that limitation and rely on the explicit 100-goroutine concurrency tests.
+- [ ] **Step 3: Run separately** from `control_panel/backend/web-build`: `npm ci`, then `npm test`, then `npm run build` (stop if any command exits nonzero).
+- [ ] **Step 4: Run** `go vet ./...` from `control_panel/backend`, `helm lint ./control_panel/charts/control-panel`, `helm template control-panel ./control_panel/charts/control-panel -n control-panel`, and `git diff --check`.
 - [ ] **Step 5: Review the final diff** against the frozen spec, confirm no private key or token logging, and confirm the worktree contains no unrelated changes.

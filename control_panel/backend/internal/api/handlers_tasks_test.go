@@ -76,7 +76,7 @@ func TestStreamCookieAuth(t *testing.T) {
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 	time.Sleep(100 * time.Millisecond)
 
-	tok, _ := tk.Issue(1, "admin")
+	tok, _ := tk.Issue(1, "admin", 2)
 	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream"
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -104,7 +104,7 @@ func TestStreamTokenQueryRejected(t *testing.T) {
 	wid, _ := ws.Create(context.Background(), workers.CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 
-	tok, _ := tk.Issue(1, "admin")
+	tok, _ := tk.Issue(1, "admin", 2)
 	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream?token=" + tok
 	req := httptest.NewRequest("GET", url, nil)
 	w := httptest.NewRecorder()
@@ -126,7 +126,7 @@ func TestStreamBearerHeader(t *testing.T) {
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 	time.Sleep(100 * time.Millisecond)
 
-	tok, _ := tk.Issue(1, "admin")
+	tok, _ := tk.Issue(1, "admin", 2)
 	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream"
 	// Bound the request so the looping SSE handler exits when the context
 	// times out (it emits the initial "task" frame before entering the loop).
@@ -157,7 +157,7 @@ func TestStreamBearerHeaderLowercase(t *testing.T) {
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 	time.Sleep(100 * time.Millisecond)
 
-	tok, _ := tk.Issue(1, "admin")
+	tok, _ := tk.Issue(1, "admin", 2)
 	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream"
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -182,7 +182,7 @@ func TestStreamLiveTaskAndStepUpdates(t *testing.T) {
 	taskID, _ := ws.ChangeRootPassword(context.Background(), wid, "x")
 	time.Sleep(150 * time.Millisecond)
 
-	tok, _ := tk.Issue(1, "admin")
+	tok, _ := tk.Issue(1, "admin", 2)
 	url := "/api/v1/tasks/" + strconv.Itoa(int(taskID)) + "/stream"
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()

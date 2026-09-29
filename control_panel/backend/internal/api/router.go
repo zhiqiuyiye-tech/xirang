@@ -1,7 +1,10 @@
 package api
 
 import (
+	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,16 +17,19 @@ import (
 )
 
 type RouterOptions struct {
-	RateLimiter    *auth.RateLimiter
-	CookieName     string
-	CookieSecure   bool
-	CookieSameSite string
-	CSRFCookieName string
-	CSRFHeaderName string
-	RequireK8s     bool
-	TrustedProxies []string
-	Collector      storageCollector
-	StaleAfter     time.Duration
+	RateLimiter                 *auth.RateLimiter
+	CookieName                  string
+	CookieSecure                bool
+	CookieSameSite              string
+	CSRFCookieName              string
+	CSRFHeaderName              string
+	RequireK8s                  bool
+	TrustedProxies              []string
+	ChallengeRateLimitPerMinute int
+	ChallengeMaxPendingPerIP    int
+	ChallengeMaxPendingGlobal   int
+	Collector                   storageCollector
+	StaleAfter                  time.Duration
 }
 
 type RouterOption func(*RouterOptions)
@@ -68,13 +74,34 @@ func WithTrustedProxies(proxies []string) RouterOption {
 	return func(o *RouterOptions) { o.TrustedProxies = proxies }
 }
 
+func WithChallengeLimits(perMinute, pendingPerIP, pendingGlobal int) RouterOption {
+	return func(o *RouterOptions) {
+		o.ChallengeRateLimitPerMinute = perMinute
+		o.ChallengeMaxPendingPerIP = pendingPerIP
+		o.ChallengeMaxPendingGlobal = pendingGlobal
+	}
+}
+
+func configureTrustedProxies(r *gin.Engine, proxies []string) error {
+	for _, proxy := range proxies {
+		if _, _, err := net.ParseCIDR(proxy); err != nil {
+			return fmt.Errorf("trusted proxy %q must be a CIDR: %w", proxy, err)
+		}
+	}
+	return r.SetTrustedProxies(proxies)
+}
+
 func securityHeadersMiddleware(isHTTPS bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("X-Frame-Options", "DENY")
-		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Referrer-Policy", "no-referrer")
 		c.Header("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'")
+		path := c.Request.URL.Path
+		if path == "/" || strings.HasPrefix(path, "/static/") || strings.HasPrefix(path, "/api/v1/auth/") {
+			c.Header("Cache-Control", "no-store")
+		}
 		if isHTTPS {
 			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
@@ -111,11 +138,11 @@ func readyHandler(store *db.Store, k8sClient kubernetes.Interface, requireK8s bo
 // NewRouter wires every HTTP route for the control panel. k8sClient may be nil
 // (non-cluster / local dev) - in that case the k8s endpoints return 503
 // Service Unavailable instead of panicking.
-func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks.Engine, k8sClient kubernetes.Interface, sshRunner ssh.Runner, opts ...RouterOption) *gin.Engine {
+func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks.Engine, k8sClient kubernetes.Interface, sshRunner ssh.Runner, opts ...RouterOption) (*gin.Engine, error) {
 	options := RouterOptions{
 		CookieName:     "cp_session",
 		CookieSecure:   false,
-		CookieSameSite: "Lax",
+		CookieSameSite: "Strict",
 		CSRFCookieName: "cp_csrf",
 		CSRFHeaderName: "X-CSRF-Token",
 	}
@@ -126,8 +153,8 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	if len(options.TrustedProxies) > 0 {
-		_ = r.SetTrustedProxies(options.TrustedProxies)
+	if err := configureTrustedProxies(r, options.TrustedProxies); err != nil {
+		return nil, fmt.Errorf("configure trusted proxies: %w", err)
 	}
 
 	r.Use(securityHeadersMiddleware(options.CookieSecure))
@@ -139,16 +166,23 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 	api := r.Group("/api/v1")
 
 	authH := newAuthHandlers(AuthHandlerConfig{
-		Store:          store,
-		Tokens:         tk,
-		Limiter:        options.RateLimiter,
-		CookieName:     options.CookieName,
-		CookieSecure:   options.CookieSecure,
-		CookieSameSite: options.CookieSameSite,
-		CSRFCookieName: options.CSRFCookieName,
-		TokenTTL:       tk.TTL(),
+		Store:                       store,
+		Tokens:                      tk,
+		Limiter:                     options.RateLimiter,
+		CookieName:                  options.CookieName,
+		CookieSecure:                options.CookieSecure,
+		CookieSameSite:              options.CookieSameSite,
+		CSRFCookieName:              options.CSRFCookieName,
+		TokenTTL:                    tk.TTL(),
+		ChallengeRateLimitPerMinute: options.ChallengeRateLimitPerMinute,
+		ChallengeMaxPendingPerIP:    options.ChallengeMaxPendingPerIP,
+		ChallengeMaxPendingGlobal:   options.ChallengeMaxPendingGlobal,
 	})
 
+	api.GET("/auth/status", authH.status)
+	api.POST("/auth/challenges/login", authH.loginChallenge)
+	api.POST("/auth/challenges/bootstrap", authH.bootstrapChallenge)
+	api.POST("/auth/bootstrap", authH.bootstrap)
 	api.POST("/auth/login", authH.login)
 
 	// SSE task stream (authenticated via session cookie or Bearer header)
@@ -167,8 +201,10 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 	}))
 	{
 		authed.GET("/auth/me", authH.me)
-		authed.PUT("/auth/password", authH.changePassword)
+		authed.POST("/auth/challenges/rotate", authH.rotateChallenge)
+		authed.PUT("/auth/key", authH.rotateKey)
 		authed.POST("/auth/logout", authH.logout)
+		authed.POST("/auth/logout-all", authH.logoutAll)
 
 		h := &workerHandlers{ws: ws, store: store, eng: eng}
 		authed.GET("/workers", h.list)
@@ -223,5 +259,5 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 
 	// Static frontend: embedded SPA served at GET / and GET /static/*.
 	registerStaticRoutes(r)
-	return r
+	return r, nil
 }
