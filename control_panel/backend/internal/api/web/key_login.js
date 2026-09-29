@@ -132,6 +132,11 @@
         if (!generateButton || !fileInput || !submitButton) return;
 
         generateButton.addEventListener('click', async function () {
+            var passwordInput = document.getElementById('bootstrap-password');
+            if (!passwordInput || !passwordInput.value) {
+                setLoginError('请输入初始化管理员密码。', false);
+                return;
+            }
             generateButton.disabled = true;
             setLoginError('', false);
             var privatePem = '';
