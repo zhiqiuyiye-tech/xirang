@@ -545,9 +545,84 @@
         return labels[reason] || '暂时无法确认具体原因';
     }
 
+    function groupPodNFSMounts(mounts) {
+        var grouped = [];
+        var matchedByDisk = new Map();
+        var relationKeysByGroup = new Map();
+        var containerMountKeysByGroup = new Map();
+
+        (Array.isArray(mounts) ? mounts : []).forEach(function (mount) {
+            if (!mount) return;
+            if (mount.status !== 'matched') {
+                grouped.push(Object.assign({}, mount, {
+                    pvc_pv_relations: [{ pvc_name: mount.pvc_name || '', pv_name: mount.pv_name || '' }]
+                }));
+                return;
+            }
+
+            var diskKey = JSON.stringify([
+                mount.worker_id == null ? null : mount.worker_id,
+                mount.vg_name || '',
+                mount.lv_name || '',
+                mount.export_path || ''
+            ]);
+            var group = matchedByDisk.get(diskKey);
+            if (!group) {
+                group = Object.assign({}, mount, { pvc_pv_relations: [], container_mounts: [] });
+                matchedByDisk.set(diskKey, group);
+                relationKeysByGroup.set(group, new Set());
+                containerMountKeysByGroup.set(group, new Set());
+                grouped.push(group);
+            }
+
+            var relation = { pvc_name: mount.pvc_name || '', pv_name: mount.pv_name || '' };
+            var relationKey = JSON.stringify([relation.pvc_name, relation.pv_name]);
+            var relationKeys = relationKeysByGroup.get(group);
+            if (!relationKeys.has(relationKey)) {
+                relationKeys.add(relationKey);
+                group.pvc_pv_relations.push(relation);
+            }
+
+            (Array.isArray(mount.container_mounts) ? mount.container_mounts : []).forEach(function (containerMount) {
+                var mountKey = JSON.stringify([
+                    containerMount.container_name || '',
+                    containerMount.mount_path || '',
+                    !!containerMount.read_only
+                ]);
+                var containerMountKeys = containerMountKeysByGroup.get(group);
+                if (containerMountKeys.has(mountKey)) return;
+                containerMountKeys.add(mountKey);
+                group.container_mounts.push(Object.assign({}, containerMount));
+            });
+        });
+
+        return grouped;
+    }
+
+    function uniqueMountedPods(mountedPods) {
+        var unique = [];
+        var byIdentity = new Map();
+        (Array.isArray(mountedPods) ? mountedPods : []).forEach(function (pod) {
+            if (!pod) return;
+            var identity = pod.pod_uid
+                ? 'uid:' + pod.pod_uid
+                : 'name:' + JSON.stringify([pod.namespace || '', pod.pod_name || '', pod.pvc_name || '', pod.pv_name || '']);
+            var existing = byIdentity.get(identity);
+            if (existing) {
+                if (!existing.owner_name && pod.owner_name) existing.owner_name = pod.owner_name;
+                if (!existing.note && pod.note) existing.note = pod.note;
+                return;
+            }
+            var entry = Object.assign({}, pod);
+            byIdentity.set(identity, entry);
+            unique.push(entry);
+        });
+        return unique;
+    }
+
     function podNFSMountSummary(pod) {
         var status = pod.nfs_mounts_status || 'none';
-        var mounts = Array.isArray(pod.nfs_mounts) ? pod.nfs_mounts : [];
+        var mounts = groupPodNFSMounts(pod.nfs_mounts);
         if (status === 'lookup_failed') return nfsMountStatusBadge(status);
         if (status === 'none' || mounts.length === 0) return '<span class="muted">无 PVC 型 NFS 关联</span>';
         if (status === 'pending') return nfsMountStatusBadge(status);
@@ -564,7 +639,7 @@
 
     function renderPodNFSMountDetails(pod) {
         var status = pod.nfs_mounts_status || 'none';
-        var mounts = Array.isArray(pod.nfs_mounts) ? pod.nfs_mounts : [];
+        var mounts = groupPodNFSMounts(pod.nfs_mounts);
         if (status === 'lookup_failed') {
             return '<div class="error-msg">关联查询暂不可用。错误分类：' + esc(pod.nfs_mounts_error || 'unknown') + '。Pod 与备注仍来自当前查询结果。</div>';
         }
@@ -572,10 +647,12 @@
             return '<div class="muted" style="padding:12px 0;">当前 Pod 没有可确认或未决的 PVC 型 NFS 挂载。</div>';
         }
         return '<div class="nfs-mount-list">' + mounts.map(function (mount) {
-            var identity = '<div class="nfs-mount-identifiers">' +
-                '<span>PVC: <code>' + esc(mount.pvc_name || '—') + '</code></span>' +
-                '<span>PV: <code>' + esc(mount.pv_name || '—') + '</code></span>' +
-                '</div>';
+            var relations = Array.isArray(mount.pvc_pv_relations) ? mount.pvc_pv_relations : [
+                { pvc_name: mount.pvc_name, pv_name: mount.pv_name }
+            ];
+            var identity = '<div class="nfs-mount-identifiers">' + relations.map(function (relation) {
+                return '<span>PVC: <code>' + esc(relation.pvc_name || '—') + '</code> / PV: <code>' + esc(relation.pv_name || '—') + '</code></span>';
+            }).join('') + '</div>';
             var location = mount.status === 'matched'
                 ? '<div class="nfs-mount-location">' +
                     '<div>Worker: <strong>' + esc(mount.worker_name || '—') + '</strong>' + (mount.worker_id != null ? ' <span class="muted">(#' + esc(mount.worker_id) + ')</span>' : '') + '</div>' +
@@ -610,18 +687,23 @@
         }).join('') + '</div>';
     }
 
+    function renderPortMappingPodIdentity(pod, primary) {
+        var badgeClass = primary ? 'badge badge-primary' : 'badge badge-muted';
+        return '<span class="' + badgeClass + ' font-mono" title="命名空间">' + esc((pod && pod.namespace) || '—') + '</span>';
+    }
+
     function renderLVMountedPods(mountedPods, associationStatus) {
+        var uniquePods = uniqueMountedPods(mountedPods);
         if (associationStatus === 'lookup_failed') return nfsMountStatusBadge('lookup_failed');
-        if (!Array.isArray(mountedPods) || mountedPods.length === 0) {
+        if (uniquePods.length === 0) {
             return associationStatus === 'partial'
                 ? '<span class="badge badge-warning">存在未决挂载，请查看告警</span>'
                 : '<span class="muted">暂无唯一匹配的 Notebook Pod</span>';
         }
-        return '<div class="nfs-mounted-pod-list">' + mountedPods.map(function (pod) {
+        return '<div class="nfs-mounted-pod-list">' + uniquePods.map(function (pod) {
             return '<div class="nfs-mounted-pod-item">' +
-                '<div><span class="badge badge-muted font-mono">' + esc(pod.namespace || '—') + '</span> <strong>' + esc(pod.pod_name || '—') + '</strong></div>' +
+                '<div>' + renderPortMappingPodIdentity(pod, false) + '</div>' +
                 '<div>' + (pod.owner_name ? '<strong>' + esc(pod.owner_name) + '</strong>' : '<span class="muted">使用人未设置</span>') + '</div>' +
-                (pod.note ? '<div class="muted nfs-mounted-pod-note">' + esc(pod.note) + '</div>' : '') +
                 '</div>';
         }).join('') + '</div>';
     }
@@ -665,8 +747,8 @@
             '</div>' +
             '<div class="table-responsive">' +
             '<table class="data-table" id="pods-table"><thead><tr>' +
-            '<th>Pod 名称</th><th>使用人 / 备注</th><th>命名空间</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th>NFS 挂载</th><th style="text-align:right;">操作</th>' +
-            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="9" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
+            '<th>命名空间</th><th>使用人 / 备注</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th>NFS 挂载</th><th style="text-align:right;">操作</th>' +
+            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="8" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
             '</div></div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
@@ -707,23 +789,22 @@
     async function loadPods(content) {
         var tbody = document.getElementById('pods-tbody');
         var msgEl = document.getElementById('pods-msg');
-        tbody.innerHTML = '<tr><td colspan="9" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
         try {
             var results = await Promise.all([apiJSON('/k8s/pods'), apiJSON('/k8s/services')]);
             var pr = results[0], sr = results[1];
             if (!pr.resp.ok) { setMsg(msgEl, '错误: ' + (pr.data && pr.data.error), 'error'); tbody.innerHTML = ''; return; }
             k8sServices = (sr.resp.ok && Array.isArray(sr.data)) ? sr.data : [];
             var pods = pr.data || [];
-            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="9" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
+            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="8" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
             tbody.innerHTML = pods.map(function (p) {
                 var cnt = servicesForPod(p.uid).length;
                 var ownerDisplay = p.owner_name
                     ? ('<strong>' + esc(p.owner_name) + '</strong>' + (p.note ? '<div class="muted" style="font-size:11.5px;">' + esc(p.note) + '</div>' : ''))
                     : '<span class="muted" style="font-size:12px;">(未设置)</span>';
                 return '<tr data-pod-uid="' + esc(p.uid) + '">' +
-                    '<td><strong>' + esc(p.name) + '</strong></td>' +
+                    '<td>' + renderPortMappingPodIdentity(p, false) + '</td>' +
                     '<td class="pod-owner-cell">' + ownerDisplay + '</td>' +
-                    '<td><span class="badge badge-muted font-mono">' + esc(p.namespace) + '</span></td>' +
                     '<td><span class="font-mono">' + esc(p.node) + '</span></td>' +
                     '<td>' + statusBadge(p.status) + '</td>' +
                     '<td><span class="font-mono">' + esc((p.ips || []).join(', ')) + '</span></td>' +
@@ -750,7 +831,7 @@
 
         var currentServices = servicesForPod(pod.uid);
         var initialSvcCount = currentServices.length;
-        var initialNFSMountCount = Array.isArray(pod.nfs_mounts) ? pod.nfs_mounts.length : 0;
+        var initialNFSMountCount = groupPodNFSMounts(pod.nfs_mounts).length;
 
         var html = '<div class="modal-overlay" id="port-modal">' +
             '<div class="modal modal-structured port-modal-dialog">' +
@@ -760,10 +841,9 @@
             '<div class="port-modal-title-row">' +
             '<svg class="port-modal-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 105.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 11-2.828-2.828l3-3z" clip-rule="evenodd"/></svg>' +
             '<span class="port-modal-title">Notebook 端口映射与归属配置</span>' +
-            '<span class="badge badge-primary font-mono">' + esc(pod.name) + '</span>' +
+            renderPortMappingPodIdentity(pod, true) +
             '</div>' +
             '<div class="port-modal-meta-pills">' +
-            '<span class="pill-item">命名空间: <code>' + esc(pod.namespace) + '</code></span>' +
             '<span class="pill-item">宿主节点: <code>' + esc(pod.node || 'N/A') + '</code></span>' +
             '<span class="pill-item">容器 IP: <code>' + esc((pod.ips || []).join(', ') || '未分配') + '</code></span>' +
             '<span class="pill-item">' + statusBadge(pod.status) + '</span>' +
