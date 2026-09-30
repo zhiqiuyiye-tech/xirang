@@ -583,3 +583,76 @@ func TestDeleteLVHandlerExplainsInUseLVAfterUnmount(t *testing.T) {
 		t.Fatalf("error=%v, want safe in-use guidance", got.Error)
 	}
 }
+
+func TestDeleteLVHandler_BlockedByActivePod(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"})
+
+	podChecker := func(ctx context.Context, workerHost, exportPath string) (bool, []string, error) {
+		return true, []string{"default/promtail-f8vmv (hostPath)", "prod/notebook-1 (pvc: nb-data)"}, nil
+	}
+
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(podChecker))
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	got, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error == nil || !strings.Contains(*got.Error, "cannot delete: volume is in use by pods") {
+		t.Fatalf("error=%v, want blocked by pods message", got.Error)
+	}
+	// Verify no umount or lvremove ran
+	for _, call := range sr.calls {
+		if strings.Contains(call, "umount") || strings.Contains(call, "lvremove") {
+			t.Fatalf("destructive command ran despite active pod blocker: %v", sr.calls)
+		}
+	}
+}
+
+func TestDeleteLVHandler_DiagnosesNamespaceHoldersOnInUse(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
+		scriptResult{stdout: "/data02/share\n"},
+		scriptResult{stdout: ""})
+	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{
+		stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5,
+	})
+	sr.add("cp-storage-find-holders", scriptResult{
+		stdout: "PID 591550 (/usr/bin/promtail): /data02/share\n",
+	})
+
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	got, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error == nil || !strings.Contains(*got.Error, "PID 591550") || !strings.Contains(*got.Error, "promtail") {
+		t.Fatalf("error=%v, want mount namespace holder diagnostic output", got.Error)
+	}
+}
+

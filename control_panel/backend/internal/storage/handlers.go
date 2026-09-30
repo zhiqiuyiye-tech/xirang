@@ -12,23 +12,59 @@ import (
 	"xirang/control_panel/internal/tasks"
 )
 
+// PodGuardChecker inspects Kubernetes Pods to verify if any pod is still using
+// or mounting the target NFS export. Returns inUse=true and blocker list if active.
+type PodGuardChecker func(ctx context.Context, workerHost, exportPath string) (inUse bool, blockers []string, err error)
+
+// StorageOption configures optional dependencies for storage handlers.
+type StorageOption func(*storageConfig)
+
+type storageConfig struct {
+	reservedMounts  []string
+	podGuardChecker PodGuardChecker
+}
+
+// WithReservedMounts configures custom protected mount points.
+func WithReservedMounts(mounts ...string) StorageOption {
+	return func(c *storageConfig) {
+		c.reservedMounts = append(c.reservedMounts, mounts...)
+	}
+}
+
+// WithPodGuardChecker injects a cluster-wide Pod usage guard for delete operations.
+func WithPodGuardChecker(checker PodGuardChecker) StorageOption {
+	return func(c *storageConfig) {
+		c.podGuardChecker = checker
+	}
+}
+
 // RegisterStorageHandlers registers the storage task handlers on the engine:
 // storage_provision_nfs / storage_reclaim_nfs (LVM+NFS lifecycle), install_deps
 // (lvm2/nfs-utils), storage_create_vg (auto-pool unused disks), storage_resize_lv
-// (lvextend/lvreduce), and storage_delete_lv (generalized LV teardown). Each
-// handler parses task.ParamsJSON, fetches the target worker, and executes the
-// command sequence via the SSH runner.
-func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store, configuredReservedMounts ...string) {
-	reservedMounts := []string{"/data01"}
-	if len(configuredReservedMounts) > 0 {
-		reservedMounts = append([]string(nil), configuredReservedMounts...)
+// (lvextend/lvreduce), and storage_delete_lv (generalized LV teardown).
+func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store, opts ...any) {
+	cfg := storageConfig{
+		reservedMounts: []string{"/data01"},
 	}
-	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store, reservedMounts: reservedMounts})
-	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store, reservedMounts: reservedMounts})
+	for _, opt := range opts {
+		switch o := opt.(type) {
+		case string:
+			cfg.reservedMounts = append(cfg.reservedMounts, o)
+		case StorageOption:
+			o(&cfg)
+		}
+	}
+	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
+	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
 	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
-	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: reservedMounts})
+	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
 	eng.Register("storage_resize_lv", &resizeLVHandler{runner: runner, store: store})
-	eng.Register("storage_delete_lv", &deleteLVHandler{runner: runner, store: store, reservedMounts: reservedMounts})
+	eng.Register("storage_delete_lv", &deleteLVHandler{
+		runner:          runner,
+		store:           store,
+		reservedMounts:  cfg.reservedMounts,
+		podGuardChecker: cfg.podGuardChecker,
+	})
 }
 
 // --- provisionHandler ---
@@ -578,9 +614,10 @@ func parseMountTargets(output string) []string {
 // mount point via findmnt so it can clean /etc/exports, umount, and clean
 // /etc/fstab before lvremove. Works for LVs created outside the control panel.
 type deleteLVHandler struct {
-	runner         ssh.Runner
-	store          *db.Store
-	reservedMounts []string
+	runner          ssh.Runner
+	store           *db.Store
+	reservedMounts  []string
+	podGuardChecker PodGuardChecker
 }
 
 func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -634,6 +671,33 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		st.Done("succeeded", out, stderr, "not mounted")
 	}
 
+	// 1.5. Pod Guard: Verify if any cluster Pod is mounting this NFS volume
+	if h.podGuardChecker != nil {
+		podStep, err := r.Step("check_pod_usage")
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+
+		exportPath := ""
+		if len(mountPoints) > 0 {
+			exportPath = mountPoints[0]
+		}
+		inUse, blockers, err := h.podGuardChecker(ctx, w.Host, exportPath)
+		if err != nil {
+			podStep.Done("failed", "", "", fmt.Sprintf("pod check failed: %v", err))
+			r.Fail(fmt.Sprintf("failed to evaluate pod usage guard: %v", err))
+			return err
+		}
+		if inUse {
+			msg := fmt.Sprintf("cannot delete: volume is in use by pods (%s)", strings.Join(blockers, "; "))
+			podStep.Done("failed", "", "", msg)
+			r.Fail(msg)
+			return fmt.Errorf("%s", msg)
+		}
+		podStep.Done("succeeded", "", "", "no active pods referencing volume")
+	}
+
 	// 2. teardown + remove. DeleteLVSteps unexports/unmounts every detected
 	// target, then verifies the LV is no longer mounted before lvremove.
 	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoints: mountPoints}) {
@@ -648,6 +712,11 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 			message := fmt.Sprintf("delete failed at %s: %s", s.Name, stderr)
 			if s.Name == "lvremove" && strings.Contains(strings.ToLower(stderr), "in use") {
 				message += "; check open file handles and other mount namespaces, stop consumers, then retry; no force removal was attempted"
+				// Diagnose lingering multi-namespace holders (e.g. Promtail or container hostPaths)
+				holdersOut, _, _, _ := h.runner.Run(ctx, *w, FindDeviceHoldersCmd(lvDev))
+				if strings.TrimSpace(holdersOut) != "" {
+					message += "\nDiagnostic details:\n" + strings.TrimSpace(holdersOut)
+				}
 			}
 			r.Fail(message)
 			return fmt.Errorf("delete failed at %s", s.Name)
@@ -657,3 +726,4 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 	r.Succeed()
 	return nil
 }
+

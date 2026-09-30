@@ -78,7 +78,18 @@ func main() {
 	// Storage task handlers: sshm implements ssh.Runner. Registered after the
 	// engine is created so the engine knows the type names before any storage
 	// API endpoint submits a task.
-	storage.RegisterStorageHandlers(eng, sshm, store, cfg.ReservedMountPoints...)
+	var podChecker storage.PodGuardChecker
+	if k8sClient != nil {
+		podChecker = func(ctx context.Context, workerHost, exportPath string) (bool, []string, error) {
+			return k8s.CheckNFSPodUsage(ctx, k8sClient, workerHost, exportPath)
+		}
+	}
+	storage.RegisterStorageHandlers(
+		eng, sshm, store,
+		storage.WithReservedMounts(cfg.ReservedMountPoints...),
+		storage.WithPodGuardChecker(podChecker),
+	)
+
 
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
