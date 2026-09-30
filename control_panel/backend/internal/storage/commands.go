@@ -339,3 +339,24 @@ func DeleteLVSteps(r DeleteLVReq) []Step {
 	)
 	return steps
 }
+
+// FindDeviceHoldersCmd inspects all process mountinfo files to locate any process (like Promtail
+// running in an isolated mount namespace) that still holds a mount of the device or its dm target.
+func FindDeviceHoldersCmd(devPath string) string {
+	d := shellLiteral(devPath)
+	return fmt.Sprintf(`# cp-storage-find-holders
+dev=%s
+realdev=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+majmin=$(lsblk -dn -o MAJ:MIN "$realdev" 2>/dev/null | head -n1 | tr -d ' ')
+echo "=== Searching mount namespaces holding $dev ($realdev $majmin) ==="
+for mi in /proc/[0-9]*/mountinfo; do
+  [ -f "$mi" ] || continue
+  if grep -qs -e "$dev" -e "$realdev" ${majmin:+-e "$majmin"} "$mi"; then
+    pid=$(echo "$mi" | cut -d/ -f3)
+    cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null || cat /proc/$pid/comm 2>/dev/null)
+    matched_mounts=$(grep -E "$dev|$realdev${majmin:+|$majmin}" "$mi" | awk '{print $5}')
+    echo "PID $pid ($cmd): $matched_mounts"
+  fi
+done`, d)
+}
+

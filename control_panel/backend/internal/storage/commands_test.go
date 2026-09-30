@@ -242,4 +242,15 @@ func TestDeleteLVSteps_Unmounted(t *testing.T) {
 	}
 }
 
+func TestFindDeviceHoldersCmd(t *testing.T) {
+	cmd := FindDeviceHoldersCmd("/dev/vg_data/lv_200g")
+	if !contains(cmd, "mountinfo") {
+		t.Fatalf("expected command to inspect /proc/*/mountinfo: %s", cmd)
+	}
+	if !contains(cmd, "/dev/vg_data/lv_200g") {
+		t.Fatalf("expected command to search for target device: %s", cmd)
+	}
+}
+
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
