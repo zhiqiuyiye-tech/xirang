@@ -300,31 +300,41 @@ func ResizeLVSteps(r ResizeLVReq) []Step {
 // --- LV delete (generalized reclaim for any LV) ---
 
 // DeleteLVReq holds parameters for deleting an arbitrary LV and releasing its
-// space back to the VG. MountPoint is detected by the handler (findmnt); when
-// empty (unmounted) the exports/umount steps are skipped.
+// space back to the VG. The handler fills MountPoints from findmnt; MountPoint
+// remains available for callers that only have one known mount target.
 type DeleteLVReq struct {
-	VGName     string
-	LVName     string
-	MountPoint string
+	VGName      string
+	LVName      string
+	MountPoint  string // legacy single-mount field
+	MountPoints []string
 }
 
-// DeleteLVSteps builds the teardown sequence. If the LV is mounted, it first
-// removes any /etc/exports line for the mount point, refreshes exports,
-// and unmounts. It always cleans any stale /etc/fstab line referencing the LV
-// device, then lvremoves. This is the generalized form of ReclaimSteps that
-// works for LVs not created by the control panel (no provision task).
+// DeleteLVSteps builds the teardown sequence. If mounted, it removes exports
+// for every mount target, refreshes exports, and unmounts deepest paths first.
+// It always cleans the fstab entry and verifies there are no remaining mounts
+// before attempting lvremove.
 func DeleteLVSteps(r DeleteLVReq) []Step {
 	lvDev := fmt.Sprintf("/dev/%s/%s", r.VGName, r.LVName)
-	steps := make([]Step, 0, 5)
-	if r.MountPoint != "" {
-		steps = append(steps,
-			Step{"remove_exports_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports`, r.MountPoint)},
-			Step{"exportfs", "exportfs -arv"},
-			Step{"umount", fmt.Sprintf("umount %s", r.MountPoint)},
-		)
+	mountPoints := r.MountPoints
+	if len(mountPoints) == 0 && r.MountPoint != "" {
+		mountPoints = []string{r.MountPoint}
+	}
+	steps := make([]Step, 0, len(mountPoints)*3+4)
+	if len(mountPoints) > 0 {
+		for _, mountPoint := range mountPoints {
+			steps = append(steps, Step{"remove_exports_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports`, mountPoint)})
+		}
+		steps = append(steps, Step{"exportfs", "exportfs -arv"})
+		for _, mountPoint := range mountPoints {
+			steps = append(steps,
+				Step{"check_mount_users", fmt.Sprintf(`if command -v fuser >/dev/null 2>&1; then fuser -vm %s 2>&1 || true; else echo "fuser is unavailable"; fi`, mountPoint)},
+				Step{"umount", fmt.Sprintf("umount %s", mountPoint)},
+			)
+		}
 	}
 	steps = append(steps,
 		Step{"remove_fstab_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab`, lvDev)},
+		Step{"verify_unmounted", fmt.Sprintf(`remaining=$(findmnt -rn -o TARGET --source %s 2>/dev/null); if [ -n "$remaining" ]; then echo "logical volume is still mounted at: $remaining" >&2; exit 1; fi`, lvDev)},
 		Step{"lvremove", fmt.Sprintf("lvremove -f %s", lvDev)},
 	)
 	return steps

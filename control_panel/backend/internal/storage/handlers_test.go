@@ -22,6 +22,9 @@ func (m *mockRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (string
 	if m.failAt > 0 && len(m.calls) == m.failAt {
 		return "", "boom", 1, nil
 	}
+	if strings.Contains(cmd, "lvs --noheadings -o lv_name") {
+		return "", "", 0, nil
+	}
 	return "ok", "", 0, nil
 }
 
@@ -47,8 +50,40 @@ func TestProvisionHandlerSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	if len(mr.calls) != 8 {
-		t.Fatalf("expected 8 calls, got %d: %v", len(mr.calls), mr.calls)
+	if len(mr.calls) != 9 {
+		t.Fatalf("expected 9 calls, got %d: %v", len(mr.calls), mr.calls)
+	}
+}
+
+func TestProvisionHandlerRejectsDuplicateLVName(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("lvs --noheadings -o lv_name '/dev/vg_data/lv_1'", scriptResult{stdout: " lv_1\n"})
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_provision_nfs", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1", "size_gb": 100.0,
+		"fs_type": "ext4", "mount_point": "/data02/nfs_lv_1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	got, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error == nil || !contains(*got.Error, "already exists") {
+		t.Fatalf("error=%v, want duplicate LV name rejection", got.Error)
+	}
+	for _, call := range sr.calls {
+		if strings.Contains(call, "lvcreate") || strings.Contains(call, "mkfs.") {
+			t.Fatalf("no destructive command should run for an existing LV: %v", sr.calls)
+		}
 	}
 }
 
@@ -56,7 +91,7 @@ func TestProvisionHandlerFailureTriggersRollback(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	mr := &mockRunner{failAt: 4} // mount fails
+	mr := &mockRunner{failAt: 5} // mount fails after the LV-name check
 	RegisterStorageHandlers(eng, mr, store)
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
@@ -445,5 +480,106 @@ func TestCreateVGHandler_RejectsVGNameCollisionOnDifferentPV(t *testing.T) {
 		if strings.Contains(call, "cp-storage-preflight") || strings.Contains(call, "pvcreate") || strings.Contains(call, "vgcreate") {
 			t.Fatalf("device must not be initialized when VG name belongs to another PV: %v", sr.calls)
 		}
+	}
+}
+
+func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
+		scriptResult{stdout: "/data02/share\n/data02/share/sub\n"},
+		scriptResult{stdout: ""})
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "succeeded", 2*time.Second)
+
+	commands := strings.Join(sr.calls, "\n")
+	subMount := strings.Index(commands, "umount /data02/share/sub")
+	parentMount := strings.Index(commands, "umount /data02/share\n")
+	userCheck := strings.Index(commands, "fuser -vm /data02/share/sub")
+	verifyUnmounted := strings.LastIndex(commands, "findmnt -rn -o TARGET --source /dev/vg_data/lv_1")
+	lvremove := strings.Index(commands, "lvremove -f /dev/vg_data/lv_1")
+	if subMount < 0 || parentMount < 0 || subMount > parentMount {
+		t.Fatalf("all mount targets must be unmounted deepest-first: %v", sr.calls)
+	}
+	if userCheck < 0 || userCheck > subMount {
+		t.Fatalf("mount users should be diagnosed before unmount: %v", sr.calls)
+	}
+	if verifyUnmounted <= parentMount || lvremove <= verifyUnmounted {
+		t.Fatalf("LV removal must follow unmount verification: %v", sr.calls)
+	}
+}
+
+func TestDeleteLVHandlerDoesNotRemoveStillMountedLV(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
+		scriptResult{stdout: "/data02/share\n"},
+		scriptResult{stderr: "logical volume is still mounted at: /data02/share", exitCode: 1})
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	for _, call := range sr.calls {
+		if strings.Contains(call, "lvremove -f /dev/vg_data/lv_1") {
+			t.Fatalf("lvremove ran while the LV was still mounted: %v", sr.calls)
+		}
+	}
+	got, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error == nil || !strings.Contains(*got.Error, "still mounted") {
+		t.Fatalf("error=%v, want a remaining-mount diagnostic", got.Error)
+	}
+}
+
+func TestDeleteLVHandlerExplainsInUseLVAfterUnmount(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
+		scriptResult{stdout: "/data02/share\n"},
+		scriptResult{stdout: ""})
+	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{
+		stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5,
+	})
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	got, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error == nil || !strings.Contains(*got.Error, "check open file handles and other mount namespaces") {
+		t.Fatalf("error=%v, want safe in-use guidance", got.Error)
 	}
 }

@@ -204,32 +204,41 @@ func TestResizeLVSteps_Shrink(t *testing.T) {
 
 func TestDeleteLVSteps_Mounted(t *testing.T) {
 	steps := DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_200g", MountPoint: "/data02/nb"})
-	// exports + exportfs + umount + fstab + lvremove
-	if len(steps) != 5 {
-		t.Fatalf("expected 5 steps for mounted LV, got %d", len(steps))
+	// exports + exportfs + user check + umount + fstab + verification + lvremove
+	if len(steps) != 7 {
+		t.Fatalf("expected 7 steps for mounted LV, got %d", len(steps))
 	}
 	if steps[0].Name != "remove_exports_line" || !contains(steps[0].Cmd, "/data02/nb") {
 		t.Fatalf("exports step wrong: %+v", steps[0])
 	}
-	if steps[2].Name != "umount" || steps[2].Cmd != "umount /data02/nb" {
-		t.Fatalf("umount step wrong: %+v", steps[2])
+	if steps[2].Name != "check_mount_users" || !contains(steps[2].Cmd, "fuser -vm /data02/nb") {
+		t.Fatalf("mount-user diagnostic step wrong: %+v", steps[2])
 	}
-	if steps[4].Cmd != "lvremove -f /dev/vg_data/lv_200g" {
-		t.Fatalf("lvremove wrong: %s", steps[4].Cmd)
+	if steps[3].Name != "umount" || steps[3].Cmd != "umount /data02/nb" {
+		t.Fatalf("umount step wrong: %+v", steps[3])
+	}
+	if steps[5].Name != "verify_unmounted" || !contains(steps[5].Cmd, "findmnt") {
+		t.Fatalf("unmount verification step wrong: %+v", steps[5])
+	}
+	if steps[6].Cmd != "lvremove -f /dev/vg_data/lv_200g" {
+		t.Fatalf("lvremove wrong: %s", steps[6].Cmd)
 	}
 }
 
 func TestDeleteLVSteps_Unmounted(t *testing.T) {
 	steps := DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_200g", MountPoint: ""})
-	// fstab + lvremove only (no exports/exportfs/umount)
-	if len(steps) != 2 {
-		t.Fatalf("expected 2 steps for unmounted LV, got %d", len(steps))
+	// fstab + verification + lvremove (no exports/exportfs/umount)
+	if len(steps) != 3 {
+		t.Fatalf("expected 3 steps for unmounted LV, got %d", len(steps))
 	}
 	if steps[0].Name != "remove_fstab_line" {
 		t.Fatalf("first step should be remove_fstab_line: %+v", steps[0])
 	}
-	if steps[1].Cmd != "lvremove -f /dev/vg_data/lv_200g" {
-		t.Fatalf("lvremove wrong: %s", steps[1].Cmd)
+	if steps[1].Name != "verify_unmounted" {
+		t.Fatalf("second step should verify unmounted state: %+v", steps[1])
+	}
+	if steps[2].Cmd != "lvremove -f /dev/vg_data/lv_200g" {
+		t.Fatalf("lvremove wrong: %s", steps[2].Cmd)
 	}
 }
 

@@ -2001,18 +2001,20 @@
         });
 
         document.getElementById('btn-nfs-create').addEventListener('click', async function () {
+            var btn = this;
             var wid = parseInt(wsel.value, 10);
             var vg = document.getElementById('st-vg-select').value;
             var size = parseInt(document.getElementById('st-nfs-size').value, 10);
             var msgEl = document.getElementById('st-nfs-msg');
             if (!wid || !vg || !size) { setMsg(msgEl, '请选择目标 Worker、存储卷组并输入容量 (GB)', 'error'); return; }
-            var lv = 'lv_nb_' + Date.now().toString(36);
-            var mp = '/data02/nfs_' + lv;
+            btn.disabled = true;
             try {
+                var lv = 'lv_nb_' + genUUID().replace(/-/g, '').toLowerCase();
+                var mp = '/data02/nfs_' + lv;
                 var r = await apiJSON('/storage/provision', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: vg, lv_name: lv, size_gb: size, fs_type: 'ext4', mount_point: mp }) });
-                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); return; }
+                if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); btn.disabled = false; return; }
                 window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
-            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); }
+            } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); btn.disabled = false; }
         });
     });
 

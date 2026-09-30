@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"xirang/control_panel/internal/db"
@@ -77,6 +78,26 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		r.Fail(err.Error())
 		return err
 	}
+	checkStep, err := r.Step("check_lv_name")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	out, stderr, _, runErr := h.runner.Run(ctx, *w,
+		fmt.Sprintf("lvs --noheadings -o lv_name %s 2>/dev/null", shellLiteral(fmt.Sprintf("/dev/%s/%s", p.VGName, p.LVName))))
+	if runErr != nil {
+		checkStep.Done("failed", out, stderr, fmt.Sprintf("check LV name failed: %v", runErr))
+		r.Fail(fmt.Sprintf("check LV name failed: %v", runErr))
+		return runErr
+	}
+	if strings.TrimSpace(out) != "" {
+		message := fmt.Sprintf("logical volume %s/%s already exists; choose a unique lv_name", p.VGName, p.LVName)
+		checkStep.Done("failed", out, stderr, message)
+		r.Fail(message)
+		return fmt.Errorf("%s", message)
+	}
+	checkStep.Done("succeeded", out, stderr, "logical volume name is available")
+
 	req := ProvisionReq{p.VGName, p.LVName, int(p.SizeGB), p.FSType, p.MountPoint, p.ExportOpts}
 	steps := ProvisionSteps(req)
 	var done []string
@@ -529,6 +550,27 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 	return nil
 }
 
+func parseMountTargets(output string) []string {
+	var mountPoints []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(output, "\n") {
+		mountPoint := strings.TrimSpace(line)
+		if mountPoint == "" {
+			continue
+		}
+		if _, ok := seen[mountPoint]; ok {
+			continue
+		}
+		seen[mountPoint] = struct{}{}
+		mountPoints = append(mountPoints, mountPoint)
+	}
+	// Nested mounts must be detached before their parent mount.
+	sort.SliceStable(mountPoints, func(i, j int) bool {
+		return len(mountPoints[i]) > len(mountPoints[j])
+	})
+	return mountPoints
+}
+
 // --- deleteLVHandler ---
 
 // deleteLVHandler tears down and removes an arbitrary LV (not just ones the
@@ -572,22 +614,29 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	out, stderr, code, _ := h.runner.Run(ctx, *w, fmt.Sprintf("findmnt -n -o TARGET --source %s 2>/dev/null", lvDev))
-	mountPoint := strings.TrimSpace(out)
-	if code == 0 && mountPoint != "" {
-		if err := ValidateMountPoint(mountPoint, h.reservedMounts); err != nil {
-			st.Done("failed", out, stderr, fmt.Sprintf("cannot delete protected volume: %v", err))
-			r.Fail(fmt.Sprintf("cannot delete protected volume mounted on %s: %v", mountPoint, err))
-			return err
+	out, stderr, _, runErr := h.runner.Run(ctx, *w, fmt.Sprintf("findmnt -rn -o TARGET --source %s 2>/dev/null", lvDev))
+	if runErr != nil {
+		st.Done("failed", out, stderr, fmt.Sprintf("findmnt failed: %v", runErr))
+		r.Fail(fmt.Sprintf("could not detect LV mountpoints: %v", runErr))
+		return runErr
+	}
+	mountPoints := parseMountTargets(out)
+	if len(mountPoints) > 0 {
+		for _, mountPoint := range mountPoints {
+			if err := ValidateMountPoint(mountPoint, h.reservedMounts); err != nil {
+				st.Done("failed", out, stderr, fmt.Sprintf("cannot delete protected volume: %v", err))
+				r.Fail(fmt.Sprintf("cannot delete protected volume mounted on %s: %v", mountPoint, err))
+				return err
+			}
 		}
-		st.Done("succeeded", out, stderr, "mounted at "+mountPoint)
+		st.Done("succeeded", out, stderr, "mounted at "+strings.Join(mountPoints, ", "))
 	} else {
-		mountPoint = ""
 		st.Done("succeeded", out, stderr, "not mounted")
 	}
 
-	// 2. teardown + remove.
-	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoint: mountPoint}) {
+	// 2. teardown + remove. DeleteLVSteps unexports/unmounts every detected
+	// target, then verifies the LV is no longer mounted before lvremove.
+	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoints: mountPoints}) {
 		sh, err := r.Step(s.Name)
 		if err != nil {
 			r.Fail(fmt.Sprintf("create step: %v", err))
@@ -596,7 +645,11 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
 		if err != nil || code != 0 {
 			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
-			r.Fail(fmt.Sprintf("delete failed at %s: %s", s.Name, stderr))
+			message := fmt.Sprintf("delete failed at %s: %s", s.Name, stderr)
+			if s.Name == "lvremove" && strings.Contains(strings.ToLower(stderr), "in use") {
+				message += "; check open file handles and other mount namespaces, stop consumers, then retry; no force removal was attempted"
+			}
+			r.Fail(message)
 			return fmt.Errorf("delete failed at %s", s.Name)
 		}
 		sh.Done("succeeded", out, stderr, "")
