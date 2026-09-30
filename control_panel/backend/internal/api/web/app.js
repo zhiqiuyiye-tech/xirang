@@ -2337,7 +2337,7 @@
             '<div class="col"><span class="muted" style="font-size:12px;">启动时间：</span><span class="font-mono" style="font-size:12.5px;">' + esc(fmtTime(task.started_at)) + '</span></div>' +
             '<div class="col"><span class="muted" style="font-size:12px;">结束时间：</span><span class="font-mono" style="font-size:12.5px;">' + esc(fmtTime(task.finished_at)) + '</span></div>' +
             '</div>' +
-            (task.error ? '<div class="error-msg mt-2">' + esc(task.error) + '</div>' : '') +
+            (task.error ? '<div class="error-msg mt-2" style="white-space:pre-wrap;font-family:monospace;font-size:12px;max-height:300px;overflow-y:auto;">' + esc(task.error) + '</div>' : '') +
             (task.type === 'storage_provision_nfs' && task.status === 'succeeded'
                 ? '<div class="mt-2" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;">' +
                   '<div><strong class="text-success">✓ NFS 存储卷供给完成</strong><span class="muted" style="margin-left:8px;font-size:12px;">已完成底层格式化与网络导出，可直接用于平台注册</span></div>' +
