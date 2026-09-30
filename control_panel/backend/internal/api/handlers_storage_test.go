@@ -131,12 +131,14 @@ func TestResizeLVViaAPI(t *testing.T) {
 // TestDeleteLVViaAPI verifies POST /api/v1/storage/lv/delete submits the
 // storage_delete_lv task and returns 202 + task_id.
 func TestDeleteLVViaAPI(t *testing.T) {
-	r, ws, _, tk := newRouter(t)
+	r, ws, store, tk := newRouter(t)
 	wid, _ := ws.Create(context.Background(), workers.CreateReq{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root",
 	})
+	// Storage inventory selectors provide worker IDs as strings. The task
+	// payload must normalize that value before the Go task handler decodes it.
 	body, _ := json.Marshal(map[string]any{
-		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
+		"worker_id": strconv.FormatInt(wid, 10), "vg_name": "vg_data", "lv_name": "lv_1",
 	})
 	req := httptest.NewRequest("POST", "/api/v1/storage/lv/delete", bytes.NewReader(body))
 	req.Header.Set("Authorization", authHeader(t, tk))
@@ -152,6 +154,19 @@ func TestDeleteLVViaAPI(t *testing.T) {
 	}
 	if resp["task_id"] == nil {
 		t.Fatalf("no task_id: %s", w.Body.String())
+	}
+	task, err := store.GetTask(context.Background(), int64(resp["task_id"].(float64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var params struct {
+		WorkerID int64 `json:"worker_id"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &params); err != nil {
+		t.Fatalf("delete task worker_id must be numeric: %v; params=%s", err, task.ParamsJSON)
+	}
+	if params.WorkerID != wid {
+		t.Fatalf("task worker_id=%d, want %d", params.WorkerID, wid)
 	}
 }
 

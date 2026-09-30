@@ -45,7 +45,7 @@ func TestProvisionSteps(t *testing.T) {
 	if len(steps) != 8 {
 		t.Fatalf("expected 8 steps, got %d", len(steps))
 	}
-	if steps[0].Name != "lvcreate" || steps[0].Cmd != "lvcreate -L 200G -n lv_200g vg_data" {
+	if steps[0].Name != "lvcreate" || steps[0].Cmd != "lvcreate -y -L 200G -n lv_200g vg_data" {
 		t.Fatalf("step0 wrong: %+v", steps[0])
 	}
 	if steps[1].Cmd != "mkfs.xfs /dev/vg_data/lv_200g" {
@@ -61,6 +61,13 @@ func TestProvisionSteps(t *testing.T) {
 	// step5 exports
 	if !contains(steps[5].Cmd, "/data02/nb") || !contains(steps[5].Cmd, "no_root_squash") {
 		t.Fatalf("exports step wrong: %s", steps[5].Cmd)
+	}
+	wantExportsNewlineGuard := `if [ -s /etc/exports ] && [ -n "$(tail -c 1 /etc/exports)" ]; then printf '\n' >> /etc/exports; fi`
+	if !strings.Contains(steps[5].Cmd, wantExportsNewlineGuard) {
+		t.Fatalf("exports step must terminate an existing unterminated line before appending: %s", steps[5].Cmd)
+	}
+	if strings.Index(steps[5].Cmd, wantExportsNewlineGuard) > strings.LastIndex(steps[5].Cmd, `echo '/data02/nb `) {
+		t.Fatalf("exports newline guard must run before appending the export: %s", steps[5].Cmd)
 	}
 	// step6 ensure_nfs
 	if steps[6].Name != "ensure_nfs" || !contains(steps[6].Cmd, "systemctl") {

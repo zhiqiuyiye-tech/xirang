@@ -42,7 +42,7 @@ func (h *storageHandlers) provision(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	wid, _ := parseWorkerID(req["worker_id"])
+	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_provision_nfs", "storage", wid, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -61,7 +61,7 @@ func (h *storageHandlers) reclaim(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	wid, _ := parseWorkerID(req["worker_id"])
+	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_reclaim_nfs", "storage", wid, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -373,7 +373,7 @@ func (h *storageHandlers) createVG(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	wid, _ := parseWorkerID(req["worker_id"])
+	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_create_vg", "storage", wid, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -392,7 +392,7 @@ func (h *storageHandlers) resizeLV(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	wid, _ := parseWorkerID(req["worker_id"])
+	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_resize_lv", "storage", wid, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -411,7 +411,7 @@ func (h *storageHandlers) deleteLV(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	wid, _ := parseWorkerID(req["worker_id"])
+	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_delete_lv", "storage", wid, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -419,6 +419,14 @@ func (h *storageHandlers) deleteLV(c *gin.Context) {
 	}
 	h.audit(c, "storage.delete_lv", strconv.FormatInt(wid, 10), "submitted")
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
+// normalizeWorkerID ensures submitted task params contain a numeric worker_id,
+// even when an API client sends the ID as a JSON string.
+func normalizeWorkerID(req map[string]any) int64 {
+	wid, _ := parseWorkerID(req["worker_id"])
+	req["worker_id"] = wid
+	return wid
 }
 
 // parseWorkerID extracts the worker_id from a JSON-decoded map value (which

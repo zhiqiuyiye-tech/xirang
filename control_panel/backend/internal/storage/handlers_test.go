@@ -376,8 +376,11 @@ func TestCreateVGHandler_SkipsExistingVG(t *testing.T) {
 	defer store.Close()
 	eng := tasks.NewEngine(store)
 	sr := newScriptRunner()
-	// sdb's VG already exists -> skip; sdc's is absent -> create.
+	// sdb's VG already exists and its PV membership matches; sdc's VG is absent.
 	sr.add("vgs vg_data_sdb", scriptResult{stdout: "exists"})
+	sr.add("pvs --noheadings -o vg_name '/dev/sdb'", scriptResult{stdout: " vg_data_sdb\n"})
+	// If preflight runs for the already-initialized sdb, it must reject the active VG.
+	sr.add("device='/dev/sdb'", scriptResult{stderr: "device belongs to active volume group: vg_data_sdb", exitCode: 1})
 	sr.add("vgs vg_data_sdc", scriptResult{stdout: "absent"})
 	RegisterStorageHandlers(eng, sr, store)
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
@@ -410,5 +413,37 @@ func TestCreateVGHandler_SkipsExistingVG(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("sdc vgcreate missing; calls=%v", sr.calls)
+	}
+}
+
+func TestCreateVGHandler_RejectsVGNameCollisionOnDifferentPV(t *testing.T) {
+	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	sr := newScriptRunner()
+	sr.add("vgs vg_data_sdb", scriptResult{stdout: "exists"})
+	sr.add("pvs --noheadings -o vg_name '/dev/sdb'", scriptResult{stdout: "vg_other\n"})
+	RegisterStorageHandlers(eng, sr, store)
+	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	id, err := eng.Submit(context.Background(), "storage_create_vg", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "disks": []string{"/dev/sdb"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	got, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Error == nil || !strings.Contains(*got.Error, "belongs to vg_other") {
+		t.Fatalf("error=%v, want existing VG membership conflict", got.Error)
+	}
+	for _, call := range sr.calls {
+		if strings.Contains(call, "cp-storage-preflight") || strings.Contains(call, "pvcreate") || strings.Contains(call, "vgcreate") {
+			t.Fatalf("device must not be initialized when VG name belongs to another PV: %v", sr.calls)
+		}
 	}
 }

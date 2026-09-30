@@ -352,9 +352,9 @@ func (h *installDepsHandler) Run(ctx context.Context, task *db.Task, r *tasks.Re
 // disk (named <prefix>_<basename>, e.g. vg_data_sdb), rather than merging all
 // disks into one VG. One-VG-per-disk sidesteps LVM's same-physical-block-size
 // constraint, so disks of different sector sizes (512e vs 4Kn) can coexist. The
-// VG name prefix defaults to vg_data. For each disk it first checks whether the
-// derived VG name is already taken; if so it skips that disk (idempotent) so a
-// re-run doesn't fail on a VG that already exists.
+// VG name prefix defaults to vg_data. An existing derived VG is skipped only
+// when the selected device is confirmed as one of that VG's PVs; a name
+// collision on another PV is reported instead of silently skipping the disk.
 type createVGHandler struct {
 	runner         ssh.Runner
 	store          *db.Store
@@ -394,9 +394,43 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return err
 	}
 
-	// Revalidate every selected device immediately before any destructive LVM
-	// command. Cached inventory is for display only and can become stale.
+	// Revalidate every selected device before any destructive LVM command. A
+	// matching existing VG is idempotent only when the selected device is one
+	// of its PVs; a name collision on another PV must fail rather than skip.
+	alreadyInitialized := make(map[string]bool, len(p.Disks))
 	for _, device := range p.Disks {
+		vg := VGNameForDisk(p.VGName, device)
+		detect, err := r.Step("detect_vg:" + vg)
+		if err != nil {
+			r.Fail(fmt.Sprintf("create step: %v", err))
+			return err
+		}
+		// `vgs <name>` exits 0 if the VG exists, non-zero otherwise; the echo
+		// gives a parseable token regardless of exit status.
+		out, stderr, _, _ := h.runner.Run(ctx, *w, fmt.Sprintf("vgs %s >/dev/null 2>&1 && echo exists || echo absent", vg))
+		if strings.Contains(out, "exists") {
+			pvOut, pvStderr, pvCode, pvErr := h.runner.Run(ctx, *w,
+				fmt.Sprintf("pvs --noheadings -o vg_name %s 2>/dev/null", shellLiteral(device)))
+			pvVG := strings.Join(strings.Fields(pvOut), "")
+			if pvErr != nil || pvCode != 0 || pvVG != vg {
+				membership := pvVG
+				if membership == "" {
+					membership = "no active volume group"
+				}
+				message := fmt.Sprintf("volume group %s exists but selected device %s belongs to %s", vg, device, membership)
+				if pvErr != nil {
+					message += ": " + pvErr.Error()
+				}
+				detect.Done("failed", pvOut, pvStderr, message)
+				r.Fail(message)
+				return fmt.Errorf("%s", message)
+			}
+			detect.Done("succeeded", pvOut, pvStderr, "vg "+vg+" already contains selected device; skipping")
+			alreadyInitialized[device] = true
+			continue
+		}
+		detect.Done("succeeded", out, stderr, "vg "+vg+" absent, will create")
+
 		step, err := r.Step("preflight:" + device)
 		if err != nil {
 			r.Fail(fmt.Sprintf("create step: %v", err))
@@ -415,27 +449,12 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		step.Done("succeeded", out, stderr, "device is safe")
 	}
 
-	// Per disk: detect whether the derived VG already exists; if so skip it
-	// (idempotent). pvcreate is still safe to re-run, but vgcreate fails on an
-	// existing name, so we skip the whole disk to avoid a confusing failure.
+	// All devices have passed their checks; initialize only those that are not
+	// already members of their derived VG.
 	for _, d := range p.Disks {
-		vg := VGNameForDisk(p.VGName, d)
-		detect, err := r.Step("detect_vg:" + vg)
-		if err != nil {
-			r.Fail(fmt.Sprintf("create step: %v", err))
-			return err
-		}
-		// `vgs <name>` exits 0 if the VG exists, non-zero otherwise; the echo
-		// gives a parseable token regardless of exit status.
-		out, stderr, _, _ := h.runner.Run(ctx, *w, fmt.Sprintf("vgs %s >/dev/null 2>&1 && echo exists || echo absent", vg))
-		exists := strings.Contains(out, "exists")
-		if exists {
-			detect.Done("succeeded", out, stderr, "vg "+vg+" already exists, skipping disk "+d)
+		if alreadyInitialized[d] {
 			continue
 		}
-		detect.Done("succeeded", out, stderr, "vg "+vg+" absent, will create")
-
-		// pvcreate + vgcreate for this disk only.
 		for _, s := range CreateVGSteps(CreateVGReq{VGNamePrefix: p.VGName, Disks: []string{d}}) {
 			sh, err := r.Step(s.Name)
 			if err != nil {

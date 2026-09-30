@@ -185,13 +185,16 @@ func ProvisionSteps(r ProvisionReq) []Step {
 		r.ExportOpts = "*(rw,sync,no_root_squash,no_subtree_check)"
 	}
 	lvDev := fmt.Sprintf("/dev/%s/%s", r.VGName, r.LVName)
+	exportsStepCmd := fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports &&
+if [ -s /etc/exports ] && [ -n "$(tail -c 1 /etc/exports)" ]; then printf '\n' >> /etc/exports; fi &&
+echo '%s %s' >> /etc/exports`, r.MountPoint, r.MountPoint, r.ExportOpts)
 	return []Step{
-		{"lvcreate", fmt.Sprintf("lvcreate -L %dG -n %s %s", r.SizeGB, r.LVName, r.VGName)},
+		{"lvcreate", fmt.Sprintf("lvcreate -y -L %dG -n %s %s", r.SizeGB, r.LVName, r.VGName)},
 		{"mkfs", fmt.Sprintf("mkfs.%s %s", r.FSType, lvDev)},
 		{"mkdir", fmt.Sprintf("mkdir -p %s", r.MountPoint)},
 		{"mount", fmt.Sprintf("mount %s %s", lvDev, r.MountPoint)},
 		{"fstab", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab && echo '%s %s %s defaults 0 0' >> /etc/fstab`, lvDev, lvDev, r.MountPoint, r.FSType)},
-		{"exports", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports && echo '%s %s' >> /etc/exports`, r.MountPoint, r.MountPoint, r.ExportOpts)},
+		{"exports", exportsStepCmd},
 		{"ensure_nfs", "systemctl is-active --quiet nfs-server || systemctl is-active --quiet nfs-kernel-server || systemctl start nfs-server || systemctl start nfs-kernel-server"},
 		{"exportfs", "exportfs -arv"},
 	}
