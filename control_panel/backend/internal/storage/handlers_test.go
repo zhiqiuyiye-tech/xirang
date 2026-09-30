@@ -621,7 +621,7 @@ func TestDeleteLVHandler_BlockedByActivePod(t *testing.T) {
 	}
 }
 
-func TestDeleteLVHandler_DiagnosesNamespaceHoldersOnInUse(t *testing.T) {
+func TestDeleteLVHandler_CleansNamespaceMountsAndRetriesLvremove(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
@@ -629,11 +629,12 @@ func TestDeleteLVHandler_DiagnosesNamespaceHoldersOnInUse(t *testing.T) {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
 		scriptResult{stdout: "/data02/share\n"},
 		scriptResult{stdout: ""})
-	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{
-		stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5,
-	})
-	sr.add("cp-storage-find-holders", scriptResult{
-		stdout: "PID 591550 (/usr/bin/promtail): /data02/share\n",
+	// First lvremove fails with in use
+	sr.add("lvremove -f /dev/vg_data/lv_1",
+		scriptResult{stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5},
+		scriptResult{stdout: "Logical volume \"lv_1\" successfully removed\n", exitCode: 0})
+	sr.add("cp-storage-cleanup-ns-mounts", scriptResult{
+		stdout: "Unmounting /data02/share inside namespace of PID 591550\n", exitCode: 0,
 	})
 
 	RegisterStorageHandlers(eng, sr, store)
@@ -646,13 +647,17 @@ func TestDeleteLVHandler_DiagnosesNamespaceHoldersOnInUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, store, id, "failed", 2*time.Second)
-	got, err := store.GetTask(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
+	waitFor(t, store, id, "succeeded", 2*time.Second)
+
+	// Verify CleanupNamespaceMountsCmd was invoked
+	foundCleanup := false
+	for _, call := range sr.calls {
+		if strings.Contains(call, "cp-storage-cleanup-ns-mounts") {
+			foundCleanup = true
+			break
+		}
 	}
-	if got.Error == nil || !strings.Contains(*got.Error, "PID 591550") || !strings.Contains(*got.Error, "promtail") {
-		t.Fatalf("error=%v, want mount namespace holder diagnostic output", got.Error)
+	if !foundCleanup {
+		t.Fatalf("expected cleanup-ns-mounts command to be called: %v", sr.calls)
 	}
 }
-

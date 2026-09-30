@@ -708,6 +708,23 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		}
 		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
 		if err != nil || code != 0 {
+			// If lvremove failed because filesystem is in use, attempt automated namespace unmounting
+			// (e.g. for Promtail/daemonset containers that inherited host mounts) and retry lvremove once.
+			if s.Name == "lvremove" && strings.Contains(strings.ToLower(stderr), "in use") {
+				cleanStep, _ := r.Step("cleanup_namespace_mounts")
+				cleanOut, cleanErr, _, _ := h.runner.Run(ctx, *w, CleanupNamespaceMountsCmd(lvDev))
+				if cleanStep != nil {
+					cleanStep.Done("succeeded", cleanOut, cleanErr, "cleaned mount namespaces")
+				}
+
+				// Retry lvremove
+				retryOut, retryErr, retryCode, retryRunErr := h.runner.Run(ctx, *w, s.Cmd)
+				if retryRunErr == nil && retryCode == 0 {
+					sh.Done("succeeded", retryOut, retryErr, "retry lvremove succeeded after namespace cleanup")
+					continue
+				}
+			}
+
 			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
 			message := fmt.Sprintf("delete failed at %s: %s", s.Name, stderr)
 			if s.Name == "lvremove" && strings.Contains(strings.ToLower(stderr), "in use") {
@@ -726,4 +743,3 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 	r.Succeed()
 	return nil
 }
-

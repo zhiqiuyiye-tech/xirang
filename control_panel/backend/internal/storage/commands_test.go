@@ -252,5 +252,17 @@ func TestFindDeviceHoldersCmd(t *testing.T) {
 	}
 }
 
-func contains(s, sub string) bool { return strings.Contains(s, sub) }
+func TestCleanupNamespaceMountsCmd(t *testing.T) {
+	cmd := CleanupNamespaceMountsCmd("/dev/vg_data/lv_200g")
+	if !contains(cmd, "nsenter") {
+		t.Fatalf("expected command to use nsenter: %s", cmd)
+	}
+	if !contains(cmd, "umount") {
+		t.Fatalf("expected command to unmount inside namespaces: %s", cmd)
+	}
+	if !contains(cmd, "/proc/[0-9]*/mountinfo") {
+		t.Fatalf("expected command to inspect mountinfo: %s", cmd)
+	}
+}
 
+func contains(s, sub string) bool { return strings.Contains(s, sub) }
