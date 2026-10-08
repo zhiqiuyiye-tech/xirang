@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/auth"
@@ -53,7 +54,7 @@ func (h *k8sHandlers) createService(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.create_service", "", "submitted")
+	h.audit(c, "k8s.create_service", fmt.Sprint(req["namespace"])+"/"+fmt.Sprint(req["pod_name"]), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -87,12 +88,37 @@ func (h *k8sHandlers) deleteService(c *gin.Context) {
 		"namespace": c.Query("namespace"),
 		"name":      c.Param("name"),
 	}
+	if c.Query("namespace") == "" || c.Param("name") == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name required"})
+		return
+	}
+	svc, err := h.client.CoreV1().Services(c.Query("namespace")).Get(c, c.Param("name"), metav1.GetOptions{})
+	if err != nil {
+		status := http.StatusBadGateway
+		if apierrors.IsNotFound(err) {
+			status = http.StatusNotFound
+		}
+		if apierrors.IsForbidden(err) {
+			status = http.StatusForbidden
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	// Pin the object at submission, not just execution: a queued task must
+	// never delete a replacement Service with the same namespace/name.
+	params["uid"] = string(svc.UID)
+	params["resource_version"] = svc.ResourceVersion
+	ports := make([]map[string]any, 0, len(svc.Spec.Ports))
+	for _, port := range svc.Spec.Ports {
+		ports = append(ports, map[string]any{"port": port.Port, "target_port": port.TargetPort.String(), "node_port": port.NodePort, "protocol": port.Protocol})
+	}
+	details := map[string]any{"ports": ports, "type": svc.Spec.Type}
 	taskID, err := h.eng.Submit(c, "k8s_delete_svc", "k8s", 0, params)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.delete_service", c.Param("name"), "submitted")
+	h.audit(c, "k8s.delete_service", c.Query("namespace")+"/"+c.Param("name"), "submitted", params, details, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -117,7 +143,7 @@ func (h *k8sHandlers) updateService(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.update_service", c.Param("name"), "submitted")
+	h.audit(c, "k8s.update_service", fmt.Sprint(req["namespace"])+"/"+c.Param("name"), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -140,7 +166,7 @@ func (h *k8sHandlers) createNetworkPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.create_network_policy", "", "submitted")
+	h.audit(c, "k8s.create_network_policy", fmt.Sprint(req["namespace"])+"/"+fmt.Sprint(req["name"]), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -177,7 +203,7 @@ func (h *k8sHandlers) deleteNetworkPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.delete_network_policy", c.Param("name"), "submitted")
+	h.audit(c, "k8s.delete_network_policy", c.Query("namespace")+"/"+c.Param("name"), "submitted", params, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -286,18 +312,13 @@ func (h *k8sHandlers) updateNotebookMetadata(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.update_notebook_metadata", namespace+"/"+name, "success")
+	h.audit(c, "k8s.update_notebook_metadata", namespace+"/"+name, "success", map[string]any{"namespace": namespace, "pod_name": name, "owner_name": ownerName, "note": note})
 	c.JSON(http.StatusOK, m)
 }
 
 // audit records an audit log entry. The actor is read from the JWT claims
 // (defaulting to "admin"). Mirrors the helper on workerHandlers so the k8s
 // endpoints record the same audit trail.
-func (h *k8sHandlers) audit(c *gin.Context, action, target, result string) {
-	actor := "admin"
-	if cl, ok := auth.ClaimsFrom(c); ok {
-		actor = cl.Username
-	}
-	t := target
-	_ = h.store.InsertAudit(c, db.AuditLog{Actor: actor, Action: action, Target: &t, Result: result})
+func (h *k8sHandlers) audit(c *gin.Context, action, target, result string, params ...map[string]any) {
+	recordAudit(c, h.store, action, target, result, params...)
 }

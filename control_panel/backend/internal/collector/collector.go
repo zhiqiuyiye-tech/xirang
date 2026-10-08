@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -204,7 +205,7 @@ func (c *Collector) collectInventory(parent context.Context, workerID int64) err
 	if err != nil {
 		return err
 	}
-	attemptedAt := time.Now().UTC()
+	attemptedAt := db.WorkerHealthCheckTime()
 	ctx, cancel := context.WithTimeout(parent, c.config.InventoryTimeout)
 	defer cancel()
 	inventory, err := storage.ListInventoryWithReserved(ctx, c.runner, *worker, c.config.ReservedMounts)
@@ -220,10 +221,15 @@ func (c *Collector) collectInventory(parent context.Context, workerID int64) err
 		return err
 	}
 	collectedAt := time.Now().UTC()
-	return c.store.SaveInventorySnapshot(parent, db.InventorySnapshot{
+	if err := c.store.SaveInventorySnapshot(parent, db.InventorySnapshot{
 		WorkerID: workerID, SchemaVersion: 1, PayloadJSON: string(payload),
 		CollectedAt: &collectedAt, LastAttemptedAt: attemptedAt,
-	})
+	}); err != nil {
+		return err
+	}
+	// A successful remote inventory command proves the same authenticated SSH
+	// execution as the heartbeat. Order its result by probe start time too.
+	return c.store.RecordWorkerHealth(parent, workerID, true, attemptedAt, "", c.config.OfflineThreshold)
 }
 
 func (c *Collector) checkHeartbeat(parent context.Context, workerID int64) error {
@@ -231,17 +237,28 @@ func (c *Collector) checkHeartbeat(parent context.Context, workerID int64) error
 	if err != nil {
 		return err
 	}
-	checkedAt := time.Now().UTC()
+	checkedAt := db.WorkerHealthCheckTime()
 	ctx, cancel := context.WithTimeout(parent, c.config.HeartbeatTimeout)
 	defer cancel()
 	_, stderr, code, runErr := c.runner.Run(ctx, *worker, "true")
 	if runErr != nil || code != 0 {
+		// Caller cancellation is not evidence that the remote node is unhealthy.
+		// A heartbeat's own deadline still counts as a failed probe.
+		if errors.Is(runErr, context.Canceled) || parent.Err() != nil {
+			return runErr
+		}
 		message := strings.TrimSpace(stderr)
 		if runErr != nil {
 			message = runErr.Error()
 		}
 		if message == "" {
 			message = fmt.Sprintf("heartbeat exited %d", code)
+		}
+		if errors.Is(runErr, ssh.ErrCredentialsNotConfigured) {
+			if storeErr := c.store.RecordWorkerHealthUnavailable(parent, workerID, checkedAt, truncateError(message)); storeErr != nil {
+				return storeErr
+			}
+			return runErr
 		}
 		if storeErr := c.store.RecordWorkerHealth(parent, workerID, false, checkedAt, truncateError(message), c.config.OfflineThreshold); storeErr != nil {
 			return storeErr

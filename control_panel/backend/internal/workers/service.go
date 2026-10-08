@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -116,10 +115,19 @@ func (s *Service) TestConnection(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	checkedAt := time.Now().UTC()
+	checkedAt := db.WorkerHealthCheckTime()
 	err = s.sshm.TestConnection(ctx, *w)
 	if err != nil {
-		_ = s.store.RecordWorkerHealth(ctx, id, false, checkedAt, err.Error(), 1)
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return err
+		}
+		if errors.Is(err, ssh.ErrCredentialsNotConfigured) {
+			if storeErr := s.store.RecordWorkerHealthUnavailable(ctx, id, checkedAt, err.Error()); storeErr != nil {
+				return storeErr
+			}
+		} else if storeErr := s.store.RecordWorkerHealth(ctx, id, false, checkedAt, err.Error(), 1); storeErr != nil {
+			return storeErr
+		}
 		return err
 	}
 	if updateErr := s.store.RecordWorkerHealth(ctx, id, true, checkedAt, "", 1); updateErr != nil {

@@ -139,6 +139,16 @@
         return '<span class="badge ' + cls + '"><span class="badge-dot"></span>' + text + '</span>';
     }
 
+    function renderWorkerHealth(worker) {
+        var status = worker.status;
+        var label = status === 'online' ? '在线' : (status === 'offline' ? '离线' : '待确认');
+        var cls = status === 'online' ? 'badge-success' : (status === 'offline' ? 'badge-failed' : 'badge-muted');
+        var html = '<span class="badge ' + cls + '" title="基于控制面板 SSH 连通性检查">' + label + '</span>';
+        if (worker.status_error) html += '<div class="muted" style="font-size:11px;max-width:240px;overflow-wrap:anywhere;">' + esc(worker.status_error) + '</div>';
+        if (worker.last_checked_at) html += '<div class="muted" style="font-size:11px;">检查于 ' + esc(fmtTime(worker.last_checked_at)) + '</div>';
+        return html;
+    }
+
     function authModeBadge(mode) {
         var cls = 'badge-key';
         var label = esc(mode);
@@ -262,7 +272,7 @@
                     '<td><span class="font-mono">' + esc(w.port) + '</span></td>' +
                     '<td><span class="font-mono">' + esc(w.username) + '</span></td>' +
                     '<td>' + authModeBadge(w.auth_mode) + '</td>' +
-                    '<td>' + statusBadge(w.status) + '</td>' +
+                    '<td>' + renderWorkerHealth(w) + '</td>' +
                     '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(w.last_seen_at)) + '</span></td>' +
                     '<td style="text-align:right;">' +
                     '<div class="actions-cell" style="justify-content: flex-end;">' +
@@ -880,7 +890,7 @@
             '<div class="card-header-clean">' +
             '<div>' +
             '<div class="section-title" style="margin-bottom:0;">已关联的 Service 映射</div>' +
-            '<div class="muted" style="font-size:12px;margin-top:2px;">匹配当前 Pod 的 Kubernetes Service。本面板创建规则支持原地编辑与清理，外部固有 Service 为只读。</div>' +
+            '<div class="muted" style="font-size:12px;margin-top:2px;">匹配当前 Pod 的 Kubernetes Service。本面板创建规则支持编辑与清理；外部 Notebook NodePort 支持删除，其他外部 Service 为只读。</div>' +
             '</div>' +
             '</div>' +
             '<div id="pod-existing-container"><div class="muted" style="padding:8px 0;font-size:12.5px;">正在加载关联 Service...</div></div>' +
@@ -1219,6 +1229,26 @@
         }
 
         // Render Existing Mappings in Modal
+        async function waitForPortMappingTask(taskID) {
+            if (!taskID) throw new Error('响应缺少任务编号，请在任务列表确认删除结果');
+            for (var attempt = 0; attempt < 120; attempt++) {
+                if (!modal.isConnected) throw new Error('窗口已关闭，删除任务继续执行，请在任务列表查看结果');
+                var result = await apiJSON('/tasks/' + encodeURIComponent(taskID));
+                if (!result.resp.ok) throw new Error((result.data && result.data.error) || '查询删除任务失败');
+                var task = result.data && result.data.task;
+                if (!task) throw new Error('无法读取删除任务状态，请在任务列表确认结果');
+                if (task.status === 'succeeded') return;
+                if (task.status === 'failed' || task.status === 'cancelled' || task.status === 'canceled') {
+                    throw new Error(task.error || '删除任务未成功完成');
+                }
+                if (task.status !== 'pending' && task.status !== 'running') {
+                    throw new Error('未知删除任务状态: ' + task.status);
+                }
+                await new Promise(function (resolve) { setTimeout(resolve, 1000); });
+            }
+            throw new Error('等待删除任务超时，请在任务列表确认最终结果后刷新');
+        }
+
         function renderExistingMappings() {
             var container = modal.querySelector('#pod-existing-container');
             if (!container) return;
@@ -1256,16 +1286,14 @@
                     ? '<span class="badge badge-success">本面板管理</span>'
                     : '<span class="badge badge-muted">外部固有</span>';
 
-                var actions = s.managed
-                    ? '<div style="display:flex;align-items:center;gap:6px;">' +
-                    '<button type="button" class="btn btn-xs btn-outline" data-act="edit-svc" data-svc=\'' + esc(JSON.stringify(s)) + '\'>' +
+                var actions = '<div style="display:flex;align-items:center;gap:6px;">' +
+                    (s.managed && s.deletable ? '<button type="button" class="btn btn-xs btn-outline" data-act="edit-svc" data-svc=\'' + esc(JSON.stringify(s)) + '\'>' +
                     '<svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-1px;"><path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"/></svg> 编辑' +
-                    '</button>' +
-                    '<button type="button" class="btn btn-xs btn-danger" data-act="del-svc" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">' +
+                    '</button>' : '') +
+                    (s.deletable ? '<button type="button" class="btn btn-xs btn-danger" data-act="del-svc" data-name="' + esc(s.name) + '" data-ns="' + esc(s.namespace) + '">' +
                     '<svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:-1px;"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg> 删除' +
-                    '</button>' +
-                    '</div>'
-                    : '<span class="muted" style="font-size:11.5px;">集群固有只读</span>';
+                    '</button>' : '<span class="muted" style="font-size:11.5px;">只读 Service</span>') +
+                    '</div>';
 
                 return '<div class="port-svc-card">' +
                     '<div class="port-svc-header">' +
@@ -1301,7 +1329,7 @@
                         self.style.backgroundColor = '#991b1b';
                         self.style.color = '#fff';
                         setTimeout(function () {
-                            if (self && self.isConnected) {
+                            if (self && self.isConnected && !self.disabled) {
                                 self.removeAttribute('data-confirming');
                                 self.innerHTML = origHtml;
                                 self.classList.add('btn-danger');
@@ -1324,30 +1352,34 @@
                             this.textContent = '删除';
                             return;
                         }
-                        setMsg(msgEl, '已提交删除任务！Service ' + name + ' 正在清理。', 'info');
-                        if (editingSvc && editingSvc.name === name) {
+                        setMsg(msgEl, '删除任务已提交，正在等待 Service ' + name + ' 清理完成...', 'info');
+                        await waitForPortMappingTask(r.data && r.data.task_id);
+                        if (editingSvc && editingSvc.name === name && editingSvc.namespace === ns2) {
                             resetFormToCreate();
                         }
-                        refreshServicesList();
+                        try {
+                            await refreshServicesList();
+                        } catch (refreshError) {
+                            throw new Error('Service 已删除，但刷新列表失败: ' + refreshError.message);
+                        }
+                        setMsg(msgEl, 'Service ' + name + ' 已删除。', 'info');
                     } catch (err) {
-                        setMsg(msgEl, '删除失败: ' + err.message, 'error');
+                        setMsg(msgEl, '删除结果: ' + err.message, 'error');
                         this.disabled = false;
                         this.textContent = '删除';
+                        this.removeAttribute('data-confirming');
                     }
                 });
             });
         }
 
         async function refreshServicesList() {
-            try {
-                var sr = await apiJSON('/k8s/services');
-                if (sr.resp.ok && Array.isArray(sr.data)) {
-                    k8sServices = sr.data;
-                    renderExistingMappings();
-                }
-            } catch (e) {
-                console.error('Failed to refresh services:', e);
+            var sr = await apiJSON('/k8s/services');
+            if (!sr.resp.ok || !Array.isArray(sr.data)) {
+                throw new Error((sr.data && sr.data.error) || 'Service 列表响应无效');
             }
+            k8sServices = sr.data;
+            if (modal.isConnected) renderExistingMappings();
         }
 
         renderExistingMappings();
@@ -1744,7 +1776,7 @@
                         var wid = this.getAttribute('data-wid');
                         var host = this.getAttribute('data-host') || '127.0.0.1';
                         showPlatformRegistrationModal(content, {
-                            name: 'nfs-' + lv.name,
+                            name: nfsStorageName(lv.name),
                             service_address: host,
                             path: lv.mp || '/data02/notebook_nfs',
                             size_gb: lv.size,
@@ -1949,7 +1981,7 @@
                             if (act === 'platform') {
                                 var curWorker = workersMap[wid] || {};
                                 showPlatformRegistrationModal(content, {
-                                    name: 'nfs-' + lv.name,
+                                    name: nfsStorageName(lv.name),
                                     service_address: curWorker.host || '127.0.0.1',
                                     path: lv.mp || '/data02/notebook_nfs',
                                     size_gb: lv.size,
@@ -2009,7 +2041,7 @@
             if (!wid || !vg || !size) { setMsg(msgEl, '请选择目标 Worker、存储卷组并输入容量 (GB)', 'error'); return; }
             btn.disabled = true;
             try {
-                var lv = 'lv_nb_' + genUUID().replace(/-/g, '').toLowerCase();
+                var lv = generateNFSName();
                 var mp = '/data02/nfs_' + lv;
                 var r = await apiJSON('/storage/provision', { method: 'POST', body: JSON.stringify({ worker_id: wid, vg_name: vg, lv_name: lv, size_gb: size, fs_type: 'ext4', mount_point: mp }) });
                 if (!r.resp.ok) { setMsg(msgEl, '错误: ' + (r.data && r.data.error), 'error'); btn.disabled = false; return; }
@@ -2017,6 +2049,14 @@
             } catch (err) { setMsg(msgEl, '错误: ' + err.message, 'error'); btn.disabled = false; }
         });
     });
+
+    function generateNFSName() {
+        return genUUID().replace(/-/g, '').toLowerCase().slice(0, 8);
+    }
+
+    function nfsStorageName(lvName) {
+        return /^[a-f0-9]{8}$/.test(lvName) ? lvName : 'nfs-' + lvName;
+    }
 
     function genUUID() {
         if (!window.XirangCrypto) throw new Error('Secure random generator unavailable');
@@ -2356,7 +2396,7 @@
                 var p = {};
                 try { p = JSON.parse(task.params_json || '{}'); } catch (e) {}
                 showPlatformRegistrationModal(document.getElementById('content'), {
-                    name: 'nfs-' + (p.lv_name || ('task-' + task.id)),
+                    name: nfsStorageName(p.lv_name || ('task-' + task.id)),
                     service_address: addr,
                     path: p.mount_point || '/data02/notebook_nfs',
                     size_gb: p.size_gb || 0,
@@ -2476,6 +2516,68 @@
     // AUDIT PAGE
     // ====================================================================
 
+    function auditActionLabel(action) {
+        var labels = {
+            'worker.create': '添加 Worker 节点', 'worker.update': '修改 Worker 节点',
+            'worker.delete': '删除 Worker 节点', 'worker.test': '测试 SSH 连接',
+            'worker.set_private_key': '更新 SSH 私钥', 'worker.set_panel_password': '更新 SSH 登录密码',
+            'worker.change_root_password': '修改节点系统密码', 'worker.install_deps': '安装 LVM / NFS 依赖',
+            'storage.provision_nfs': '创建 NFS 共享', 'storage.reclaim_nfs': '回收 NFS 共享',
+            'storage.create_vg': '创建或扩展存储卷组', 'storage.resize_lv': '调整虚拟盘容量',
+            'storage.delete_lv': '删除虚拟盘', 'k8s.create_service': '创建端口映射',
+            'k8s.update_service': '更新端口映射', 'k8s.delete_service': '删除端口映射',
+            'k8s.create_network_policy': '创建网络策略', 'k8s.delete_network_policy': '删除网络策略',
+            'k8s.update_notebook_metadata': '修改 Notebook 使用人与备注',
+            'k8s.delete_notebook_metadata': '清除 Notebook 使用人与备注',
+            'auth.bootstrap': '初始化登录密钥', 'auth.login': '管理员登录',
+            'auth.logout': '管理员退出登录', 'auth.key_rotate': '轮换登录密钥'
+        };
+        return Object.prototype.hasOwnProperty.call(labels, action) ? labels[action] : action;
+    }
+
+    function renderAuditDetails(details) {
+        if (!details || Object.keys(details).length === 0) return '<span class="muted">未记录操作参数</span>';
+        var labels = {
+            worker_id: 'Worker ID', worker_name: '节点名称', host: '主机地址', port: '端口', username: 'SSH 用户',
+            auth_mode: '认证方式', namespace: '命名空间', name: '资源名称', pod_name: 'Pod', type: '服务类型',
+            vg_name: '卷组', lv_name: '虚拟盘', size_gb: '容量 (GB)', delta_gb: '调整容量 (GB)',
+            fs_type: '文件系统', mount_point: '挂载路径', action: '调整方式', owner_name: '使用人', note: '备注',
+            disks: '物理磁盘'
+        };
+        var lines = [];
+        Object.keys(labels).forEach(function (key) {
+            var value = details[key];
+            if (value === undefined || value === null || value === '') return;
+            if (key === 'disks' && Array.isArray(value)) value = value.join(', ');
+            if (key === 'action') value = value === 'grow' ? '扩容' : (value === 'shrink' ? '缩容' : value);
+            if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return;
+            lines.push('<div><span class="muted">' + labels[key] + '：</span>' + esc(value) + '</div>');
+        });
+        if (Array.isArray(details.ports)) {
+            details.ports.forEach(function (port) {
+                lines.push('<div><span class="muted">端口映射：</span>NodePort ' + esc(port.node_port || '自动分配') +
+                    ' → Pod ' + esc(port.target_port || port.port) + '/' + esc(port.protocol || 'TCP') +
+                    ' (Service ' + esc(port.port) + ')</div>');
+            });
+        }
+        ['before', 'after'].forEach(function (key) {
+            if (details[key] && typeof details[key] === 'object') {
+                lines.push('<details><summary>' + (key === 'before' ? '修改前' : '修改后') + '</summary>' + renderAuditDetails(details[key]) + '</details>');
+            }
+        });
+        if (Number.isSafeInteger(details.task_id) && details.task_id > 0) {
+            lines.push('<div><span class="muted">异步任务：</span><a href="#/tasks/' + details.task_id + '">查看任务 #' + details.task_id + '</a></div>');
+        }
+        return lines.length ? '<div style="min-width:220px;font-size:12px;overflow-wrap:anywhere;">' + lines.join('') + '</div>' : '<span class="muted">未记录操作参数</span>';
+    }
+
+    function auditResultBadge(result) {
+        var success = result === 'success' || result === 'succeeded' || result === 'deleted';
+        var failure = result === 'fail' || result === 'failed' || result === 'error';
+        var label = success ? '操作成功' : (failure ? '操作失败' : (result === 'submitted' ? '任务已提交' : result));
+        return '<span class="badge ' + (success ? 'badge-success' : (failure ? 'badge-failed' : 'badge-pending')) + '">' + esc(label) + '</span>';
+    }
+
     registerRoute('/audit', async function (content) {
         content.innerHTML = '<div class="page-header">' +
             '<div>' +
@@ -2485,8 +2587,8 @@
             '</div>' +
             '<div class="table-responsive mt-2">' +
             '<table class="data-table" id="audit-table"><thead><tr>' +
-            '<th>流水 ID</th><th>操作者</th><th>触发动作</th><th>目标对象</th><th>执行结果</th><th>发生时间</th>' +
-            '</tr></thead><tbody id="audit-tbody"><tr><td colspan="6" class="muted">正在加载审计日志...</td></tr></tbody></table>' +
+            '<th>流水 ID</th><th>操作者</th><th>触发动作</th><th>目标对象</th><th>操作详情</th><th>执行结果</th><th>发生时间</th>' +
+            '</tr></thead><tbody id="audit-tbody"><tr><td colspan="7" class="muted">正在加载审计日志...</td></tr></tbody></table>' +
             '</div>';
 
         try {
@@ -2495,16 +2597,17 @@
             var logs = r.data || [];
             var tbody = document.getElementById('audit-tbody');
             if (logs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="muted">暂无历史操作审计记录。</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无历史操作审计记录。</td></tr>';
                 return;
             }
             tbody.innerHTML = logs.map(function (a) {
                 return '<tr>' +
                     '<td><span class="badge-mono font-mono">' + esc(a.id) + '</span></td>' +
                     '<td><strong>' + esc(a.actor) + '</strong></td>' +
-                    '<td><span class="badge badge-muted font-mono">' + esc(a.action) + '</span></td>' +
+                    '<td><strong>' + esc(auditActionLabel(a.action)) + '</strong><div class="muted font-mono" style="font-size:11px;">' + esc(a.action) + '</div></td>' +
                     '<td><span class="font-mono">' + esc(a.target) + '</span></td>' +
-                    '<td>' + statusBadge(a.result) + '</td>' +
+                    '<td>' + renderAuditDetails(a.details) + '</td>' +
+                    '<td>' + auditResultBadge(a.result) + '</td>' +
                     '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(a.at)) + '</span></td>' +
                     '</tr>';
             }).join('');

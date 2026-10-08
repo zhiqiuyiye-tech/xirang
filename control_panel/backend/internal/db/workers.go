@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -82,22 +83,84 @@ func (s *Store) SetWorkerCredentials(ctx context.Context, id int64, encPassword,
 	return err
 }
 
+var workerHealthClock atomic.Int64
+
+// WorkerHealthCheckTime orders probe starts across inventory, heartbeat and
+// manual checks. Windows may return identical wall-clock timestamps for
+// distinct concurrent calls; assigning the next nanosecond preserves ordering
+// without changing timeouts or losing precision when timestamps are persisted.
+func WorkerHealthCheckTime() time.Time {
+	for {
+		previous := workerHealthClock.Load()
+		now := time.Now().UnixNano()
+		if now <= previous {
+			now = previous + 1
+		}
+		if workerHealthClock.CompareAndSwap(previous, now) {
+			return time.Unix(0, now).UTC()
+		}
+	}
+}
+
 func (s *Store) RecordWorkerHealth(ctx context.Context, id int64, online bool, checkedAt time.Time, message string, offlineThreshold int) error {
+	state := "offline"
+	if online {
+		state = "online"
+	}
+	return s.recordWorkerHealth(ctx, id, state, checkedAt, message, offlineThreshold)
+}
+
+// RecordWorkerHealthUnavailable records a check that cannot run because local
+// credentials are absent. It is neither a successful probe nor a node failure.
+func (s *Store) RecordWorkerHealthUnavailable(ctx context.Context, id int64, checkedAt time.Time, message string) error {
+	return s.recordWorkerHealth(ctx, id, "unknown", checkedAt, message, 1)
+}
+
+func (s *Store) recordWorkerHealth(ctx context.Context, id int64, state string, checkedAt time.Time, message string, offlineThreshold int) error {
 	if offlineThreshold < 1 {
 		offlineThreshold = 1
 	}
-	if online {
-		_, err := s.db.ExecContext(ctx, `
-UPDATE worker_nodes SET status='online', last_seen_at=?, last_checked_at=?, status_error=NULL,
- health_failures=0, updated_at=? WHERE id=?`, checkedAt, checkedAt, time.Now().UTC(), id)
+	checkedAt = checkedAt.UTC()
+	// Compare parsed timestamps in the same transaction as the update. SQLite
+	// text timestamps can differ in fractional precision/time zone; SQL date
+	// functions also lose the sub-millisecond ordering of concurrent probes.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
+	defer tx.Rollback()
+	var lastChecked sql.NullTime
+	if err := tx.QueryRowContext(ctx, "SELECT last_checked_at FROM worker_nodes WHERE id=?", id).Scan(&lastChecked); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	// Equal wall-clock timestamps can represent distinct probes on Windows;
+	// only strictly older results are stale. Ties retain database arrival order.
+	if lastChecked.Valid && checkedAt.Before(lastChecked.Time) {
+		return nil
+	}
+	switch state {
+	case "online":
+		_, err = tx.ExecContext(ctx, `
+UPDATE worker_nodes SET status='online', last_seen_at=?, last_checked_at=?, status_error=NULL,
+ health_failures=0, updated_at=? WHERE id=?`, checkedAt, checkedAt, time.Now().UTC(), id)
+	case "unknown":
+		_, err = tx.ExecContext(ctx, `
+UPDATE worker_nodes SET status='unknown', last_checked_at=?, status_error=?,
+ health_failures=0, updated_at=? WHERE id=?`, checkedAt, message, time.Now().UTC(), id)
+	default:
+		_, err = tx.ExecContext(ctx, `
 UPDATE worker_nodes SET
  status=CASE WHEN health_failures + 1 >= ? THEN 'offline' ELSE status END,
  last_checked_at=?, status_error=?, health_failures=health_failures+1, updated_at=?
 WHERE id=?`, offlineThreshold, checkedAt, message, time.Now().UTC(), id)
-	return err
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SetWorkerStatus remains for callers that need an immediate explicit state.

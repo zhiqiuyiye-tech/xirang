@@ -23,6 +23,10 @@ type pooledConn struct {
 	releasedAt time.Time
 }
 
+// ErrCredentialsNotConfigured identifies local setup that prevents any probe.
+// Remote authentication failures remain ordinary SSH health failures.
+var ErrCredentialsNotConfigured = errors.New("no credentials configured for worker")
+
 type Manager struct {
 	cipher      *crypto.Cipher
 	poolSize    int
@@ -129,6 +133,9 @@ func (m *Manager) EvictWorker(wID int64) {
 // set + decrypts). Key-first, password-fallback. If neither produces a
 // usable method, an error is returned.
 func (m *Manager) buildAuth(w db.WorkerNode) ([]xssh.AuthMethod, error) {
+	if w.EncPrivateKey == nil && w.EncPassword == nil {
+		return nil, ErrCredentialsNotConfigured
+	}
 	var methods []xssh.AuthMethod
 	if w.EncPrivateKey != nil {
 		key, err := m.cipher.Decrypt(*w.EncPrivateKey)
@@ -170,9 +177,35 @@ func (m *Manager) dial(ctx context.Context, w db.WorkerNode) (*xssh.Client, erro
 	if err != nil {
 		return nil, err
 	}
+	// DialContext covers TCP setup only; NewClientConn's handshake does not
+	// honor ClientConfig.Timeout. Bound it explicitly and close on cancellation.
+	deadline := time.Now().Add(cfg.Timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	ncc, chans, reqs, err := xssh.NewClientConn(conn, addr, cfg)
 	if err != nil {
 		conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if contextDeadline, ok := ctx.Deadline(); ok && !time.Now().Before(contextDeadline) {
+			return nil, context.DeadlineExceeded
+		}
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		ncc.Close()
+		return nil, ctx.Err()
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		ncc.Close()
 		return nil, err
 	}
 	// NewClient wraps the Conn into a *Client and internally handles

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -32,7 +33,15 @@ func ping(ctx context.Context, c *xssh.Client) error {
 		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
 		done <- result{err}
 	}()
-	t := time.NewTimer(keepaliveTimeout)
+	probeTimeout := keepaliveTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		// Leave most of the caller's budget for a fresh connection if the idle
+		// transport is half-dead. Otherwise a stale pool alone fails a heartbeat.
+		if budget := time.Until(deadline) / 3; budget < probeTimeout {
+			probeTimeout = budget
+		}
+	}
+	t := time.NewTimer(probeTimeout)
 	defer t.Stop()
 	select {
 	case r := <-done:
@@ -107,9 +116,12 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	if err != nil {
 		return "", "", -1, err
 	}
+	// NewSession and Start are synchronous SSH requests too, so watching only
+	// Wait misses stalled channel opens and exec acknowledgements.
+	stop := context.AfterFunc(ctx, func() { _ = client.Close() })
 	reuse := false
 	defer func() {
-		if reuse {
+		if stopped := stop(); reuse && stopped && ctx.Err() == nil {
 			m.release(w.ID, client)
 		} else {
 			client.Close()
@@ -117,6 +129,9 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	}()
 	sess, err := client.NewSession()
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", "", -1, ctx.Err()
+		}
 		return "", "", -1, err
 	}
 	defer sess.Close()
@@ -127,12 +142,18 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 		sess.Stdin = stdin
 	}
 	if err := sess.Start(cmd); err != nil {
+		if ctx.Err() != nil {
+			return "", "", -1, ctx.Err()
+		}
 		return "", "", -1, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- sess.Wait() }()
 	select {
 	case err := <-done:
+		if ctx.Err() != nil {
+			return outB.String(), errB.String(), -1, ctx.Err()
+		}
 		if ee, ok := err.(*xssh.ExitError); ok {
 			reuse = true
 			return outB.String(), errB.String(), ee.ExitStatus(), nil
@@ -143,11 +164,11 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 		reuse = true
 		return outB.String(), errB.String(), 0, nil
 	case <-ctx.Done():
-		// SSH signal delivery is optional for servers; closing the session
-		// channel is the guaranteed way to terminate the remote process. The
-		// deferred sess.Close() is a no-op after this.
-		_ = sess.Signal(xssh.SIGKILL)
-		_ = sess.Close()
+		// Closing the transport interrupts SSH requests without relying on the
+		// optional signal request (which can itself block). Wait for output-copy
+		// goroutines before reading buffers to avoid a cancellation data race.
+		_ = client.Close()
+		<-done
 		return outB.String(), errB.String(), -1, ctx.Err()
 	}
 }
@@ -155,6 +176,12 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 func (m *Manager) TestConnection(ctx context.Context, w db.WorkerNode) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	_, _, _, err := m.Run(ctx, w, "true")
-	return err
+	_, stderr, code, err := m.Run(ctx, w, "true")
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("connection test exited %d: %s", code, stderr)
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -99,19 +100,78 @@ func CreateService(ctx context.Context, client kubernetes.Interface, req CreateS
 	return created, nil
 }
 
-// DeleteService deletes a Service by name after verifying it is managed by the control panel.
+// DeleteService deletes panel-managed Services or external NodePort mappings
+// whose nonempty selector targets only existing notebook pods. Identity
+// preconditions protect the validated object from concurrent replacement/edit.
 func DeleteService(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
-	if isProtectedNamespace(namespace) {
-		return fmt.Errorf("cannot delete service in protected namespace %q", namespace)
-	}
-	svc, err := client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	svc, err := serviceForDeletion(ctx, client, namespace, name, "", "", false)
 	if err != nil {
 		return err
 	}
-	if svc.Labels["managed-by"] != "control-panel" {
-		return fmt.Errorf("cannot delete externally managed service %s/%s", namespace, name)
+	return deleteValidatedService(ctx, client, svc)
+}
+
+func serviceForDeletion(ctx context.Context, client kubernetes.Interface, namespace, name, uid, resourceVersion string, managedOnly bool) (*corev1.Service, error) {
+	if namespace == "" || name == "" {
+		return nil, fmt.Errorf("namespace and name required")
 	}
-	return client.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if isProtectedNamespace(namespace) {
+		return nil, fmt.Errorf("cannot delete service in protected namespace %q", namespace)
+	}
+	svc, err := client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if (uid != "" && string(svc.UID) != uid) || (resourceVersion != "" && svc.ResourceVersion != resourceVersion) {
+		return nil, fmt.Errorf("conflict: service %s/%s was replaced or modified, please refresh", namespace, name)
+	}
+	if svc.Labels["managed-by"] == "control-panel" {
+		return svc, nil
+	}
+	if managedOnly || svc.Spec.Type != corev1.ServiceTypeNodePort || len(svc.Spec.Selector) == 0 {
+		return nil, fmt.Errorf("cannot delete externally managed service %s/%s: only notebook NodePort mappings may be deleted", namespace, name)
+	}
+	// A fresh namespaced Pod list is used for the destructive check, rather
+	// than relying on the UI's cached attribution or a service-name convention.
+	pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("verify notebook mapping: %w", err)
+	}
+	if !serviceDeletionAllowed(*svc, pods.Items) {
+		return nil, fmt.Errorf("cannot delete externally managed service %s/%s: selector must target only existing notebook pods", namespace, name)
+	}
+	return svc, nil
+}
+
+func deleteValidatedService(ctx context.Context, client kubernetes.Interface, svc *corev1.Service) error {
+	return client.CoreV1().Services(svc.Namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &svc.UID, ResourceVersion: &svc.ResourceVersion},
+	})
+}
+
+// serviceDeletionAllowed is also used to advertise deletion separately from
+// ownership/editability. Mixed notebook/ordinary selectors are rejected.
+func serviceDeletionAllowed(svc corev1.Service, pods []corev1.Pod) bool {
+	if isProtectedNamespace(svc.Namespace) {
+		return false
+	}
+	if svc.Labels["managed-by"] == "control-panel" {
+		return true
+	}
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		return false
+	}
+	matched := false
+	for _, pod := range pods {
+		if pod.Namespace != svc.Namespace || !selectorMatches(svc.Spec.Selector, pod.Labels) {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(pod.Name), "notebook") {
+			return false
+		}
+		matched = true
+	}
+	return matched
 }
 
 // UpdateServiceReq describes the desired ports and concurrency token for updating a Service.
@@ -167,14 +227,15 @@ func ListServices(ctx context.Context, client kubernetes.Interface, namespace st
 // created it (managed-by=control-panel label), and Pods lists the notebook pods
 // the Service routes to (selector match). Pods lets the UI show existing port
 // mappings grouped PER notebook pod instead of a flat cluster-wide list;
-// Services created by other systems are included (read-only) when they target
-// the same pod.
+// Services created by other systems are included when they target the same
+// pod. Deletable is independent of Managed; external editing stays prohibited.
 type ServiceInfo struct {
 	Name            string            `json:"name"`
 	Namespace       string            `json:"namespace"`
 	Type            string            `json:"type"` // ClusterIP | NodePort | LoadBalancer
 	Selector        map[string]string `json:"selector"`
 	Managed         bool              `json:"managed"`
+	Deletable       bool              `json:"deletable"`
 	Ports           []PortRow         `json:"ports"`
 	Pods            []PodRef          `json:"pods"` // notebook pods this Service routes to (selector match); empty if none
 	ResourceVersion string            `json:"resource_version"`
@@ -208,15 +269,20 @@ type PortRow struct {
 // endpoint. Lists are served from the API server watch cache
 // (ResourceVersion=0), skipping the etcd quorum read.
 func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) ([]ServiceInfo, error) {
-	pods, err := ListNotebookPods(ctx, client)
+	// Keep ordinary pods in this single existing cluster-wide list so mixed
+	// selectors cannot be advertised as deletable. Namespace scoping and pod
+	// attribution still use the project's notebook name filter.
+	pods, err := client.CoreV1().Pods("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 	if err != nil {
 		return nil, fmt.Errorf("list notebook pods: %w", err)
 	}
-	nsSet := make(map[string]struct{}, len(pods))
-	podsByNs := make(map[string][]PodInfo, len(pods))
-	for _, p := range pods {
-		nsSet[p.Namespace] = struct{}{}
+	nsSet := make(map[string]struct{})
+	podsByNs := make(map[string][]corev1.Pod)
+	for _, p := range pods.Items {
 		podsByNs[p.Namespace] = append(podsByNs[p.Namespace], p)
+		if strings.Contains(strings.ToLower(p.Name), "notebook") {
+			nsSet[p.Namespace] = struct{}{}
+		}
 	}
 	out := make([]ServiceInfo, 0)
 	var (
@@ -246,9 +312,10 @@ func ListServicesForNotebooks(ctx context.Context, client kubernetes.Interface) 
 			defer mu.Unlock()
 			for _, s := range list.Items {
 				si := toServiceInfo(s)
+				si.Deletable = serviceDeletionAllowed(s, podsByNs[ns])
 				for _, p := range podsByNs[ns] {
-					if selectorMatches(s.Spec.Selector, p.Labels) {
-						si.Pods = append(si.Pods, PodRef{Name: p.Name, UID: p.UID})
+					if strings.Contains(strings.ToLower(p.Name), "notebook") && selectorMatches(s.Spec.Selector, p.Labels) {
+						si.Pods = append(si.Pods, PodRef{Name: p.Name, UID: string(p.UID)})
 					}
 				}
 				out = append(out, si)
@@ -272,7 +339,8 @@ func selectorMatches(selector, podLabels map[string]string) bool {
 		return false
 	}
 	for k, v := range selector {
-		if podLabels[k] != v {
+		value, exists := podLabels[k]
+		if !exists || value != v {
 			return false
 		}
 	}

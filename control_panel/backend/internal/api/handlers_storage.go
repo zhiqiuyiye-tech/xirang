@@ -9,7 +9,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
-	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/ssh"
 	"xirang/control_panel/internal/storage"
@@ -48,7 +47,7 @@ func (h *storageHandlers) provision(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "storage.provision_nfs", strconv.FormatInt(wid, 10), "submitted")
+	h.audit(c, "storage.provision_nfs", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -67,7 +66,7 @@ func (h *storageHandlers) reclaim(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "storage.reclaim_nfs", strconv.FormatInt(wid, 10), "submitted")
+	h.audit(c, "storage.reclaim_nfs", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -379,7 +378,7 @@ func (h *storageHandlers) createVG(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "storage.create_vg", strconv.FormatInt(wid, 10), "submitted")
+	h.audit(c, "storage.create_vg", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -398,7 +397,7 @@ func (h *storageHandlers) resizeLV(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "storage.resize_lv", strconv.FormatInt(wid, 10), "submitted")
+	h.audit(c, "storage.resize_lv", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -417,7 +416,7 @@ func (h *storageHandlers) deleteLV(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "storage.delete_lv", strconv.FormatInt(wid, 10), "submitted")
+	h.audit(c, "storage.delete_lv", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -448,11 +447,7 @@ func parseWorkerID(v any) (int64, error) {
 
 // audit records an audit log entry. The actor is read from the JWT claims
 // (defaulting to "admin"). Mirrors the helper on workerHandlers / k8sHandlers.
-func (h *storageHandlers) audit(c *gin.Context, action, target, result string) {
-	actor := "admin"
-	if cl, ok := auth.ClaimsFrom(c); ok {
-		actor = cl.Username
-	}
-	t := target
-	_ = h.store.InsertAudit(c, db.AuditLog{Actor: actor, Action: action, Target: &t, Result: result})
+func (h *storageHandlers) audit(c *gin.Context, action, target, result string, params ...map[string]any) {
+	fields := append([]map[string]any{workerAuditDetails(c, h.store, target)}, params...)
+	recordAudit(c, h.store, action, target, result, fields...)
 }

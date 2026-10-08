@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
-	"xirang/control_panel/internal/auth"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
@@ -58,21 +57,23 @@ func (h *workerHandlers) update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	before := workerAuditDetails(c, h.store, c.Param("id"))
 	if err := h.ws.Update(c, id, r); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "worker.update", c.Param("id"), "success")
+	h.audit(c, "worker.update", c.Param("id"), "success", map[string]any{"before": before, "after": workerAuditDetails(c, h.store, c.Param("id"))})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func (h *workerHandlers) delete(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	details := workerAuditDetails(c, h.store, c.Param("id"))
 	if err := h.ws.Delete(c, id); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "worker.delete", c.Param("id"), "success")
+	h.audit(c, "worker.delete", c.Param("id"), "success", details)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -134,7 +135,7 @@ func (h *workerHandlers) changeRootPassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "worker.change_root_password", c.Param("id"), "success")
+	h.audit(c, "worker.change_root_password", c.Param("id"), "submitted", map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
@@ -148,17 +149,14 @@ func (h *workerHandlers) installDeps(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "worker.install_deps", c.Param("id"), "submitted")
+	h.audit(c, "worker.install_deps", c.Param("id"), "submitted", map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 
 // audit records an audit log entry. The actor is read from the JWT claims
-// (defaulting to "admin"); credential plaintext is never logged - only the
-// action name, target id, and result are recorded.
-func (h *workerHandlers) audit(c *gin.Context, action, target, result string) {
-	actor := "admin"
-	if cl, ok := auth.ClaimsFrom(c); ok {
-		actor = cl.Username
-	}
-	_ = h.store.InsertAudit(c, db.AuditLog{Actor: actor, Action: action, Target: &target, Result: result})
+// (defaulting to "admin"); only safe operation fields and node identity are
+// recorded. Passwords and private keys never enter audit parameters.
+func (h *workerHandlers) audit(c *gin.Context, action, target, result string, params ...map[string]any) {
+	fields := append([]map[string]any{workerAuditDetails(c, h.store, target)}, params...)
+	recordAudit(c, h.store, action, target, result, fields...)
 }

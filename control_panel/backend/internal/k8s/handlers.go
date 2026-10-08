@@ -7,6 +7,9 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/tasks"
@@ -210,28 +213,9 @@ func (h *updateSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 
 	// Deleting the last mapping cleanly deletes the Service and its associated NetworkPolicy.
 	if len(p.Mappings) == 0 && len(p.Ports) == 0 {
-		st, err := r.Step("delete_empty_service")
-		if err != nil {
-			r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
-			return err
-		}
-		if err := DeleteService(ctx, h.client, p.Namespace, p.Name); err != nil {
-			st.Done("failed", "", err.Error(), err.Error())
-			r.Fail(fmt.Sprintf("k8s_update_svc: delete service: %v", err))
-			return err
-		}
-		st.Done("succeeded", p.Name, "", "")
-
-		stNP, _ := r.Step("delete_network_policy")
-		if err := DeleteNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name); err != nil {
-			if stNP != nil {
-				stNP.Done("failed", "", err.Error(), err.Error())
-			}
-		} else if stNP != nil {
-			stNP.Done("succeeded", p.Name, "", "")
-		}
-		r.Succeed()
-		return nil
+		// Empty PUT remains an edit operation: do not let this branch bypass
+		// external read-only semantics or the supplied concurrency token.
+		return runServiceDeletion(ctx, h.client, r, "k8s_update_svc", "delete_empty_service", p.Namespace, p.Name, "", p.ResourceVersion, true)
 	}
 
 	ports, err := parsePortSpecs(p.Mappings, p.Ports)
@@ -295,35 +279,69 @@ func (h *deleteSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		return errNoK8sClient
 	}
 	var p struct {
-		Namespace string `json:"namespace"`
-		Name      string `json:"name"`
+		Namespace       string `json:"namespace"`
+		Name            string `json:"name"`
+		UID             string `json:"uid"`
+		ResourceVersion string `json:"resource_version"`
 	}
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
 		r.Fail(fmt.Sprintf("k8s_delete_svc: parse params: %v", err))
 		return err
 	}
+	return runServiceDeletion(ctx, h.client, r, "k8s_delete_svc", "delete_service", p.Namespace, p.Name, p.UID, p.ResourceVersion, false)
+}
 
-	st, err := r.Step("delete_service")
+// Snapshot associated panel policies BEFORE deleting the Service. Listing by
+// service-name afterwards can capture policies belonging to a newly created
+// same-name Service. Both service and policy deletes pin UID/resourceVersion.
+// External mappings never cascade into platform-owned NetworkPolicies.
+func runServiceDeletion(ctx context.Context, client kubernetes.Interface, r *tasks.Reporter, taskType, stepName, namespace, name, uid, resourceVersion string, managedOnly bool) error {
+	st, err := r.Step(stepName)
 	if err != nil {
-		r.Fail(fmt.Sprintf("k8s_delete_svc: create step: %v", err))
+		r.Fail(fmt.Sprintf("%s: create step: %v", taskType, err))
 		return err
 	}
-	if err := DeleteService(ctx, h.client, p.Namespace, p.Name); err != nil {
-		st.Done("failed", "", err.Error(), err.Error())
-		r.Fail(fmt.Sprintf("k8s_delete_svc: %v", err))
-		return err
-	}
-	st.Done("succeeded", p.Name, "", "")
-
-	// Cascade delete associated NetworkPolicy created by control-panel for this service
-	st2, err := r.Step("delete_network_policy")
-	if err == nil {
-		if err := DeleteNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name); err != nil {
-			st2.Done("failed", "", err.Error(), fmt.Sprintf("delete network policy for service %s: %v", p.Name, err))
-		} else {
-			st2.Done("succeeded", p.Name, "", "")
+	svc, err := serviceForDeletion(ctx, client, namespace, name, uid, resourceVersion, managedOnly)
+	var policies []networkingv1.NetworkPolicy
+	if err == nil && svc.Labels["managed-by"] == "control-panel" {
+		var list *networkingv1.NetworkPolicyList
+		list, err = client.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("managed-by=control-panel,service-name=%s", name),
+		})
+		if err == nil {
+			policies = list.Items
 		}
 	}
+	if err == nil {
+		err = deleteValidatedService(ctx, client, svc)
+	}
+	if err != nil {
+		st.Done("failed", "", err.Error(), err.Error())
+		r.Fail(fmt.Sprintf("%s: delete service: %v", taskType, err))
+		return err
+	}
+	st.Done("succeeded", name, "", "")
+
+	stNP, err := r.Step("delete_network_policy")
+	if err != nil {
+		r.Fail(fmt.Sprintf("%s: service deleted but policy cleanup step failed: %v", taskType, err))
+		return err
+	}
+	for _, np := range policies {
+		err = client.NetworkingV1().NetworkPolicies(namespace).Delete(ctx, np.Name, metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &np.UID, ResourceVersion: &np.ResourceVersion},
+		})
+		if apierrors.IsNotFound(err) {
+			continue // Already removed by garbage collection or another request.
+		}
+		if err != nil {
+			message := fmt.Sprintf("service deleted but network policy %s cleanup failed: %v", np.Name, err)
+			stNP.Done("failed", "", err.Error(), message)
+			r.Fail(fmt.Sprintf("%s: %s", taskType, message))
+			return err
+		}
+	}
+	stNP.Done("succeeded", name, "", "")
 	r.Succeed()
 	return nil
 }
