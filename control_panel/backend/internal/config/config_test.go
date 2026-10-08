@@ -189,7 +189,7 @@ func TestLoad_CollectorDefaultsAndCustomValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.WorkerHeartbeatInterval != time.Minute || cfg.WorkerHeartbeatTimeout != 5*time.Second {
+	if cfg.WorkerHeartbeatInterval != time.Minute || cfg.WorkerHeartbeatTimeout != 15*time.Second {
 		t.Fatalf("heartbeat defaults: interval=%v timeout=%v", cfg.WorkerHeartbeatInterval, cfg.WorkerHeartbeatTimeout)
 	}
 	if cfg.StorageRefreshInterval != 5*time.Minute || cfg.StorageProbeTimeout != 45*time.Second {

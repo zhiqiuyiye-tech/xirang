@@ -175,7 +175,7 @@ func (m *Manager) dial(ctx context.Context, w db.WorkerNode) (*xssh.Client, erro
 	d := net.Dialer{}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ssh tcp connect %s: %w", addr, err)
 	}
 	// DialContext covers TCP setup only; NewClientConn's handshake does not
 	// honor ClientConfig.Timeout. Bound it explicitly and close on cancellation.
@@ -193,16 +193,15 @@ func (m *Manager) dial(ctx context.Context, w db.WorkerNode) (*xssh.Client, erro
 	if err != nil {
 		conn.Close()
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			err = ctx.Err()
+		} else if contextDeadline, ok := ctx.Deadline(); ok && !time.Now().Before(contextDeadline) {
+			err = context.DeadlineExceeded
 		}
-		if contextDeadline, ok := ctx.Deadline(); ok && !time.Now().Before(contextDeadline) {
-			return nil, context.DeadlineExceeded
-		}
-		return nil, err
+		return nil, fmt.Errorf("ssh handshake/authentication %s: %w", addr, err)
 	}
 	if ctx.Err() != nil {
 		ncc.Close()
-		return nil, ctx.Err()
+		return nil, fmt.Errorf("ssh handshake/authentication %s: %w", addr, ctx.Err())
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		ncc.Close()

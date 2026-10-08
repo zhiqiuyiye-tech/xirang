@@ -61,6 +61,8 @@ config:
   cookieSecure: false  # Required for the current HTTP-only internal deployment
   cookieSameSite: "Strict"
   jwtTTL: "30m"
+  # Total SSH heartbeat budget, including pool validation and remote true.
+  workerHeartbeatTimeout: "15s"
   trustedProxies: []
   rateLimitMaxFailures: 5
   rateLimitLockoutDuration: "15m"

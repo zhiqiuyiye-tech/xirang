@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -150,6 +151,9 @@ func TestRunHonorsContextDuringEverySSHStage(t *testing.T) {
 			case err := <-done:
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("expected deadline error during %s, got %v", stage, err)
+				}
+				if !strings.Contains(err.Error(), stage) {
+					t.Fatalf("timeout must identify SSH %s stage, got %v", stage, err)
 				}
 			case <-time.After(750 * time.Millisecond):
 				server.closeConnections()

@@ -114,7 +114,7 @@ func (m *Manager) Run(ctx context.Context, w db.WorkerNode, cmd string) (stdout,
 func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string, stdin io.Reader) (stdout, stderr string, exitCode int, err error) {
 	client, err := m.acquire(ctx, w)
 	if err != nil {
-		return "", "", -1, err
+		return "", "", -1, fmt.Errorf("ssh connection acquisition: %w", err)
 	}
 	// NewSession and Start are synchronous SSH requests too, so watching only
 	// Wait misses stalled channel opens and exec acknowledgements.
@@ -130,9 +130,9 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	sess, err := client.NewSession()
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", "", -1, ctx.Err()
+			err = ctx.Err()
 		}
-		return "", "", -1, err
+		return "", "", -1, fmt.Errorf("ssh session open: %w", err)
 	}
 	defer sess.Close()
 	var outB, errB bytes.Buffer
@@ -143,16 +143,16 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	}
 	if err := sess.Start(cmd); err != nil {
 		if ctx.Err() != nil {
-			return "", "", -1, ctx.Err()
+			err = ctx.Err()
 		}
-		return "", "", -1, err
+		return "", "", -1, fmt.Errorf("ssh exec start: %w", err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- sess.Wait() }()
 	select {
 	case err := <-done:
 		if ctx.Err() != nil {
-			return outB.String(), errB.String(), -1, ctx.Err()
+			return outB.String(), errB.String(), -1, fmt.Errorf("ssh wait for command completion: %w", ctx.Err())
 		}
 		if ee, ok := err.(*xssh.ExitError); ok {
 			reuse = true
@@ -169,7 +169,7 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 		// goroutines before reading buffers to avoid a cancellation data race.
 		_ = client.Close()
 		<-done
-		return outB.String(), errB.String(), -1, ctx.Err()
+		return outB.String(), errB.String(), -1, fmt.Errorf("ssh wait for command completion: %w", ctx.Err())
 	}
 }
 

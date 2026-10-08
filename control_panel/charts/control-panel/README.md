@@ -55,10 +55,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.7.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.8.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.7`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.8`.
 
 ## Install
 
@@ -221,6 +221,38 @@ not expect the old password-login binary to operate on a `KEY_ACTIVE` database.
 - [ ] **StorageClass**: Ensure StorageClass is `local-path`, `hostPath`, or a block CSI (not NFS).
 - [ ] **Ingress Network Restriction**: If exposed to corporate LAN, configure `whitelist-source-range` on Ingress or enable `networkPolicy`.
 
+## Worker SSH heartbeat timeouts
+
+Worker status is based on an authenticated SSH session executing `true`, not
+Kubernetes Node Ready or simply opening a TCP port. The default total heartbeat
+budget is 15 seconds, matching the manual connection test. Earlier versions used
+5 seconds for background checks, which could mark a reachable but slow worker
+offline while the manual test succeeded.
+
+For an existing installation, the environment variable is already supported:
+
+```bash
+kubectl -n control-panel set env deployment/control-panel WORKER_HEARTBEAT_TIMEOUT=15s
+kubectl -n control-panel rollout status deployment/control-panel
+```
+
+This restarts the panel Pod. Check the worker again after the next heartbeat
+(default interval: one minute), or use the panel's connection-test button. To
+persist a larger total budget with the updated chart, set
+`config.workerHeartbeatTimeout: "30s"` in your values file. Explicit environment
+values override the application default; an existing `5s` override must be
+changed separately.
+
+New timeout diagnostics name the SSH stage: `tcp connect`,
+`handshake/authentication`, `session open`, `exec start`, or
+`wait for command completion`. Handshake/authentication also has its own 10-second
+limit; increasing the total heartbeat budget does not remove that limit. For a
+handshake timeout, inspect server authentication, DNS/PAM and the network path
+from the panel Pod, rather than only increasing the heartbeat budget. For
+session/exec/wait timeouts, inspect node load and non-interactive shell startup.
+Repeated failed checks still use the offline threshold; timeouts are never
+converted into successful checks.
+
 ## Configuration Reference
 
 | Key | Default | Description |
@@ -237,6 +269,7 @@ not expect the old password-login binary to operate on a `KEY_ACTIVE` database.
 | `config.cookieSecure` | `false` | Session cookies cannot use `Secure` in the required HTTP deployment |
 | `config.cookieSameSite` | `Strict` | Required SameSite policy for the shared admin session |
 | `config.jwtTTL` | `30m` | Session lifetime; values over 30 minutes fail startup |
+| `config.workerHeartbeatTimeout` | `15s` | Total SSH heartbeat budget (`WORKER_HEARTBEAT_TIMEOUT`); increase for slow worker authentication/session startup |
 | `config.trustedProxies` | `[]` | CIDRs allowed to supply forwarded client IP headers; empty means use `RemoteAddr` |
 | `config.rateLimitMaxFailures` | `5` | Failed proofs per resolved source before temporary source-only backoff |
 | `config.rateLimitLockoutDuration` | `15m` | Maximum source-only in-memory backoff; no account-wide persistent lock |

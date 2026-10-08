@@ -131,7 +131,7 @@ func Load() (Config, error) {
 	if c.WorkerHeartbeatInterval, err = positiveDurationEnv("WORKER_HEARTBEAT_INTERVAL", time.Minute); err != nil {
 		return c, err
 	}
-	if c.WorkerHeartbeatTimeout, err = positiveDurationEnv("WORKER_HEARTBEAT_TIMEOUT", 5*time.Second); err != nil {
+	if c.WorkerHeartbeatTimeout, err = positiveDurationEnv("WORKER_HEARTBEAT_TIMEOUT", 15*time.Second); err != nil {
 		return c, err
 	}
 	if c.StorageRefreshInterval, err = positiveDurationEnv("STORAGE_REFRESH_INTERVAL", 5*time.Minute); err != nil {

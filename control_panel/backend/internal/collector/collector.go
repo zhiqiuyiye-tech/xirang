@@ -56,7 +56,9 @@ func New(store *db.Store, runner ssh.Runner, config Config) *Collector {
 		config.InventoryInterval = 5 * time.Minute
 	}
 	if config.HeartbeatTimeout <= 0 {
-		config.HeartbeatTimeout = 5 * time.Second
+		// Include pool probing, authentication and remote session setup, using
+		// the same default budget as the manual SSH connection test.
+		config.HeartbeatTimeout = 15 * time.Second
 	}
 	if config.InventoryTimeout <= 0 {
 		config.InventoryTimeout = 45 * time.Second
@@ -246,6 +248,9 @@ func (c *Collector) checkHeartbeat(parent context.Context, workerID int64) error
 		// A heartbeat's own deadline still counts as a failed probe.
 		if errors.Is(runErr, context.Canceled) || parent.Err() != nil {
 			return runErr
+		}
+		if errors.Is(runErr, context.DeadlineExceeded) {
+			runErr = fmt.Errorf("SSH heartbeat timed out after %s (WORKER_HEARTBEAT_TIMEOUT): %w", c.config.HeartbeatTimeout, runErr)
 		}
 		message := strings.TrimSpace(stderr)
 		if runErr != nil {
