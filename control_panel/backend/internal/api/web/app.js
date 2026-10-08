@@ -151,19 +151,21 @@
 
     function renderWorkerAccelerators(info) {
         info = info || {};
-        var total = info.status === 'available' && info.total != null ? info.total : '未知';
+        var physicalTotal = info.status === 'available' && info.total != null ? info.total : '未知';
+        var total = info.allocation_status === 'available' && info.schedulable_total != null ? info.schedulable_total : '未知';
         var used = info.allocation_status === 'available' && info.used != null ? info.used : '未知';
         var models = (info.devices || []).map(function (device) {
-            return '<div><strong>' + esc(device.model) + '</strong> <span class="muted">' + esc(device.count) + ' 张</span></div>';
+            return '<div><strong>' + esc(device.model) + '</strong> <span class="muted">' + esc(device.count) + ' 张物理卡' + (device.device_count > 0 ? ' · ' + esc(device.device_count) + ' 个设备' : '') + '</span></div>';
         }).join('');
-        var html = models || '<div class="muted">' + (total === 0 ? '未检测到 GPU / NPU 卡' : '卡型号未知') + '</div>';
-        html += '<div title="已使用为 Kubernetes 已分配卡数；总数为设备工具采集的物理卡数">已使用 / 总共：<span class="font-mono">' + esc(used) + ' / ' + esc(total) + '</span> 张</div>';
-        if (info.error) html += '<div class="muted" style="font-size:11px;">' + esc(info.error) + '</div>';
+        var html = models || '<div class="muted">' + (physicalTotal === 0 ? '未检测到 GPU / NPU 卡' : '卡型号未知') + '</div>';
+        html += '<div title="已使用与总共均按 Kubernetes 可分配设备计数；一张物理卡可能包含多个 NPU 设备">已使用 / 总共：<span class="font-mono">' + esc(used) + ' / ' + esc(total) + '</span> 个设备</div>';
+        if (info.status === 'partial') html += '<div class="muted" style="font-size:11px;">部分工具采集失败，已保留成功的设备信息</div>';
+        if (info.error) html += '<div class="muted" style="font-size:11px;max-width:320px;overflow-wrap:anywhere;">' + esc(info.error) + '</div>';
         if (info.allocation_status !== 'available') html += '<div class="muted" style="font-size:11px;">分配信息未知</div>';
         if (info.source) html += '<div class="muted" style="font-size:11px;">来源：' + esc(info.source) + '</div>';
         if (info.checked_at) html += '<div class="muted" style="font-size:11px;">采集于 ' + esc(fmtTime(info.checked_at)) + '</div>';
         if (info.schedulable_total != null && info.total != null && info.schedulable_total !== info.total) {
-            html += '<div class="muted" style="font-size:11px;">Kubernetes 可分配：' + esc(info.schedulable_total) + ' 张（可能存在共享或虚拟化）</div>';
+            html += '<div class="muted" style="font-size:11px;">物理卡总数：' + esc(info.total) + ' 张（与可分配设备数量分别统计）</div>';
         }
         return html;
     }
@@ -189,8 +191,8 @@
     function renderPodAccelerators(pod) {
         if (pod.accelerator_count == null) return '<span class="muted">未知</span>';
         var resources = pod.accelerator_resources || {};
-        var details = Object.keys(resources).sort().map(function (name) { return name + ': ' + resources[name] + ' 张'; }).join('；');
-        var html = '<span class="badge ' + (pod.accelerator_count > 0 ? 'badge-primary' : 'badge-muted') + '" title="' + esc(details || '未申请 GPU / NPU 卡资源') + '">' + esc(pod.accelerator_count) + ' 张</span>';
+        var details = Object.keys(resources).sort().map(function (name) { return name + ': ' + resources[name] + ' 个设备'; }).join('；');
+        var html = '<span class="badge ' + (pod.accelerator_count > 0 ? 'badge-primary' : 'badge-muted') + '" title="' + esc(details || '未申请 GPU / NPU 设备资源') + '">' + esc(pod.accelerator_count) + ' 个设备</span>';
         if (pod.accelerator_count > 0) {
             if (pod.status === 'Succeeded' || pod.status === 'Failed') html += '<span class="muted" style="font-size:11px;"> 已释放（配置数量）</span>';
             else if (!pod.node) html += '<span class="muted" style="font-size:11px;"> 未分配（申请数量）</span>';

@@ -19,7 +19,7 @@ import (
 	"xirang/control_panel/internal/db"
 )
 
-func startTestSSHd(t *testing.T, rootPassword string) (addr string, testPrivKey string) {
+func startTestSSHd(t *testing.T, rootPassword string, responseDelay ...time.Duration) (addr string, testPrivKey string) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -90,6 +90,9 @@ func startTestSSHd(t *testing.T, rootPassword string) (addr string, testPrivKey 
 							}
 						}
 						_, _ = io.Copy(io.Discard, ch)
+						if len(responseDelay) > 0 {
+							time.Sleep(responseDelay[0])
+						}
 						ch.Write([]byte("hello\n"))
 						ch.SendRequest("exit-status", false, xssh.Marshal(struct{ C uint32 }{0}))
 					}(ch, reqs)
@@ -116,6 +119,20 @@ func mustEncrypt(t *testing.T, s string) string {
 		t.Fatal(err)
 	}
 	return enc
+}
+
+func TestConnectionAllowsObservedSlowSession(t *testing.T) {
+	addr, _ := startTestSSHd(t, "pw123", 17*time.Second)
+	host, port, _ := net.SplitHostPort(addr)
+	p := 0
+	fmt.Sscanf(port, "%d", &p)
+	encPw := mustEncrypt(t, "pw123")
+	w := db.WorkerNode{ID: 1, Host: host, Port: p, Username: "root", AuthMode: "password", EncPassword: &encPw}
+	m := newTestManager(t)
+	defer m.Close()
+	if err := m.TestConnection(context.Background(), w); err != nil {
+		t.Fatalf("successful slow SSH session marked unavailable: %v", err)
+	}
 }
 
 func TestRun_PasswordAuth(t *testing.T) {

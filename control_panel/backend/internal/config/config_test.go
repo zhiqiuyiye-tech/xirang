@@ -42,6 +42,7 @@ func unsetMinimalEnv() {
 	os.Unsetenv("REQUIRE_K8S")
 	os.Unsetenv("WORKER_HEARTBEAT_INTERVAL")
 	os.Unsetenv("WORKER_HEARTBEAT_TIMEOUT")
+	os.Unsetenv("WORKER_ACCELERATOR_TIMEOUT")
 	os.Unsetenv("STORAGE_REFRESH_INTERVAL")
 	os.Unsetenv("STORAGE_PROBE_TIMEOUT")
 	os.Unsetenv("COLLECTOR_CONCURRENCY")
@@ -189,7 +190,7 @@ func TestLoad_CollectorDefaultsAndCustomValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.WorkerHeartbeatInterval != time.Minute || cfg.WorkerHeartbeatTimeout != 15*time.Second {
+	if cfg.WorkerHeartbeatInterval != time.Minute || cfg.WorkerHeartbeatTimeout != 30*time.Second {
 		t.Fatalf("heartbeat defaults: interval=%v timeout=%v", cfg.WorkerHeartbeatInterval, cfg.WorkerHeartbeatTimeout)
 	}
 	if cfg.StorageRefreshInterval != 5*time.Minute || cfg.StorageProbeTimeout != 45*time.Second {
@@ -238,6 +239,27 @@ func TestLoad_InvalidCollectorOptions(t *testing.T) {
 		os.Setenv(key, value)
 		if _, err := Load(); err == nil {
 			t.Fatalf("expected error for %s=%q", key, value)
+		}
+	}
+}
+
+func TestLoadAcceleratorTimeout(t *testing.T) {
+	setMinimalEnv()
+	defer unsetMinimalEnv()
+	t.Setenv("WORKER_ACCELERATOR_TIMEOUT", "")
+	cfg, err := Load()
+	if err != nil || cfg.WorkerAcceleratorTimeout != 45*time.Second {
+		t.Fatalf("default: %+v, err=%v", cfg, err)
+	}
+	t.Setenv("WORKER_ACCELERATOR_TIMEOUT", "1m")
+	cfg, err = Load()
+	if err != nil || cfg.WorkerAcceleratorTimeout != time.Minute {
+		t.Fatalf("custom: %+v, err=%v", cfg, err)
+	}
+	for _, value := range []string{"0s", "-1s", "invalid"} {
+		t.Setenv("WORKER_ACCELERATOR_TIMEOUT", value)
+		if _, err := Load(); err == nil {
+			t.Fatalf("accepted invalid timeout %q", value)
 		}
 	}
 }

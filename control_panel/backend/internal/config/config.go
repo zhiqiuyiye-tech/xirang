@@ -36,6 +36,7 @@ type Config struct {
 	RequireK8s                  bool
 	WorkerHeartbeatInterval     time.Duration
 	WorkerHeartbeatTimeout      time.Duration
+	WorkerAcceleratorTimeout    time.Duration
 	StorageRefreshInterval      time.Duration
 	StorageProbeTimeout         time.Duration
 	CollectorConcurrency        int
@@ -131,7 +132,10 @@ func Load() (Config, error) {
 	if c.WorkerHeartbeatInterval, err = positiveDurationEnv("WORKER_HEARTBEAT_INTERVAL", time.Minute); err != nil {
 		return c, err
 	}
-	if c.WorkerHeartbeatTimeout, err = positiveDurationEnv("WORKER_HEARTBEAT_TIMEOUT", 15*time.Second); err != nil {
+	if c.WorkerHeartbeatTimeout, err = positiveDurationEnv("WORKER_HEARTBEAT_TIMEOUT", 30*time.Second); err != nil {
+		return c, err
+	}
+	if c.WorkerAcceleratorTimeout, err = positiveDurationEnv("WORKER_ACCELERATOR_TIMEOUT", 45*time.Second); err != nil {
 		return c, err
 	}
 	if c.StorageRefreshInterval, err = positiveDurationEnv("STORAGE_REFRESH_INTERVAL", 5*time.Minute); err != nil {

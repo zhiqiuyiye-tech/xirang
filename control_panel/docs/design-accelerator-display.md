@@ -2,38 +2,42 @@
 
 ## 显示内容
 
-- Worker 列表新增 GPU / NPU 列：各型号的物理卡数量、已使用 / 总共、采集来源及时间。
-- Worker 页面新增“刷新节点与卡信息”，进入页面时也自动查询。
-- 端口映射的 Notebook 列表和配置弹窗显示用卡数量，悬浮提示具体 Kubernetes 资源类型。
+- Worker 列表展示型号、物理卡数量、工具采集的设备数量，以及已使用 / 总可分配设备数。
+- Worker 页面支持刷新节点与卡信息，进入页面时自动查询。
+- 端口映射 Notebook 列表和弹窗显示分配设备数，悬浮提示具体 Kubernetes 资源类型。
 - 尚未调度的 Notebook 标记“未分配（申请数量）”；已结束的 Notebook 标记“已释放（配置数量）”。
 
 ## 数据来源与统计口径
 
-- 通过已有 Worker SSH 凭证执行只读的 `npu-smi info`、`nvidia-smi --query-gpu=uuid,name --format=csv,noheader,nounits`。
-- 昇腾卡按照 NPU ID 去重，避免将同一卡的芯片、进程或重复表格当成多张卡；NVIDIA 卡按照 GPU UUID 去重。
-- Worker 总数为工具采集的物理卡数；已使用数为全部命名空间中绑定到节点的非终态 Pod 的有效卡资源申请，并非算力利用率或进程数量。
-- Notebook 用卡数量按有效资源申请计算：逐资源优先 requests，缺少时使用 limits；普通容器累加，init 容器使用调度峰值，支持可重启 init 容器和 Pod overhead。
-- 识别 NVIDIA、AMD、海光、寒武纪及昇腾的卡计数资源；排除显存、核心、百分比和共享份额等非卡计数单位。
-- Worker 优先以主机地址匹配 Kubernetes InternalIP；匹配失败时允许节点名称匹配，但拒绝地址冲突和歧义。
-- Kubernetes 可分配数量与物理卡数量不一致时额外展示可分配数量，提示可能存在共享或虚拟化。
+- 沿用 Worker SSH 凭证执行只读的 `npu-smi info` 和 `nvidia-smi --query-gpu=uuid,name --format=csv,noheader,nounits`。
+- 昇腾物理卡按 NPU ID 去重，设备按 Phy-ID 去重；例如 npu-smi 25.5.5 显示 NPU 0–7、Phy-ID 0–15，即 8 张 Ascend910 物理卡、16 个设备。
+- NVIDIA 物理卡和设备按 GPU UUID 去重。
+- Worker 已使用数为绑定到该节点的全部命名空间非终态 Pod 的有效设备申请，总数为节点 Kubernetes allocatable 中计数型加速设备资源总和。分子与分母使用相同单位，不与物理卡数混用。
+- Notebook 按有效设备申请计算：逐资源 requests 优先，缺少时使用 limits；普通容器累加，init 使用调度峰值，支持可重启 init 和 Pod overhead。
+- 识别 NVIDIA、AMD、海光、寒武纪及昇腾计数资源；排除显存、核心、百分比、共享份额等非设备计数单位。
+- Worker 优先以主机地址匹配 Kubernetes InternalIP，再尝试节点名称，拒绝地址冲突与歧义。
 
-## 边界与约束
+## 厂商查询隔离与错误处理
 
-- 卡信息使用独立、需登录的 `GET /api/v1/workers/accelerators` 接口，避免远程设备探测阻塞节点列表及配置操作。
-- 每次请求最多并发探测 4 个 Worker，单节点 SSH 超时 8 秒；Kubernetes 统计超时 5 秒，两种查询并行执行。
-- 不增加数据库迁移，不保存凭证或命令输出，不修改开发数据库。
-- SSH、驱动、设备工具、Kubernetes 权限或节点匹配异常时对应数据展示“未知”，而非 0。
-- 驱动输出无法识别时不会猜测型号和数量。不同版本的 `npu-smi` 若引入新表格格式，需要增加样例和解析测试。
+- 各设备工具分别记录输出和退出码，单个工具失败不会丢弃其他工具成功的型号、物理卡及设备信息。
+- `status=partial` 表示部分厂商采集失败；成功结果仍返回，失败工具、退出码和输出摘要作为诊断展示。完整物理卡总数 `total` 保持 null，避免将部分结果误当成整机总数。
+- 已登录的管理界面显示 SSH 具体失败阶段、超时预算及命令错误摘要。单个错误输出流最多 512 个字符，保留 UTF-8；不持久化命令输出和凭证。
+- SSH、设备工具、Kubernetes 权限或节点匹配失败时，对应未知数据不会伪装成 0。
+- 驱动权限由管理员处理，面板不会 chmod、绕过权限或执行驱动安装。
 
-## 方案选择
+## 超时与部署
 
-沿用已有 SSH 通道采集硬件，通过 Kubernetes 计算分配；前端异步补充卡信息。相比直接在 Worker 列表接口同步探测，此方式保持节点管理操作可用；相比新增常驻采集和存储体系，此次改动更小、无需迁移。
+- 独立的登录保护接口 `GET /api/v1/workers/accelerators` 避免设备探测阻塞节点配置操作。
+- 每次请求最多并发探测 4 个 Worker；设备采集默认总预算 45 秒，可通过 `WORKER_ACCELERATOR_TIMEOUT` / Helm `config.workerAcceleratorTimeout` 配置。Kubernetes 统计超时 5 秒，两者并行。
+- 心跳默认 30 秒，通过 `WORKER_HEARTBEAT_TIMEOUT` 配置；手动连接测试默认也为 30 秒。握手仍有独立 10 秒限制，心跳超时不会伪装成功。
+- 用户提供的真实会话认证后耗时 16.6 秒且 exit=0，旧 15 秒心跳和 8 秒设备预算不足。加大预算容纳该延迟，不能据此判定远端 shell 启动慢的具体原因。
+- 现有安装若显式配置旧心跳 15s，必须调整环境变量或 Helm values；原始 1.0.9 的设备预算硬编码 8 秒，新变量需要部署 1.0.10 或更新的二进制才有效。
+- 不增加数据库迁移，不修改开发数据库。
 
 ## 验证
 
-- `go test ./...`
-- `go vet ./...`
-- `node --check ../internal/api/web/app.js`（在 backend/web-build 执行）
-- `npm test`（在 backend/web-build 执行）
-
-自动化测试使用设备输出样例和 Kubernetes fake client；真实 Worker 驱动输出及真实集群权限需在部署环境验证。
+- `go test ./...`、`go vet ./...`。
+- `node --check ../internal/api/web/app.js`、`npm test`（在 backend/web-build 执行）。
+- 厂商退出码 126/127、双方成功或失败、实际双芯片布局、超时参数和真实 SSH 测试服务 17 秒响应的回归测试。
+- 使用 Bash 执行真实探测脚本配合模拟厂商工具，验证一个工具失败仍保留另一工具成功数据。
+- 自动化测试使用样例及 Kubernetes fake client；部署后的真实 Worker 查询和节点网络路径仍需确认。

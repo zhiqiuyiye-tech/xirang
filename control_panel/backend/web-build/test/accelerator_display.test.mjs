@@ -13,16 +13,25 @@ runInNewContext(source.replace(/\}\)\(\);\s*$/, `
  window.loadWorkerAccelerators = typeof loadWorkerAccelerators === 'function' ? loadWorkerAccelerators : null;
 })();`), sandbox);
 
-test('worker displays card models, counts and allocated / physical total', () => {
+test('worker keeps physical card models separate from Kubernetes device allocations', () => {
+ const html = window.renderWorkerAccelerators({ status: 'partial', devices: [{ model: 'Ascend910', count: 8, device_count: 16 }], total: null, used: 14, schedulable_total: 16, allocation_status: 'available', source: 'npu-smi', error: 'nvidia-smi: exit=126 Permission denied' });
+ assert.match(html, /8 张物理卡/);
+ assert.match(html, /16 个设备/);
+ assert.match(html, /14 \/ 16/);
+ assert.ok(!html.includes('14 / 8'));
+ assert.match(html, /nvidia-smi/);
+});
+
+test('worker displays models, physical cards and allocated / allocatable devices', () => {
  assert.equal(typeof window.renderWorkerAccelerators, 'function');
- const html = window.renderWorkerAccelerators({ status: 'available', devices: [{ model: 'Ascend 910B4', count: 8 }], total: 8, used: 3, allocation_status: 'available' });
+ const html = window.renderWorkerAccelerators({ status: 'available', devices: [{ model: 'Ascend 910B4', count: 8 }], total: 8, schedulable_total: 8, used: 3, allocation_status: 'available' });
  assert.match(html, /Ascend 910B4/);
  assert.match(html, /8 张/);
  assert.match(html, /3 \/ 8/);
  assert.match(html, /已使用/);
 });
 test('worker displays a successful zero-card probe distinctly from unknown hardware', () => {
- const html = window.renderWorkerAccelerators({ status: 'available', devices: [], total: 0, used: 0, allocation_status: 'available' });
+ const html = window.renderWorkerAccelerators({ status: 'available', devices: [], total: 0, schedulable_total: 0, used: 0, allocation_status: 'available' });
  assert.match(html, /未检测到 GPU \/ NPU 卡/);
  assert.match(html, /0 \/ 0/);
  assert.ok(!html.includes('卡型号未知'));
@@ -34,7 +43,8 @@ test('unknown hardware and allocations are never displayed as zero', () => {
  assert.match(html, /未知/);
  assert.ok(!html.includes('0 / 0'));
  const partial = window.renderWorkerAccelerators({ status: 'available', devices: [{ model: 'NVIDIA A100', count: 4 }], total: 4, used: null, allocation_status: 'unknown' });
- assert.match(partial, /未知 \/ 4/);
+ assert.match(partial, /未知 \/ 未知/);
+ assert.match(partial, /4 张物理卡/);
 });
 test('worker safely escapes model names and reports unavailable allocation', () => {
  assert.equal(typeof window.renderWorkerAccelerators, 'function');
@@ -46,16 +56,16 @@ test('worker safely escapes model names and reports unavailable allocation', () 
 test('notebook displays accelerator count and resource details', () => {
  assert.equal(typeof window.renderPodAccelerators, 'function');
  const html = window.renderPodAccelerators({ accelerator_count: 2, accelerator_resources: { 'huawei.com/Ascend910': 2 }, node: 'worker-1', status: 'Running' });
- assert.match(html, /2 张/);
+ assert.match(html, /2 个设备/);
  assert.match(html, /huawei.com\/Ascend910/);
- assert.match(window.renderPodAccelerators({ accelerator_count: 0, accelerator_resources: {} }), /0 张/);
+ assert.match(window.renderPodAccelerators({ accelerator_count: 0, accelerator_resources: {} }), /0 个设备/);
  assert.match(window.renderPodAccelerators({}), /未知/);
 });
 test('unbound and terminal notebooks label configured cards without claiming allocation', () => {
  assert.equal(typeof window.renderPodAccelerators, 'function');
  for (const pod of [{ node: '', status: 'Pending' }, { node: 'w', status: 'Succeeded' }, { node: 'w', status: 'Failed' }]) {
   const html = window.renderPodAccelerators({ ...pod, accelerator_count: 2, accelerator_resources: {} });
-  assert.match(html, /2 张/);
+  assert.match(html, /2 个设备/);
   assert.match(html, /未分配|已释放/);
  }
 });
@@ -65,7 +75,7 @@ test('worker loader joins by worker id even when the response order changes', as
  sandbox.fetch = async url => {
   assert.equal(url, '/api/v1/workers/accelerators');
   return { ok: true, status: 200, json: async () => [
-   { worker_id: 1, status: 'available', total: 8, used: 3, allocation_status: 'available', devices: [{ model: 'Ascend 910B4', count: 8 }] },
+   { worker_id: 1, status: 'available', total: 8, schedulable_total: 8, used: 3, allocation_status: 'available', devices: [{ model: 'Ascend 910B4', count: 8 }] },
    { worker_id: 2, status: 'unknown', total: null, used: null, allocation_status: 'unknown', error: '采集失败' },
   ] };
  };

@@ -174,7 +174,7 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 }
 
 func (m *Manager) TestConnection(ctx context.Context, w db.WorkerNode) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	_, stderr, code, err := m.Run(ctx, w, "true")
 	if err != nil {

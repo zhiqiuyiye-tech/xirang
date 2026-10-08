@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -40,14 +41,28 @@ type workerSSH interface {
 }
 
 type Service struct {
-	store *db.Store
-	c     *crypto.Cipher
-	sshm  workerSSH
-	eng   *tasks.Engine
+	store              *db.Store
+	c                  *crypto.Cipher
+	sshm               workerSSH
+	eng                *tasks.Engine
+	acceleratorTimeout time.Duration
 }
 
-func NewService(store *db.Store, c *crypto.Cipher, sshm workerSSH, eng *tasks.Engine) *Service {
-	s := &Service{store: store, c: c, sshm: sshm, eng: eng}
+type ServiceOption func(*Service)
+
+func WithAcceleratorTimeout(timeout time.Duration) ServiceOption {
+	return func(s *Service) {
+		if timeout > 0 {
+			s.acceleratorTimeout = timeout
+		}
+	}
+}
+
+func NewService(store *db.Store, c *crypto.Cipher, sshm workerSSH, eng *tasks.Engine, opts ...ServiceOption) *Service {
+	s := &Service{store: store, c: c, sshm: sshm, eng: eng, acceleratorTimeout: 45 * time.Second}
+	for _, opt := range opts {
+		opt(s)
+	}
 	eng.Register("set_root_password", &rootPasswordHandler{service: s})
 	return s
 }

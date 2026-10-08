@@ -58,7 +58,7 @@ func New(store *db.Store, runner ssh.Runner, config Config) *Collector {
 	if config.HeartbeatTimeout <= 0 {
 		// Include pool probing, authentication and remote session setup, using
 		// the same default budget as the manual SSH connection test.
-		config.HeartbeatTimeout = 15 * time.Second
+		config.HeartbeatTimeout = 30 * time.Second
 	}
 	if config.InventoryTimeout <= 0 {
 		config.InventoryTimeout = 45 * time.Second

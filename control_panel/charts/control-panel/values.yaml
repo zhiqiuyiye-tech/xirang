@@ -62,7 +62,9 @@ config:
   cookieSameSite: "Strict"
   jwtTTL: "30m"
   # Total SSH heartbeat budget, including pool validation and remote true.
-  workerHeartbeatTimeout: "15s"
+  workerHeartbeatTimeout: "30s"
+  # Total SSH + device-tool query budget, including slow session startup.
+  workerAcceleratorTimeout: "45s"
   trustedProxies: []
   rateLimitMaxFailures: 5
   rateLimitLockoutDuration: "15m"

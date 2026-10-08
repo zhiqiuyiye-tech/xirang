@@ -55,10 +55,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.9.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.10.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.9`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.10`.
 
 ## Install
 
@@ -225,14 +225,15 @@ not expect the old password-login binary to operate on a `KEY_ACTIVE` database.
 
 Worker status is based on an authenticated SSH session executing `true`, not
 Kubernetes Node Ready or simply opening a TCP port. The default total heartbeat
-budget is 15 seconds, matching the manual connection test. Earlier versions used
-5 seconds for background checks, which could mark a reachable but slow worker
-offline while the manual test succeeded.
+budget is 30 seconds, matching the manual connection test. Versions that used
+5 or 15 seconds can mark a reachable worker offline when its authenticated
+non-interactive session takes longer than that budget (a successful 16.6-second
+session has been observed).
 
 For an existing installation, the environment variable is already supported:
 
 ```bash
-kubectl -n control-panel set env deployment/control-panel WORKER_HEARTBEAT_TIMEOUT=15s
+kubectl -n control-panel set env deployment/control-panel WORKER_HEARTBEAT_TIMEOUT=30s
 kubectl -n control-panel rollout status deployment/control-panel
 ```
 
@@ -240,7 +241,7 @@ This restarts the panel Pod. Check the worker again after the next heartbeat
 (default interval: one minute), or use the panel's connection-test button. To
 persist a larger total budget with the updated chart, set
 `config.workerHeartbeatTimeout: "30s"` in your values file. Explicit environment
-values override the application default; an existing `5s` override must be
+values override the application default; existing `5s` or `15s` overrides must be
 changed separately.
 
 New timeout diagnostics name the SSH stage: `tcp connect`,
@@ -252,6 +253,25 @@ from the panel Pod, rather than only increasing the heartbeat budget. For
 session/exec/wait timeouts, inspect node load and non-interactive shell startup.
 Repeated failed checks still use the offline threshold; timeouts are never
 converted into successful checks.
+
+## Worker GPU / NPU collection
+
+Device collection has a separate total SSH and tool-query budget of 45 seconds:
+`config.workerAcceleratorTimeout` / `WORKER_ACCELERATOR_TIMEOUT`. This includes
+connection acquisition and non-interactive shell startup. The environment option
+requires version 1.0.10 or later; setting it on the original 1.0.9 binary
+will not change that binary's hard-coded eight-second budget.
+
+Each installed vendor tool has its own result and exit status. A failed
+`nvidia-smi` (for example, exit 126 / Permission denied on an Ascend node) no
+longer discards successful `npu-smi` model information. Failed vendors remain
+visible as warnings, and the complete physical-card total stays unknown when
+collection is partial. Driver permissions are never changed by the panel.
+
+Physical cards and allocatable devices are separate units. An Ascend910 system
+with NPU IDs 0–7 and Phy-IDs 0–15 has eight physical cards and sixteen devices.
+The worker's used / total ratio now compares Kubernetes allocated devices with
+Kubernetes allocatable devices. Notebook counts use the same device unit.
 
 ## Configuration Reference
 
@@ -269,7 +289,8 @@ converted into successful checks.
 | `config.cookieSecure` | `false` | Session cookies cannot use `Secure` in the required HTTP deployment |
 | `config.cookieSameSite` | `Strict` | Required SameSite policy for the shared admin session |
 | `config.jwtTTL` | `30m` | Session lifetime; values over 30 minutes fail startup |
-| `config.workerHeartbeatTimeout` | `15s` | Total SSH heartbeat budget (`WORKER_HEARTBEAT_TIMEOUT`); increase for slow worker authentication/session startup |
+| `config.workerHeartbeatTimeout` | `30s` | Total SSH heartbeat budget (`WORKER_HEARTBEAT_TIMEOUT`); increase for slow worker authentication/session startup |
+| `config.workerAcceleratorTimeout` | `45s` | Total SSH and device-tool collection budget (`WORKER_ACCELERATOR_TIMEOUT`) |
 | `config.trustedProxies` | `[]` | CIDRs allowed to supply forwarded client IP headers; empty means use `RemoteAddr` |
 | `config.rateLimitMaxFailures` | `5` | Failed proofs per resolved source before temporary source-only backoff |
 | `config.rateLimitLockoutDuration` | `15m` | Maximum source-only in-memory backoff; no account-wide persistent lock |

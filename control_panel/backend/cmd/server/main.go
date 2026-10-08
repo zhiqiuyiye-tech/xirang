@@ -61,7 +61,7 @@ func main() {
 	eng.SetTaskTimeout(cfg.TaskTimeout)
 	sshm := ssh.NewManager(cipher, cfg.SSHPoolSize, cfg.SSHIdleTimeout)
 	defer sshm.Close() // stop idle-eviction goroutine + close pooled conns on exit
-	ws := workers.NewService(store, cipher, sshm, eng)
+	ws := workers.NewService(store, cipher, sshm, eng, workers.WithAcceleratorTimeout(cfg.WorkerAcceleratorTimeout))
 
 	// K8s client: in-cluster only. Failure is fatal if REQUIRE_K8S is true.
 	// Otherwise it is non-fatal for local development with k8s endpoints returning 503.
@@ -89,7 +89,6 @@ func main() {
 		storage.WithReservedMounts(cfg.ReservedMountPoints...),
 		storage.WithPodGuardChecker(podChecker),
 	)
-
 
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()

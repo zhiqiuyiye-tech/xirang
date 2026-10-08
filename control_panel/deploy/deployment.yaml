@@ -61,6 +61,10 @@ spec:
               value: /data/control_panel.db
             - name: LISTEN_ADDR
               value: ":8080"
+            - name: WORKER_HEARTBEAT_TIMEOUT
+              value: "30s"
+            - name: WORKER_ACCELERATOR_TIMEOUT
+              value: "45s"
             - name: JWT_TTL
               value: "30m"
             - name: COOKIE_SECURE

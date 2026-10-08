@@ -23,8 +23,8 @@ type workerAcceleratorInfo struct {
 }
 
 // accelerators is separate from the worker list: slow or unavailable SSH probes
-// cannot block ordinary node configuration. Each probe has an eight-second
-// timeout, and at most four nodes are probed concurrently per request.
+// cannot block ordinary node configuration. Each probe uses the configurable
+// Worker SSH/device timeout, with at most four nodes probed concurrently per request.
 func (h *workerHandlers) accelerators(c *gin.Context) {
 	nodes, err := h.ws.List(c.Request.Context())
 	if err != nil {

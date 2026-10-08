@@ -29,6 +29,13 @@ func (r *slowHeartbeatRunner) Run(ctx context.Context, _ db.WorkerNode, _ string
 	}
 }
 
+func TestHeartbeatDefaultFitsObservedSessionLatency(t *testing.T) {
+	c := New(nil, nil, Config{})
+	if c.config.HeartbeatTimeout != 30*time.Second {
+		t.Fatalf("budget %s does not cover successful 16.6s sessions", c.config.HeartbeatTimeout)
+	}
+}
+
 func TestDefaultHeartbeatAllowsReachableSlowSSH(t *testing.T) {
 	store, id := newTestStore(t)
 	c := New(store, &slowHeartbeatRunner{delay: 6 * time.Second}, Config{})
