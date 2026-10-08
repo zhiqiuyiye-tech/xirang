@@ -31,7 +31,9 @@ type AcceleratorInfo struct {
 }
 
 // These read-only commands are fixed strings; no user input enters the shell.
-// Include the usual driver locations for non-interactive SSH sessions.
+// Nodes normally have one accelerator vendor. Stop after a successful query;
+// only fall back to NVIDIA when Ascend is absent or failed. Include the usual
+// driver locations for non-interactive SSH sessions.
 const acceleratorProbeCommand = `export LC_ALL=C
 PATH="$PATH:/usr/local/sbin:/usr/sbin:/usr/local/Ascend/driver/tools:/usr/local/Ascend/driver/bin"
 export PATH
@@ -43,6 +45,7 @@ if command -v npu-smi >/dev/null 2>&1; then
  npu-smi info 2>&1
  code=$?
  printf '\n__NPU_EXIT__=%s\n' "$code"
+ if [ "$code" = 0 ]; then printf '__SELECTED__=npu-smi\n'; exit 0; fi
  if [ "$code" != 0 ]; then printf 'npu-smi info failed (exit=%s)\n' "$code" >&2; failed=1; fi
 fi
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -51,6 +54,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
  nvidia-smi --query-gpu=uuid,name --format=csv,noheader,nounits 2>&1
  code=$?
  printf '\n__NVIDIA_EXIT__=%s\n' "$code"
+ if [ "$code" = 0 ]; then printf '__SELECTED__=nvidia-smi\n'; exit 0; fi
  if [ "$code" != 0 ]; then printf 'nvidia-smi query failed (exit=%s)\n' "$code" >&2; failed=1; fi
 fi
 if [ "$found" = 0 ]; then printf '__UNSUPPORTED__\n'; fi
@@ -81,7 +85,7 @@ func (s *Service) DiscoverAccelerators(parent context.Context, w db.WorkerNode) 
 		}
 		return info
 	}
-	var source string
+	var source, selectedSource string
 	var section strings.Builder
 	var sources, warnings []string
 	sectionExit := 0
@@ -119,6 +123,8 @@ func (s *Service) DiscoverAccelerators(parent context.Context, w db.WorkerNode) 
 			} else {
 				source = "nvidia-smi"
 			}
+		} else if strings.HasPrefix(line, "__SELECTED__=") {
+			selectedSource = strings.TrimPrefix(line, "__SELECTED__=")
 		} else if (source == "npu-smi" && strings.HasPrefix(line, "__NPU_EXIT__=")) || (source == "nvidia-smi" && strings.HasPrefix(line, "__NVIDIA_EXIT__=")) {
 			value := strings.SplitN(line, "=", 2)[1]
 			parsed, parseErr := strconv.Atoi(value)
@@ -132,6 +138,12 @@ func (s *Service) DiscoverAccelerators(parent context.Context, w db.WorkerNode) 
 		}
 	}
 	flush()
+	// Under the single-vendor policy, confirmed cards from the selected tool
+	// make failures of the other vendor irrelevant. An empty or unrecognized
+	// fallback must still retain the original failure rather than claiming zero.
+	if len(sources) == 1 && sources[0] == selectedSource && len(info.Devices) > 0 {
+		warnings = nil
+	}
 	info.Error = strings.Join(warnings, "；")
 	info.Source = strings.Join(sources, ", ")
 	if len(sources) == 0 {

@@ -113,7 +113,8 @@ func TestAcceleratorFailureDiagnosticIsBounded(t *testing.T) {
 	}
 }
 
-func TestProbeScriptPreservesNPUOnNVIDIAPermissionDenied(t *testing.T) {
+func acceleratorTestBash(t *testing.T) string {
+	t.Helper()
 	bash, err := exec.LookPath("bash")
 	if err != nil && runtime.GOOS == "windows" {
 		if git, gitErr := exec.LookPath("git"); gitErr == nil {
@@ -124,18 +125,75 @@ func TestProbeScriptPreservesNPUOnNVIDIAPermissionDenied(t *testing.T) {
 	if err != nil {
 		t.Skip("bash is not installed")
 	}
+	return bash
+}
+
+func TestProbeScriptSkipsNVIDIAAfterNPUSuccess(t *testing.T) {
+	bash := acceleratorTestBash(t)
 	script := "npu-smi() { printf '%s\\n' '" + npuSample + "'; }\n" +
 		"nvidia-smi() { printf '/usr/bin/nvidia-smi: Permission denied\\n' >&2; return 126; }\n" + acceleratorProbeCommand
 	output, runErr := exec.Command(bash, "-c", script).Output()
-	var exitErr *exec.ExitError
-	if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 1 {
-		t.Fatalf("script did not report failed vendor: err=%v output=%s", runErr, output)
+	if runErr != nil {
+		t.Fatalf("irrelevant NVIDIA probe caused failure: err=%v output=%s", runErr, output)
+	}
+	if strings.Contains(string(output), "__NVIDIA__") || strings.Contains(string(output), "Permission denied") {
+		t.Fatalf("NVIDIA was queried on an Ascend node: %s", output)
 	}
 	svc := setup(t)
-	svc.sshm = &acceleratorSSHStub{output: string(output), stderr: string(exitErr.Stderr), code: exitErr.ExitCode()}
+	svc.sshm = &acceleratorSSHStub{output: string(output)}
 	info := svc.DiscoverAccelerators(context.Background(), db.WorkerNode{ID: 1})
-	if info.Status != "partial" || len(info.Devices) != 1 || info.Devices[0].Count != 2 || !strings.Contains(info.Error, "exit=126") || !strings.Contains(info.Error, "Permission denied") {
-		t.Fatalf("lost valid NPU results or vendor diagnostic: %+v", info)
+	if info.Status != "available" || info.Total == nil || *info.Total != 2 || len(info.Devices) != 1 || info.Devices[0].Count != 2 || info.Error != "" || info.Source != "npu-smi" {
+		t.Fatalf("unexpected single-vendor result: %+v", info)
+	}
+}
+
+func TestProbeScriptUsesSingleVendorFallback(t *testing.T) {
+	bash := acceleratorTestBash(t)
+	for _, tc := range []struct {
+		name, setup            string
+		wantStatus, wantSource string
+		wantTotal              int64
+	}{
+		{name: "NVIDIA only", setup: "command() { if [ \"$2\" = npu-smi ]; then return 1; fi; builtin command \"$@\"; }\n", wantStatus: "available", wantSource: "nvidia-smi", wantTotal: 1},
+		{name: "failed Ascend tool on NVIDIA node", setup: "npu-smi() { printf 'Ascend driver unavailable\\n'; return 3; }\n", wantStatus: "available", wantSource: "nvidia-smi", wantTotal: 1},
+		{name: "both tools fail", setup: "npu-smi() { printf 'Ascend driver unavailable\\n'; return 3; }\nnvidia-smi() { printf 'NVIDIA driver unavailable\\n'; return 126; }\n", wantStatus: "unknown"},
+		{name: "neither tool available", setup: "command() { return 1; }\n", wantStatus: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "nvidia-smi() { printf 'GPU-a, NVIDIA A100\\n'; }\n" + tc.setup + acceleratorProbeCommand
+			output, err := exec.Command(bash, "-c", script).Output()
+			code := 0
+			stderr := ""
+			if err != nil {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					t.Fatal(err)
+				}
+				code, stderr = exitErr.ExitCode(), string(exitErr.Stderr)
+			}
+			svc := setup(t)
+			svc.sshm = &acceleratorSSHStub{output: string(output), stderr: stderr, code: code}
+			info := svc.DiscoverAccelerators(context.Background(), db.WorkerNode{ID: 1})
+			if info.Status != tc.wantStatus || info.Source != tc.wantSource {
+				t.Fatalf("got %+v", info)
+			}
+			if tc.wantStatus == "available" {
+				if code != 0 || info.Total == nil || *info.Total != tc.wantTotal || info.Error != "" {
+					t.Fatalf("fallback contains irrelevant failure: code=%d info=%+v", code, info)
+				}
+			} else if info.Total != nil || info.Error == "" {
+				t.Fatalf("failed detection should preserve diagnostics: %+v", info)
+			}
+		})
+	}
+}
+
+func TestEmptyFallbackDoesNotHidePrimaryDriverFailure(t *testing.T) {
+	svc := setup(t)
+	svc.sshm = &acceleratorSSHStub{output: "__NPU__\nAscend driver unavailable\n__NPU_EXIT__=3\n__NVIDIA__\n__NVIDIA_EXIT__=0\n__SELECTED__=nvidia-smi\n"}
+	info := svc.DiscoverAccelerators(context.Background(), db.WorkerNode{ID: 1})
+	if info.Total != nil || info.Error == "" || !strings.Contains(info.Error, "npu-smi") {
+		t.Fatalf("empty fallback hid the real driver failure: %+v", info)
 	}
 }
 

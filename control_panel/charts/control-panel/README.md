@@ -55,10 +55,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.10.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.11.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.10`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.11`.
 
 ## Install
 
@@ -262,11 +262,13 @@ connection acquisition and non-interactive shell startup. The environment option
 requires version 1.0.10 or later; setting it on the original 1.0.9 binary
 will not change that binary's hard-coded eight-second budget.
 
-Each installed vendor tool has its own result and exit status. A failed
-`nvidia-smi` (for example, exit 126 / Permission denied on an Ascend node) no
-longer discards successful `npu-smi` model information. Failed vendors remain
-visible as warnings, and the complete physical-card total stays unknown when
-collection is partial. Driver permissions are never changed by the panel.
+Starting with version 1.0.11, nodes are probed as single-vendor systems. The panel tries `npu-smi` first
+and stops after a successful query, so an Ascend node is not affected by an
+unrelated, non-executable `nvidia-smi`. NVIDIA is tried only when the Ascend tool
+is absent or fails. When the fallback confirms NVIDIA cards, errors from the
+irrelevant Ascend tool are not displayed. Both-tool failures and empty or
+unrecognized fallback results still retain diagnostics; driver permissions are
+never changed by the panel. This default does not aggregate mixed-vendor nodes.
 
 Physical cards and allocatable devices are separate units. An Ascend910 system
 with NPU IDs 0–7 and Phy-IDs 0–15 has eight physical cards and sixteen devices.
