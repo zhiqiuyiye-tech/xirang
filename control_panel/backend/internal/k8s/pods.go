@@ -15,21 +15,23 @@ import (
 // UI to drive port-mapping (SVC) creation: selecting a pod auto-fills its
 // namespace/name/uid/selector so the admin only enters ports.
 type PodInfo struct {
-	Name              string            `json:"name"`
-	Namespace         string            `json:"namespace"`
-	UID               string            `json:"uid"`
-	Node              string            `json:"node"`
-	Status            string            `json:"status"`
-	IPs               []string          `json:"ips"`
-	Labels            map[string]string `json:"labels"`
-	StableKey         string            `json:"stable_key"`
-	KeyKind           string            `json:"key_kind"`
-	WorkspaceID       string            `json:"workspace_id,omitempty"`
-	ProjectID         string            `json:"project_id,omitempty"`
-	OwnerName         string            `json:"owner_name,omitempty"`
-	Note              string            `json:"note,omitempty"`
-	UpdatedBy         string            `json:"updated_by,omitempty"`
-	MetadataUpdatedAt *time.Time        `json:"metadata_updated_at,omitempty"`
+	Name                 string            `json:"name"`
+	Namespace            string            `json:"namespace"`
+	UID                  string            `json:"uid"`
+	Node                 string            `json:"node"`
+	Status               string            `json:"status"`
+	IPs                  []string          `json:"ips"`
+	Labels               map[string]string `json:"labels"`
+	StableKey            string            `json:"stable_key"`
+	KeyKind              string            `json:"key_kind"`
+	WorkspaceID          string            `json:"workspace_id,omitempty"`
+	ProjectID            string            `json:"project_id,omitempty"`
+	OwnerName            string            `json:"owner_name,omitempty"`
+	Note                 string            `json:"note,omitempty"`
+	UpdatedBy            string            `json:"updated_by,omitempty"`
+	MetadataUpdatedAt    *time.Time        `json:"metadata_updated_at,omitempty"`
+	AcceleratorCount     int64             `json:"accelerator_count"`
+	AcceleratorResources map[string]int64  `json:"accelerator_resources"`
 }
 
 // StableKeyForPod derives the persistence key for Notebook metadata.
@@ -97,17 +99,20 @@ func NotebookPodInfo(pod corev1.Pod) PodInfo {
 		}
 	}
 	stableKey, kind, ws, proj := StableKeyForPod(pod.Namespace, string(pod.UID), pod.Labels)
+	accelerators := podAcceleratorRequests(pod)
 	return PodInfo{
-		Name:        pod.Name,
-		Namespace:   pod.Namespace,
-		UID:         string(pod.UID),
-		Node:        pod.Spec.NodeName,
-		Status:      string(pod.Status.Phase),
-		IPs:         ips,
-		Labels:      pod.Labels,
-		StableKey:   stableKey,
-		KeyKind:     kind,
-		WorkspaceID: ws,
-		ProjectID:   proj,
+		Name:                 pod.Name,
+		Namespace:            pod.Namespace,
+		UID:                  string(pod.UID),
+		Node:                 pod.Spec.NodeName,
+		Status:               string(pod.Status.Phase),
+		IPs:                  ips,
+		Labels:               pod.Labels,
+		StableKey:            stableKey,
+		KeyKind:              kind,
+		WorkspaceID:          ws,
+		ProjectID:            proj,
+		AcceleratorCount:     acceleratorResourceCount(accelerators),
+		AcceleratorResources: accelerators,
 	}
 }

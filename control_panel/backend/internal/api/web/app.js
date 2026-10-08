@@ -149,6 +149,55 @@
         return html;
     }
 
+    function renderWorkerAccelerators(info) {
+        info = info || {};
+        var total = info.status === 'available' && info.total != null ? info.total : '未知';
+        var used = info.allocation_status === 'available' && info.used != null ? info.used : '未知';
+        var models = (info.devices || []).map(function (device) {
+            return '<div><strong>' + esc(device.model) + '</strong> <span class="muted">' + esc(device.count) + ' 张</span></div>';
+        }).join('');
+        var html = models || '<div class="muted">' + (total === 0 ? '未检测到 GPU / NPU 卡' : '卡型号未知') + '</div>';
+        html += '<div title="已使用为 Kubernetes 已分配卡数；总数为设备工具采集的物理卡数">已使用 / 总共：<span class="font-mono">' + esc(used) + ' / ' + esc(total) + '</span> 张</div>';
+        if (info.error) html += '<div class="muted" style="font-size:11px;">' + esc(info.error) + '</div>';
+        if (info.allocation_status !== 'available') html += '<div class="muted" style="font-size:11px;">分配信息未知</div>';
+        if (info.source) html += '<div class="muted" style="font-size:11px;">来源：' + esc(info.source) + '</div>';
+        if (info.checked_at) html += '<div class="muted" style="font-size:11px;">采集于 ' + esc(fmtTime(info.checked_at)) + '</div>';
+        if (info.schedulable_total != null && info.total != null && info.schedulable_total !== info.total) {
+            html += '<div class="muted" style="font-size:11px;">Kubernetes 可分配：' + esc(info.schedulable_total) + ' 张（可能存在共享或虚拟化）</div>';
+        }
+        return html;
+    }
+
+    async function loadWorkerAccelerators(tbody) {
+        try {
+            var result = await apiJSON('/workers/accelerators');
+            if (!tbody.isConnected) return;
+            if (!result.resp.ok || !Array.isArray(result.data)) throw new Error('卡信息查询失败');
+            var byID = {};
+            result.data.forEach(function (info) { byID[info.worker_id] = info; });
+            tbody.querySelectorAll('[data-worker-accelerators]').forEach(function (cell) {
+                cell.innerHTML = renderWorkerAccelerators(byID[cell.getAttribute('data-worker-accelerators')]);
+            });
+        } catch (err) {
+            if (!tbody.isConnected) return;
+            tbody.querySelectorAll('[data-worker-accelerators]').forEach(function (cell) {
+                cell.innerHTML = renderWorkerAccelerators({ error: '卡信息查询失败，请刷新重试' });
+            });
+        }
+    }
+
+    function renderPodAccelerators(pod) {
+        if (pod.accelerator_count == null) return '<span class="muted">未知</span>';
+        var resources = pod.accelerator_resources || {};
+        var details = Object.keys(resources).sort().map(function (name) { return name + ': ' + resources[name] + ' 张'; }).join('；');
+        var html = '<span class="badge ' + (pod.accelerator_count > 0 ? 'badge-primary' : 'badge-muted') + '" title="' + esc(details || '未申请 GPU / NPU 卡资源') + '">' + esc(pod.accelerator_count) + ' 张</span>';
+        if (pod.accelerator_count > 0) {
+            if (pod.status === 'Succeeded' || pod.status === 'Failed') html += '<span class="muted" style="font-size:11px;"> 已释放（配置数量）</span>';
+            else if (!pod.node) html += '<span class="muted" style="font-size:11px;"> 未分配（申请数量）</span>';
+        }
+        return html;
+    }
+
     function authModeBadge(mode) {
         var cls = 'badge-key';
         var label = esc(mode);
@@ -239,18 +288,23 @@
             '<h2 class="page-title">Worker 节点管理</h2>' +
             '<p class="page-subtitle">配置与维护集群计算 Worker、SSH 连接认证、远程依赖与连通性</p>' +
             '</div>' +
+            '<div class="actions-cell">' +
+            '<button class="btn btn-outline" id="btn-refresh-workers">刷新节点与卡信息</button>' +
             '<button class="btn btn-primary" id="btn-new-worker">' +
             '<svg width="15" height="15" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 5a1 1 0 011 1v3h3a1 1 0 110 2h-3v3a1 1 0 11-2 0v-3H6a1 1 0 110-2h3V6a1 1 0 011-1z" clip-rule="evenodd"/></svg>' +
             '新建 Worker' +
-            '</button>' +
+            '</button></div>' +
             '</div>' +
             '<div id="workers-msg" class="info-msg"></div>' +
             '<div class="table-responsive mt-2">' +
             '<table class="data-table" id="workers-table"><thead><tr>' +
-            '<th>ID</th><th>节点名称</th><th>主机地址</th><th>端口</th><th>用户名</th><th>认证方式</th><th>状态</th><th>最近上报</th><th style="text-align:right;">操作</th>' +
-            '</tr></thead><tbody id="workers-tbody"><tr><td colspan="9" class="muted">正在加载节点列表...</td></tr></tbody></table>' +
+            '<th>ID</th><th>节点名称</th><th>主机地址</th><th>端口</th><th>用户名</th><th>认证方式</th><th>GPU / NPU</th><th>状态</th><th>最近上报</th><th style="text-align:right;">操作</th>' +
+            '</tr></thead><tbody id="workers-tbody"><tr><td colspan="10" class="muted">正在加载节点列表...</td></tr></tbody></table>' +
             '</div>';
 
+        document.getElementById('btn-refresh-workers').addEventListener('click', function () {
+            routes['/workers'](content);
+        });
         document.getElementById('btn-new-worker').addEventListener('click', function () {
             showWorkerForm(content, null);
         });
@@ -261,7 +315,7 @@
             var workers = r.data || [];
             var tbody = document.getElementById('workers-tbody');
             if (workers.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="muted">暂无 Worker 节点，点击右上角「新建 Worker」开始接入。</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" class="muted">暂无 Worker 节点，点击右上角「新建 Worker」开始接入。</td></tr>';
                 return;
             }
             tbody.innerHTML = workers.map(function (w) {
@@ -272,6 +326,7 @@
                     '<td><span class="font-mono">' + esc(w.port) + '</span></td>' +
                     '<td><span class="font-mono">' + esc(w.username) + '</span></td>' +
                     '<td>' + authModeBadge(w.auth_mode) + '</td>' +
+                    '<td data-worker-accelerators="' + esc(w.id) + '"><span class="muted">正在采集卡信息...</span></td>' +
                     '<td>' + renderWorkerHealth(w) + '</td>' +
                     '<td><span class="muted" style="font-size:12px;">' + esc(fmtTime(w.last_seen_at)) + '</span></td>' +
                     '<td style="text-align:right;">' +
@@ -284,6 +339,8 @@
                     '</div>' +
                     '</td></tr>';
             }).join('');
+
+            loadWorkerAccelerators(tbody);
 
             // Wire action buttons
             tbody.querySelectorAll('button[data-action]').forEach(function (btn) {
@@ -757,8 +814,8 @@
             '</div>' +
             '<div class="table-responsive">' +
             '<table class="data-table" id="pods-table"><thead><tr>' +
-            '<th>命名空间</th><th>使用人 / 备注</th><th>宿主节点</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th>NFS 挂载</th><th style="text-align:right;">操作</th>' +
-            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="8" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
+            '<th>命名空间</th><th>使用人 / 备注</th><th>宿主节点</th><th>用卡数量</th><th>Pod 状态</th><th>容器 IP</th><th>已有映射数</th><th>NFS 挂载</th><th style="text-align:right;">操作</th>' +
+            '</tr></thead><tbody id="pods-tbody"><tr><td colspan="9" class="muted">正在加载 Pod 与 Service 映射...</td></tr></tbody></table>' +
             '</div></div>';
 
         document.getElementById('btn-load-pods').addEventListener('click', function () { loadPods(content); });
@@ -799,14 +856,14 @@
     async function loadPods(content) {
         var tbody = document.getElementById('pods-tbody');
         var msgEl = document.getElementById('pods-msg');
-        tbody.innerHTML = '<tr><td colspan="8" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="muted">正在从 Kubernetes 集群同步资源...</td></tr>';
         try {
             var results = await Promise.all([apiJSON('/k8s/pods'), apiJSON('/k8s/services')]);
             var pr = results[0], sr = results[1];
             if (!pr.resp.ok) { setMsg(msgEl, '错误: ' + (pr.data && pr.data.error), 'error'); tbody.innerHTML = ''; return; }
             k8sServices = (sr.resp.ok && Array.isArray(sr.data)) ? sr.data : [];
             var pods = pr.data || [];
-            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="8" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
+            if (pods.length === 0) { tbody.innerHTML = '<tr><td colspan="9" class="muted">当前集群未检测到符合名称规则的 notebook Pod 实例。</td></tr>'; return; }
             tbody.innerHTML = pods.map(function (p) {
                 var cnt = servicesForPod(p.uid).length;
                 var ownerDisplay = p.owner_name
@@ -816,6 +873,7 @@
                     '<td>' + renderPortMappingPodIdentity(p, false) + '</td>' +
                     '<td class="pod-owner-cell">' + ownerDisplay + '</td>' +
                     '<td><span class="font-mono">' + esc(p.node) + '</span></td>' +
+                    '<td class="pod-accelerators-cell">' + renderPodAccelerators(p) + '</td>' +
                     '<td>' + statusBadge(p.status) + '</td>' +
                     '<td><span class="font-mono">' + esc((p.ips || []).join(', ')) + '</span></td>' +
                     '<td class="pod-mappings-cell">' + (cnt > 0 ? '<span class="badge badge-success">' + cnt + ' 条映射</span>' : '<span class="muted">-</span>') + '</td>' +
@@ -855,6 +913,7 @@
             '</div>' +
             '<div class="port-modal-meta-pills">' +
             '<span class="pill-item">宿主节点: <code>' + esc(pod.node || 'N/A') + '</code></span>' +
+            '<span class="pill-item">用卡数量: ' + renderPodAccelerators(pod) + '</span>' +
             '<span class="pill-item">容器 IP: <code>' + esc((pod.ips || []).join(', ') || '未分配') + '</code></span>' +
             '<span class="pill-item">' + statusBadge(pod.status) + '</span>' +
             '</div>' +

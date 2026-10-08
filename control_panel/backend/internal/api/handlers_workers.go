@@ -5,15 +5,17 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 )
 
 type workerHandlers struct {
-	ws    *workers.Service
-	store *db.Store
-	eng   *tasks.Engine
+	ws     *workers.Service
+	store  *db.Store
+	eng    *tasks.Engine
+	client kubernetes.Interface
 }
 
 func (h *workerHandlers) list(c *gin.Context) {

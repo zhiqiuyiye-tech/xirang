@@ -206,8 +206,9 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/auth/logout", authH.logout)
 		authed.POST("/auth/logout-all", authH.logoutAll)
 
-		h := &workerHandlers{ws: ws, store: store, eng: eng}
+		h := &workerHandlers{ws: ws, store: store, eng: eng, client: k8sClient}
 		authed.GET("/workers", h.list)
+		authed.GET("/workers/accelerators", h.accelerators)
 		authed.POST("/workers", h.create)
 		authed.GET("/workers/:id", h.get)
 		authed.PUT("/workers/:id", h.update)
