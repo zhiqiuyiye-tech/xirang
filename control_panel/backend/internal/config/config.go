@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -42,6 +43,9 @@ type Config struct {
 	CollectorConcurrency        int
 	StorageStaleAfter           time.Duration
 	ReservedMountPoints         []string
+	NamespaceCleanupAllowlist   []string
+	NamespaceCleanupTimeout     time.Duration
+	NamespaceUnmountTimeout     time.Duration
 }
 
 func Load() (Config, error) {
@@ -157,7 +161,57 @@ func Load() (Config, error) {
 		}
 	}
 
+	c.NamespaceCleanupAllowlist, err = cleanupAllowlist(os.Getenv("NAMESPACE_CLEANUP_ALLOWLIST"))
+	if err != nil {
+		return c, err
+	}
+	if c.NamespaceCleanupTimeout, err = positiveDurationEnv("NAMESPACE_CLEANUP_TIMEOUT", time.Minute); err != nil {
+		return c, err
+	}
+	if c.NamespaceUnmountTimeout, err = positiveDurationEnv("NAMESPACE_UNMOUNT_TIMEOUT", 10*time.Second); err != nil {
+		return c, err
+	}
+	if c.NamespaceCleanupTimeout > 5*time.Minute || c.NamespaceUnmountTimeout > 10*time.Second || c.NamespaceUnmountTimeout > c.NamespaceCleanupTimeout {
+		return c, fmt.Errorf("namespace recovery requires unmount timeout <= 10s and <= cleanup timeout <= 5m")
+	}
+
 	return c, nil
+}
+
+// cleanupAllowlist uses exact namespace/DaemonSet/container triples, never glob patterns.
+func cleanupAllowlist(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	label := regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+	var entries []string
+	seen := map[string]bool{}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		parts := strings.Split(item, "/")
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("NAMESPACE_CLEANUP_ALLOWLIST entries require namespace/daemonset/container: %q", item)
+		}
+		for i, part := range parts {
+			if i == 1 {
+				if len(part) > 253 {
+					return nil, fmt.Errorf("invalid daemonset name: %q", part)
+				}
+				for _, segment := range strings.Split(part, ".") {
+					if len(segment) > 63 || !label.MatchString(segment) {
+						return nil, fmt.Errorf("invalid daemonset name: %q", part)
+					}
+				}
+			} else if len(part) > 63 || !label.MatchString(part) {
+				return nil, fmt.Errorf("invalid namespace/container name: %q", part)
+			}
+		}
+		if !seen[item] {
+			entries = append(entries, item)
+			seen[item] = true
+		}
+	}
+	return entries, nil
 }
 
 func envOr(k, def string) string {

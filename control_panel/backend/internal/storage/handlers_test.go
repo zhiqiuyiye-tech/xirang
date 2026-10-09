@@ -61,7 +61,7 @@ func TestProvisionHandlerRejectsDuplicateLVName(t *testing.T) {
 	eng := tasks.NewEngine(store)
 	sr := newScriptRunner()
 	sr.add("lvs --noheadings -o lv_name '/dev/vg_data/lv_1'", scriptResult{stdout: " lv_1\n"})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -219,6 +219,12 @@ func (s *scriptRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (stri
 	if strings.Contains(cmd, "$(id -u)") {
 		return "root\n", "", 0, nil
 	}
+	if strings.Contains(cmd, "cp-storage-namespace-scan") {
+		return `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"holders":[]}}`, "", 0, nil
+	}
+	if strings.Contains(cmd, "cp-storage-namespace-inspect") {
+		return `{"ok":true,"result":{"uuid":"u","major_minor":"253:0"}}`, "", 0, nil
+	}
 	if strings.Contains(cmd, "cp-storage-preflight") {
 		return "SAFE\n", "", 0, nil
 	}
@@ -240,7 +246,7 @@ func TestInstallDeps_AllAlreadyInstalled(t *testing.T) {
 	sr.add("echo lvm2_ok", scriptResult{stdout: "lvm2_ok\nnfs_ok\n"})
 	sr.add("nfs.conf", scriptResult{stdout: ""})
 	sr.add("systemctl enable", scriptResult{stdout: ""})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -284,7 +290,7 @@ func TestInstallDeps_InstallSuccess(t *testing.T) {
 	sr.add("yum install", scriptResult{stdout: ""})
 	sr.add("nfs.conf", scriptResult{stdout: ""})
 	sr.add("systemctl enable", scriptResult{stdout: ""})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -306,7 +312,7 @@ func TestInstallDeps_UnsupportedDistro(t *testing.T) {
 	sr := newScriptRunner()
 	// detect_pm returns empty -> ParsePM error -> fail
 	sr.add("echo yum", scriptResult{stdout: ""})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -329,7 +335,7 @@ func TestInstallDeps_VerifyStillMissing(t *testing.T) {
 		scriptResult{stdout: ""},
 	)
 	sr.add("yum install", scriptResult{stdout: ""})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -352,7 +358,7 @@ func TestCreateVGHandler_CreatesOneVGPerDisk(t *testing.T) {
 	// vgs <name> -> absent for both disks (neither VG exists yet).
 	sr.add("vgs vg_data_sdb", scriptResult{stdout: "absent"})
 	sr.add("vgs vg_data_sdc", scriptResult{stdout: "absent"})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -388,7 +394,7 @@ func TestCreateVGHandler_StopsWhenPreflightRejectsReservedDisk(t *testing.T) {
 	eng := tasks.NewEngine(store)
 	sr := newScriptRunner()
 	sr.add("cp-storage-preflight", scriptResult{stderr: "device belongs to reserved mount /data01", exitCode: 1})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -417,7 +423,7 @@ func TestCreateVGHandler_SkipsExistingVG(t *testing.T) {
 	// If preflight runs for the already-initialized sdb, it must reject the active VG.
 	sr.add("device='/dev/sdb'", scriptResult{stderr: "device belongs to active volume group: vg_data_sdb", exitCode: 1})
 	sr.add("vgs vg_data_sdc", scriptResult{stdout: "absent"})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -458,7 +464,7 @@ func TestCreateVGHandler_RejectsVGNameCollisionOnDifferentPV(t *testing.T) {
 	sr := newScriptRunner()
 	sr.add("vgs vg_data_sdb", scriptResult{stdout: "exists"})
 	sr.add("pvs --noheadings -o vg_name '/dev/sdb'", scriptResult{stdout: "vg_other\n"})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -491,7 +497,7 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
 		scriptResult{stdout: "/data02/share\n/data02/share/sub\n"},
 		scriptResult{stdout: ""})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -528,7 +534,7 @@ func TestDeleteLVHandlerDoesNotRemoveStillMountedLV(t *testing.T) {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
 		scriptResult{stdout: "/data02/share\n"},
 		scriptResult{stderr: "logical volume is still mounted at: /data02/share", exitCode: 1})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -564,7 +570,7 @@ func TestDeleteLVHandlerExplainsInUseLVAfterUnmount(t *testing.T) {
 	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{
 		stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5,
 	})
-	RegisterStorageHandlers(eng, sr, store)
+	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -622,42 +628,26 @@ func TestDeleteLVHandler_BlockedByActivePod(t *testing.T) {
 }
 
 func TestDeleteLVHandler_CleansNamespaceMountsAndRetriesLvremove(t *testing.T) {
-	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
-	defer store.Close()
-	eng := tasks.NewEngine(store)
-	sr := newScriptRunner()
-	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
-		scriptResult{stdout: "/data02/share\n"},
-		scriptResult{stdout: ""})
-	// First lvremove fails with in use
-	sr.add("lvremove -f /dev/vg_data/lv_1",
-		scriptResult{stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5},
-		scriptResult{stdout: "Logical volume \"lv_1\" successfully removed\n", exitCode: 0})
-	sr.add("cp-storage-cleanup-ns-mounts", scriptResult{
-		stdout: "Unmounting /data02/share inside namespace of PID 591550\n", exitCode: 0,
-	})
-
-	RegisterStorageHandlers(eng, sr, store)
-	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
-		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
-	})
-	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
-		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
-	})
+	sr := recoveryScriptRunner(t)
+	store, id := submitRecoveryDelete(t, sr, WithNamespaceCleanup(allowTestHolders, time.Minute, time.Second))
+	waitFor(t, store, id, "succeeded", 2*time.Second)
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-cleanup"] != 1 || sr.counts["cp-storage-namespace-verify"] != 1 {
+		t.Fatalf("unexpected recovery attempts: %v", sr.counts)
+	}
+	steps, err := store.ListSteps(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, store, id, "succeeded", 2*time.Second)
-
-	// Verify CleanupNamespaceMountsCmd was invoked
-	foundCleanup := false
-	for _, call := range sr.calls {
-		if strings.Contains(call, "cp-storage-cleanup-ns-mounts") {
-			foundCleanup = true
-			break
+	var firstFailed, retrySucceeded bool
+	for _, step := range steps {
+		if step.Name == "lvremove" && step.Status == "failed" {
+			firstFailed = true
+		}
+		if step.Name == "lvremove_retry" && step.Status == "succeeded" {
+			retrySucceeded = true
 		}
 	}
-	if !foundCleanup {
-		t.Fatalf("expected cleanup-ns-mounts command to be called: %v", sr.calls)
+	if !firstFailed || !retrySucceeded {
+		t.Fatalf("original failure or successful retry lost: %+v", steps)
 	}
 }

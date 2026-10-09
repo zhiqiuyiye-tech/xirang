@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/ssh"
@@ -19,9 +20,14 @@ type PodGuardChecker func(ctx context.Context, workerHost, exportPath string) (i
 // StorageOption configures optional dependencies for storage handlers.
 type StorageOption func(*storageConfig)
 
+type NamespaceCleanupAuthorizer func(ctx context.Context, workerHost, exportPath string, holders []NamespaceHolder) error
+
 type storageConfig struct {
-	reservedMounts  []string
-	podGuardChecker PodGuardChecker
+	reservedMounts    []string
+	podGuardChecker   PodGuardChecker
+	cleanupAuthorizer NamespaceCleanupAuthorizer
+	cleanupTimeout    time.Duration
+	unmountTimeout    time.Duration
 }
 
 // WithReservedMounts configures custom protected mount points.
@@ -38,13 +44,30 @@ func WithPodGuardChecker(checker PodGuardChecker) StorageOption {
 	}
 }
 
+// WithNamespaceCleanup enables only an explicitly authorized recovery path.
+// A nil authorizer leaves namespace cleanup disabled, irrespective of tools.
+func WithNamespaceCleanup(authorizer NamespaceCleanupAuthorizer, budget, unmountTimeout time.Duration) StorageOption {
+	return func(c *storageConfig) {
+		c.cleanupAuthorizer = authorizer
+		if budget > 0 {
+			c.cleanupTimeout = budget
+		}
+		if unmountTimeout > 0 {
+			c.unmountTimeout = unmountTimeout
+		}
+	}
+}
+
 // RegisterStorageHandlers registers the storage task handlers on the engine:
 // storage_provision_nfs / storage_reclaim_nfs (LVM+NFS lifecycle), install_deps
 // (lvm2/nfs-utils), storage_create_vg (auto-pool unused disks), storage_resize_lv
 // (lvextend/lvreduce), and storage_delete_lv (generalized LV teardown).
 func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Store, opts ...any) {
+	runner = &guardedStorageRunner{Runner: runner}
 	cfg := storageConfig{
 		reservedMounts: []string{"/data01"},
+		cleanupTimeout: time.Minute,
+		unmountTimeout: 10 * time.Second,
 	}
 	for _, opt := range opts {
 		switch o := opt.(type) {
@@ -54,17 +77,18 @@ func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Sto
 			o(&cfg)
 		}
 	}
+	deletion := &deleteLVHandler{
+		runner: runner, store: store, reservedMounts: cfg.reservedMounts,
+		podGuardChecker: cfg.podGuardChecker, cleanupAuthorizer: cfg.cleanupAuthorizer,
+		cleanupTimeout: cfg.cleanupTimeout,
+		recovery:       NewNamespaceRecovery(runner, cfg.reservedMounts, cfg.unmountTimeout),
+	}
 	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
-	eng.Register("storage_reclaim_nfs", &reclaimHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
+	eng.Register("storage_reclaim_nfs", &reclaimHandler{store: store, reservedMounts: cfg.reservedMounts, delete: deletion})
 	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
 	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
 	eng.Register("storage_resize_lv", &resizeLVHandler{runner: runner, store: store})
-	eng.Register("storage_delete_lv", &deleteLVHandler{
-		runner:          runner,
-		store:           store,
-		reservedMounts:  cfg.reservedMounts,
-		podGuardChecker: cfg.podGuardChecker,
-	})
+	eng.Register("storage_delete_lv", deletion)
 }
 
 // --- provisionHandler ---
@@ -182,9 +206,9 @@ func (h *provisionHandler) rollback(ctx context.Context, w db.WorkerNode, r *tas
 // --- reclaimHandler ---
 
 type reclaimHandler struct {
-	runner         ssh.Runner
 	store          *db.Store
 	reservedMounts []string
+	delete         *deleteLVHandler
 }
 
 func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -208,6 +232,11 @@ func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Report
 			r.Fail(fmt.Sprintf("load provision task %d: %v", p.TaskID, err))
 			return err
 		}
+		if prov.Type != "storage_provision_nfs" || prov.Status != "succeeded" {
+			err := fmt.Errorf("task_id must refer to a succeeded storage_provision_nfs task")
+			r.Fail(err.Error())
+			return err
+		}
 		var pp struct {
 			WorkerID   int64  `json:"worker_id"`
 			VGName     string `json:"vg_name"`
@@ -226,31 +255,21 @@ func (h *reclaimHandler) Run(ctx context.Context, task *db.Task, r *tasks.Report
 			return err
 		}
 	}
-	if err := ValidateMountPoint(p.MountPoint, h.reservedMounts); err != nil {
-		r.Fail(fmt.Sprintf("invalid mount_point: %v", err))
-		return err
-	}
-	w, err := h.store.GetWorker(ctx, p.WorkerID)
-	if err != nil {
-		r.Fail(err.Error())
-		return err
-	}
-	for _, st := range ReclaimSteps(ReclaimReq{p.VGName, p.LVName, p.MountPoint}) {
-		sh, err := r.Step(st.Name)
-		if err != nil {
-			r.Fail(fmt.Sprintf("create step: %v", err))
+	if p.MountPoint != "" {
+		if err := ValidateMountPoint(p.MountPoint, h.reservedMounts); err != nil {
+			r.Fail(fmt.Sprintf("invalid mount_point: %v", err))
 			return err
 		}
-		out, stderr, code, err := h.runner.Run(ctx, *w, st.Cmd)
-		if err != nil || code != 0 {
-			sh.Done("failed", out, stderr, fmt.Sprintf("code=%d", code))
-			r.Fail(fmt.Sprintf("reclaim failed at %s: %s", st.Name, stderr))
-			return fmt.Errorf("reclaim failed at %s", st.Name)
-		}
-		sh.Done("succeeded", out, stderr, "")
 	}
-	r.Succeed()
-	return nil
+	// Both deletion entry points use the same live-device checks and recovery.
+	// Historical provisioning parameters are not proof of a current mount.
+	params, err := json.Marshal(map[string]any{"worker_id": p.WorkerID, "vg_name": p.VGName, "lv_name": p.LVName})
+	if err != nil {
+		return err
+	}
+	delegated := *task
+	delegated.ParamsJSON = string(params)
+	return h.delete.Run(ctx, &delegated, r)
 }
 
 // --- installDepsHandler ---
@@ -614,10 +633,13 @@ func parseMountTargets(output string) []string {
 // mount point via findmnt so it can clean /etc/exports, umount, and clean
 // /etc/fstab before lvremove. Works for LVs created outside the control panel.
 type deleteLVHandler struct {
-	runner          ssh.Runner
-	store           *db.Store
-	reservedMounts  []string
-	podGuardChecker PodGuardChecker
+	runner            ssh.Runner
+	store             *db.Store
+	reservedMounts    []string
+	podGuardChecker   PodGuardChecker
+	cleanupAuthorizer NamespaceCleanupAuthorizer
+	cleanupTimeout    time.Duration
+	recovery          *NamespaceRecovery
 }
 
 func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -631,10 +653,20 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return err
 	}
 	for _, f := range []string{p.VGName, p.LVName} {
-		if err := ValidateName(f); err != nil {
+		if err := ValidateLVComponent(f); err != nil {
 			r.Fail(fmt.Sprintf("invalid param: %v", err))
 			return err
 		}
+	}
+	if p.WorkerID <= 0 || task.TargetID != p.WorkerID || (task.TargetKind != "storage" && task.TargetKind != "worker") {
+		err := fmt.Errorf("worker_id does not match the serialized task target")
+		r.Fail(err.Error())
+		return err
+	}
+	if h.podGuardChecker == nil {
+		err := fmt.Errorf("Kubernetes pod usage checker is unavailable; retaining logical volume")
+		r.Fail(err.Error())
+		return err
 	}
 	w, err := h.store.GetWorker(ctx, p.WorkerID)
 	if err != nil {
@@ -651,11 +683,12 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	out, stderr, _, runErr := h.runner.Run(ctx, *w, fmt.Sprintf("findmnt -rn -o TARGET --source %s 2>/dev/null", lvDev))
-	if runErr != nil {
-		st.Done("failed", out, stderr, fmt.Sprintf("findmnt failed: %v", runErr))
-		r.Fail(fmt.Sprintf("could not detect LV mountpoints: %v", runErr))
-		return runErr
+	out, stderr, status, runErr := h.runner.Run(ctx, *w, fmt.Sprintf("findmnt -rn -o TARGET --source %s 2>/dev/null", lvDev))
+	if runErr != nil || (status != 0 && status != 1) {
+		err := fmt.Errorf("could not detect LV mountpoints (findmnt status=%d): %v %s", status, runErr, stderr)
+		st.Done("failed", out, stderr, err.Error())
+		r.Fail(err.Error())
+		return err
 	}
 	mountPoints := parseMountTargets(out)
 	if len(mountPoints) > 0 {
@@ -671,36 +704,32 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		st.Done("succeeded", out, stderr, "not mounted")
 	}
 
-	// 1.5. Pod Guard: Verify if any cluster Pod is mounting this NFS volume
-	if h.podGuardChecker != nil {
-		podStep, err := r.Step("check_pod_usage")
-		if err != nil {
-			r.Fail(fmt.Sprintf("create step: %v", err))
-			return err
-		}
-
-		exportPath := ""
-		if len(mountPoints) > 0 {
-			exportPath = mountPoints[0]
-		}
-		inUse, blockers, err := h.podGuardChecker(ctx, w.Host, exportPath)
-		if err != nil {
-			podStep.Done("failed", "", "", fmt.Sprintf("pod check failed: %v", err))
-			r.Fail(fmt.Sprintf("failed to evaluate pod usage guard: %v", err))
-			return err
-		}
-		if inUse {
-			msg := fmt.Sprintf("cannot delete: volume is in use by pods (%s)", strings.Join(blockers, "; "))
-			podStep.Done("failed", "", "", msg)
-			r.Fail(msg)
-			return fmt.Errorf("%s", msg)
-		}
-		podStep.Done("succeeded", "", "", "no active pods referencing volume")
+	// Verify every live export alias before any worker mutation.
+	if err := h.checkPodUsage(ctx, r, w.Host, mountPoints, "check_pod_usage"); err != nil {
+		return err
 	}
 
-	// 2. teardown + remove. DeleteLVSteps unexports/unmounts every detected
-	// target, then verifies the LV is no longer mounted before lvremove.
+	identity, err := h.inspectDevice(ctx, r, *w, lvDev, "verify_lv_identity")
+	if err != nil {
+		return err
+	}
+
+	// Teardown only after the target LV and host mount propagation are safe.
 	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoints: mountPoints}) {
+		if s.Name == "lvremove" {
+			if err := h.checkPodUsage(ctx, r, w.Host, mountPoints, "verify_pod_usage"); err != nil {
+				return err
+			}
+			current, err := h.inspectDevice(ctx, r, *w, lvDev, "verify_lv_identity_before_remove")
+			if err != nil {
+				return err
+			}
+			if current != identity {
+				err := fmt.Errorf("logical volume identity changed during teardown; retaining volume")
+				r.Fail(err.Error())
+				return err
+			}
+		}
 		sh, err := r.Step(s.Name)
 		if err != nil {
 			r.Fail(fmt.Sprintf("create step: %v", err))
@@ -708,35 +737,22 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		}
 		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
 		if err != nil || code != 0 {
-			// If lvremove failed because filesystem is in use, attempt automated namespace unmounting
-			// (e.g. for Promtail/daemonset containers that inherited host mounts) and retry lvremove once.
-			if s.Name == "lvremove" && strings.Contains(strings.ToLower(stderr), "in use") {
-				cleanStep, _ := r.Step("cleanup_namespace_mounts")
-				cleanOut, cleanErr, _, _ := h.runner.Run(ctx, *w, CleanupNamespaceMountsCmd(lvDev))
-				if cleanStep != nil {
-					cleanStep.Done("succeeded", cleanOut, cleanErr, "cleaned mount namespaces")
-				}
-
-				// Retry lvremove
-				retryOut, retryErr, retryCode, retryRunErr := h.runner.Run(ctx, *w, s.Cmd)
-				if retryRunErr == nil && retryCode == 0 {
-					sh.Done("succeeded", retryOut, retryErr, "retry lvremove succeeded after namespace cleanup")
-					continue
-				}
+			message := fmt.Sprintf("delete failed at %s (code=%d): %s", s.Name, code, strings.TrimSpace(stderr+"\n"+out))
+			if err != nil {
+				message += "; " + err.Error()
 			}
-
-			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
-			message := fmt.Sprintf("delete failed at %s: %s", s.Name, stderr)
-			if s.Name == "lvremove" && strings.Contains(strings.ToLower(stderr), "in use") {
-				message += "; check open file handles and other mount namespaces, stop consumers, then retry; no force removal was attempted"
-				// Diagnose lingering multi-namespace holders (e.g. Promtail or container hostPaths)
-				holdersOut, _, _, _ := h.runner.Run(ctx, *w, FindDeviceHoldersCmd(lvDev))
-				if strings.TrimSpace(holdersOut) != "" {
-					message += "\nDiagnostic details:\n" + strings.TrimSpace(holdersOut)
+			sh.Done("failed", out, stderr, message)
+			// Only a confirmed LVM filesystem-in-use error permits recovery.
+			// Transport failures never trigger a destructive follow-up command.
+			if s.Name == "lvremove" && err == nil && isFilesystemInUse(out, stderr) {
+				if recoveryErr := h.recoverNamespaceAndRemove(ctx, r, *w, lvDev, mountPoints, identity, s.Cmd); recoveryErr == nil {
+					continue
+				} else {
+					message += "; " + recoveryErr.Error()
 				}
 			}
 			r.Fail(message)
-			return fmt.Errorf("delete failed at %s", s.Name)
+			return fmt.Errorf("%s", message)
 		}
 		sh.Done("succeeded", out, stderr, "")
 	}

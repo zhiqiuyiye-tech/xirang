@@ -84,10 +84,17 @@ func main() {
 			return k8s.CheckNFSPodUsage(ctx, k8sClient, workerHost, exportPath)
 		}
 	}
+	var namespaceAuthorizer storage.NamespaceCleanupAuthorizer
+	if len(cfg.NamespaceCleanupAllowlist) > 0 && k8sClient != nil {
+		namespaceAuthorizer = func(ctx context.Context, workerHost, exportPath string, holders []storage.NamespaceHolder) error {
+			return k8s.AuthorizeNamespaceCleanup(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist)
+		}
+	}
 	storage.RegisterStorageHandlers(
 		eng, sshm, store,
 		storage.WithReservedMounts(cfg.ReservedMountPoints...),
 		storage.WithPodGuardChecker(podChecker),
+		storage.WithNamespaceCleanup(namespaceAuthorizer, cfg.NamespaceCleanupTimeout, cfg.NamespaceUnmountTimeout),
 	)
 
 	appCtx, appCancel := context.WithCancel(context.Background())

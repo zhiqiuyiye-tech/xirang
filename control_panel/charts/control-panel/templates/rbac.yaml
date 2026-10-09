@@ -30,6 +30,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims", "persistentvolumes"]
     verbs: ["get", "list"]
+  # DaemonSets: verify fresh owner UID before namespace cleanup; read-only.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get"]
   # Nodes: read-only (discover cluster nodes to prefill worker records).
   - apiGroups: [""]
     resources: ["nodes"]

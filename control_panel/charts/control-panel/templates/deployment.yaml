@@ -78,6 +78,12 @@ spec:
               value: {{ .Values.config.workerHeartbeatTimeout | default "30s" | quote }}
             - name: WORKER_ACCELERATOR_TIMEOUT
               value: {{ .Values.config.workerAcceleratorTimeout | default "45s" | quote }}
+            - name: NAMESPACE_CLEANUP_ALLOWLIST
+              value: {{ join "," (.Values.config.namespaceCleanupAllowlist | default (list)) | quote }}
+            - name: NAMESPACE_CLEANUP_TIMEOUT
+              value: {{ .Values.config.namespaceCleanupTimeout | default "60s" | quote }}
+            - name: NAMESPACE_UNMOUNT_TIMEOUT
+              value: {{ .Values.config.namespaceUnmountTimeout | default "10s" | quote }}
             {{- if .Values.config.trustedProxies }}
             - name: TRUSTED_PROXIES
               value: "{{ join "," .Values.config.trustedProxies }}"

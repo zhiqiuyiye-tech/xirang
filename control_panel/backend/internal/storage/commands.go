@@ -88,6 +88,14 @@ func ValidateMountPoint(mountPoint string, reservedMounts []string) error {
 	return nil
 }
 
+// ValidateLVComponent accepts a single LVM basename, not a path or CLI option.
+func ValidateLVComponent(value string) error {
+	if !regexp.MustCompile(`^[A-Za-z0-9_+][A-Za-z0-9_+.\-]*$`).MatchString(value) || len(value) > 127 || value == "." || value == ".." {
+		return fmt.Errorf("invalid LVM basename: %q", value)
+	}
+	return nil
+}
+
 func shellLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
@@ -334,7 +342,7 @@ func DeleteLVSteps(r DeleteLVReq) []Step {
 	}
 	steps = append(steps,
 		Step{"remove_fstab_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab`, lvDev)},
-		Step{"verify_unmounted", fmt.Sprintf(`remaining=$(findmnt -rn -o TARGET --source %s 2>/dev/null); if [ -n "$remaining" ]; then echo "logical volume is still mounted at: $remaining" >&2; exit 1; fi`, lvDev)},
+		Step{"verify_unmounted", fmt.Sprintf(`remaining=$(findmnt -rn -o TARGET --source %s 2>/dev/null); status=$?; if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then echo "could not verify logical volume mount state (findmnt status=$status)" >&2; exit 1; fi; if [ -n "$remaining" ]; then echo "logical volume is still mounted at: $remaining" >&2; exit 1; fi`, lvDev)},
 		Step{"lvremove", fmt.Sprintf("lvremove -f %s", lvDev)},
 	)
 	return steps
@@ -358,31 +366,4 @@ for mi in /proc/[0-9]*/mountinfo; do
     echo "PID $pid ($cmd): $matched_mounts"
   fi
 done`, d)
-}
-
-// CleanupNamespaceMountsCmd finds all lingering mounts of the device inside isolated
-// mount namespaces (e.g. DaemonSets like Promtail) and uses nsenter to unmount them.
-func CleanupNamespaceMountsCmd(devPath string) string {
-	d := shellLiteral(devPath)
-	return fmt.Sprintf(`# cp-storage-cleanup-ns-mounts
-dev=%s
-realdev=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
-majmin=$(lsblk -dn -o MAJ:MIN "$realdev" 2>/dev/null | head -n1 | tr -d ' ')
-echo "=== Cleaning mount namespaces holding $dev ($realdev $majmin) ==="
-cleaned=0
-for mi in /proc/[0-9]*/mountinfo; do
-  [ -f "$mi" ] || continue
-  if grep -qs -e "$dev" -e "$realdev" ${majmin:+-e "$majmin"} "$mi"; then
-    pid=$(echo "$mi" | cut -d/ -f3)
-    [ -d "/proc/$pid/ns" ] || continue
-    # Extract matching mountpoints inside this target namespace
-    grep -E "$dev|$realdev${majmin:+|$majmin}" "$mi" | awk '{print $5}' | sort -r | while read -r mp; do
-      [ -n "$mp" ] || continue
-      echo "Unmounting $mp inside namespace of PID $pid"
-      nsenter --mount="/proc/$pid/ns/mnt" umount -f "$mp" 2>/dev/null || true
-    done
-    cleaned=1
-  fi
-done
-`, d)
 }

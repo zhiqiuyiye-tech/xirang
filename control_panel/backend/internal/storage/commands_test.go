@@ -252,16 +252,18 @@ func TestFindDeviceHoldersCmd(t *testing.T) {
 	}
 }
 
-func TestCleanupNamespaceMountsCmd(t *testing.T) {
-	cmd := CleanupNamespaceMountsCmd("/dev/vg_data/lv_200g")
-	if !contains(cmd, "nsenter") {
-		t.Fatalf("expected command to use nsenter: %s", cmd)
+func TestDeleteStepsNeverForceOrLazyUnmount(t *testing.T) {
+	for _, step := range DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_200g", MountPoint: "/data02/share"}) {
+		if contains(step.Cmd, "umount -f") || contains(step.Cmd, "umount -l") {
+			t.Fatalf("unsafe unmount command: %s", step.Cmd)
+		}
 	}
-	if !contains(cmd, "umount") {
-		t.Fatalf("expected command to unmount inside namespaces: %s", cmd)
-	}
-	if !contains(cmd, "/proc/[0-9]*/mountinfo") {
-		t.Fatalf("expected command to inspect mountinfo: %s", cmd)
+}
+
+func TestUnmountVerificationChecksFindmntExitCode(t *testing.T) {
+	steps := DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_1"})
+	if !contains(steps[1].Cmd, `status=$?`) || !contains(steps[1].Cmd, `"$status" -ne 1`) {
+		t.Fatalf("findmnt failure is not checked: %s", steps[1].Cmd)
 	}
 }
 

@@ -65,6 +65,13 @@ spec:
               value: "30s"
             - name: WORKER_ACCELERATOR_TIMEOUT
               value: "45s"
+            # Empty allowlist keeps automatic container namespace cleanup disabled.
+            - name: NAMESPACE_CLEANUP_ALLOWLIST
+              value: ""
+            - name: NAMESPACE_CLEANUP_TIMEOUT
+              value: "60s"
+            - name: NAMESPACE_UNMOUNT_TIMEOUT
+              value: "10s"
             - name: JWT_TTL
               value: "30m"
             - name: COOKIE_SECURE

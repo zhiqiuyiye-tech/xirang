@@ -40,6 +40,22 @@ func TestNFSRBACRulesOnlyGrantPVCAndPVGetList(t *testing.T) {
 			if err := yaml.Unmarshal([]byte(roleDocument[rulesStart:]), &parsed); err != nil {
 				t.Fatalf("parse ClusterRole rules: %v", err)
 			}
+			daemonsetVerbs := map[string]bool{}
+			for _, rule := range parsed.Rules {
+				for _, resource := range rule.Resources {
+					for _, verb := range rule.Verbs {
+						if resource == "pods" && (verb == "delete" || verb == "deletecollection" || verb == "*" || verb == "create" || verb == "update" || verb == "patch") {
+							t.Errorf("Pod write permission %q is forbidden", verb)
+						}
+						if resource == "daemonsets" && len(rule.APIGroups) == 1 && rule.APIGroups[0] == "apps" {
+							daemonsetVerbs[verb] = true
+						}
+					}
+				}
+			}
+			if len(daemonsetVerbs) != 1 || !daemonsetVerbs["get"] {
+				t.Errorf("DaemonSet permissions=%v, want only get", daemonsetVerbs)
+			}
 			permissions := map[string]map[string]bool{
 				"persistentvolumeclaims": {},
 				"persistentvolumes":      {},

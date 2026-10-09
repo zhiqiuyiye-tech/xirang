@@ -60,6 +60,16 @@ the control panel into a cluster.
    CA on each node), or create an `imagePullSecret` and reference it in
    `deployment.yaml`.
 
+## NFS namespace recovery
+
+NFS LV deletion can perform an explicitly authorized ordinary unmount of a
+lingering log-agent namespace, then verify Open Count=0 and retry once. The
+allowlist is empty by default. Workers additionally need Python 3 and GNU
+`timeout`; verify the Linux behavior in an isolated environment before enabling
+cleanup. See [the recovery operator guide](../docs/nfs-namespace-recovery.md) for
+configuration, permissions, conservative refusal cases, and uncertain-executor
+markers. Both deletion endpoints share the same safeguards.
+
 ## Build and Push the Image
 
 The deployment pulls `registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:latest`

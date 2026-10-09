@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -61,6 +63,31 @@ func (h *storageHandlers) reclaim(c *gin.Context) {
 		return
 	}
 	wid := normalizeWorkerID(req)
+	if value, exists := req["task_id"]; exists && value != nil {
+		provisionID, parseErr := parseWorkerID(value)
+		if parseErr != nil || provisionID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "task_id must identify a succeeded provision task"})
+			return
+		}
+		provision, err := h.store.GetTask(c, provisionID)
+		if err != nil || provision.Type != "storage_provision_nfs" || provision.Status != "succeeded" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "task_id must identify a succeeded storage_provision_nfs task"})
+			return
+		}
+		var original struct {
+			WorkerID int64 `json:"worker_id"`
+		}
+		if err := json.Unmarshal([]byte(provision.ParamsJSON), &original); err != nil || original.WorkerID <= 0 || provision.TargetID != original.WorkerID {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provision task has inconsistent worker identity"})
+			return
+		}
+		wid = original.WorkerID
+		req["worker_id"], req["task_id"] = wid, provisionID
+	}
+	if wid <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "worker_id is required"})
+		return
+	}
 	taskID, err := h.eng.Submit(c, "storage_reclaim_nfs", "storage", wid, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -434,6 +461,9 @@ func normalizeWorkerID(req map[string]any) int64 {
 func parseWorkerID(v any) (int64, error) {
 	switch w := v.(type) {
 	case float64:
+		if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 || w != math.Trunc(w) || w >= float64(1<<63) {
+			return 0, fmt.Errorf("worker/task ID must be a nonnegative integer within int64 range")
+		}
 		return int64(w), nil
 	case int64:
 		return w, nil

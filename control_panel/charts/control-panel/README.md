@@ -22,6 +22,18 @@ the one-time browser key enrollment after the pod is Ready.
 > supports one replica only. Startup checks the SQLite runtime is at least 3.35.0
 > (the pinned Go driver currently reports 3.53.3) before applying migrations.
 
+## NFS namespace recovery
+
+`config.namespaceCleanupAllowlist` accepts exact `namespace/daemonset/container`
+triples; its default empty list disables automatic namespace cleanup.
+`config.namespaceCleanupTimeout` defaults to `60s`, and
+`config.namespaceUnmountTimeout` to `10s`. A worker requires Python 3, GNU
+`timeout`, and privileged access for the trusted ordinary-unmount executor.
+The chart grants only `get` on DaemonSets for owner-UID verification, without
+adding Pod deletion permissions. See [the operator guide](../../docs/nfs-namespace-recovery.md)
+before enabling recovery, including isolated Linux validation and handling
+uncertain-executor markers.
+
 ## Prerequisites
 
 1. **Private registry image pushed** (the master must be able to pull it):
@@ -55,10 +67,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.11.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.12.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.11`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.12`.
 
 ## Install
 
