@@ -22,7 +22,7 @@ func TestCreateSvcHandlerCreatesService(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	cs := fake.NewSimpleClientset()
+	cs := fake.NewSimpleClientset(k8sTestPod("p1", "uid-1", map[string]string{"app": "p1"}))
 	RegisterK8sHandlers(eng, cs)
 
 	params := map[string]any{
@@ -167,7 +167,7 @@ func TestCreateNPHandlerCreatesNetworkPolicy(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	cs := fake.NewSimpleClientset()
+	cs := fake.NewSimpleClientset(k8sTestPod("p1", "uid-1", map[string]string{"app": "p1"}))
 	RegisterK8sHandlers(eng, cs)
 
 	params := map[string]any{
@@ -215,13 +215,13 @@ func TestDeleteNPHandlerDeletesNetworkPolicy(t *testing.T) {
 	eng := tasks.NewEngine(store)
 	cs := fake.NewSimpleClientset(&networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "np1", Namespace: "ns1",
+			Name: "np1", Namespace: "ns1", UID: "np-uid-1", ResourceVersion: "np-rv-1",
 			Labels: map[string]string{"managed-by": "control-panel"},
 		},
 	})
 	RegisterK8sHandlers(eng, cs)
 
-	params := map[string]any{"namespace": "ns1", "name": "np1"}
+	params := map[string]any{"namespace": "ns1", "name": "np1", "uid": "np-uid-1", "resource_version": "np-rv-1"}
 	id, err := eng.Submit(context.Background(), "k8s_delete_np", "k8s", 1, params)
 	if err != nil {
 		t.Fatal(err)
@@ -241,7 +241,7 @@ func TestCreateSvcHandlerSimplifiedMappingsAndAutomaticNodePort(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	cs := fake.NewSimpleClientset()
+	cs := fake.NewSimpleClientset(k8sTestPod("p1", "uid-1", map[string]string{"app": "p1"}))
 	RegisterK8sHandlers(eng, cs)
 
 	params := map[string]any{
@@ -286,7 +286,7 @@ func TestUpdateSvcHandlerReplacesPortsAndSyncsNetworkPolicy(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	cs := fake.NewSimpleClientset()
+	cs := fake.NewSimpleClientset(k8sTestPod("p1", "uid-1", map[string]string{"app": "p1"}))
 	RegisterK8sHandlers(eng, cs)
 
 	createParams := map[string]any{
@@ -336,7 +336,7 @@ func TestUpdateSvcHandlerEmptyMappingsDeletesServiceAndPolicy(t *testing.T) {
 	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer store.Close()
 	eng := tasks.NewEngine(store)
-	cs := fake.NewSimpleClientset()
+	cs := fake.NewSimpleClientset(k8sTestPod("p1", "uid-1", map[string]string{"app": "p1"}))
 	RegisterK8sHandlers(eng, cs)
 
 	createParams := map[string]any{

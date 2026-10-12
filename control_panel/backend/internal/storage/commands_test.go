@@ -30,10 +30,17 @@ func TestValidateMountPoint(t *testing.T) {
 		}
 	}
 	// Invalid mounts: relative, root, protected system, reserved
-	for _, m := range []string{"", "relative/path", "/", "/boot", "/boot/efi", "/etc", "/etc/exports", "/var/log", "/data01", "/data01/sub"} {
+	for _, m := range []string{"", "relative/path", "/", "/boot", "/boot/efi", "/etc", "/etc/exports", "/var/log", "/run", "/run/containerd", "/run/containerd/io.containerd", "/data01", "/data01/sub"} {
 		if err := ValidateMountPoint(m, reserved); err == nil {
 			t.Fatalf("expected err for mount point %q", m)
 		}
+	}
+}
+
+func TestValidateMountPointRejectsRunFstabFixture(t *testing.T) {
+	_, err := parseLVResizeSafetyState(`{"mount_targets":[],"fstab_targets":["/run/containerd"],"swap_active":false,"device_open_count":0}`)
+	if err == nil || !strings.Contains(err.Error(), `fstab_targets target "/run/containerd"`) {
+		t.Fatalf("protected fstab target was not rejected: %v", err)
 	}
 }
 
@@ -136,6 +143,19 @@ func TestValidateDisk(t *testing.T) {
 	}
 }
 
+func TestPreflightDeviceRequiresSignatureProbe(t *testing.T) {
+	cmd := PreflightDeviceCmd("/dev/sdb", []string{"/data01"})
+	for _, required := range []string{
+		"command -v wipefs",
+		"wipefs --noheadings --no-act -o TYPE",
+		"device has existing signatures",
+	} {
+		if !strings.Contains(cmd, required) {
+			t.Fatalf("preflight command missing fail-closed probe %q: %s", required, cmd)
+		}
+	}
+}
+
 func TestCreateVGSteps_New(t *testing.T) {
 	// Each disk becomes its OWN VG: 2 disks -> 2x (pvcreate + vgcreate) = 4 steps.
 	// The VG name is derived from the prefix + disk basename (vg_data + sdb -> vg_data_sdb).
@@ -143,8 +163,8 @@ func TestCreateVGSteps_New(t *testing.T) {
 	if len(steps) != 4 {
 		t.Fatalf("expected 4 steps (2 disks x 2), got %d", len(steps))
 	}
-	if steps[0].Name != "pvcreate:/dev/sdb" || steps[0].Cmd != "wipefs -a /dev/sdb && pvcreate -y -ff /dev/sdb" {
-		t.Fatalf("pvcreate sdb wrong: %+v", steps[0])
+	if steps[0].Name != "pvcreate:/dev/sdb" || steps[0].Cmd != "pvcreate /dev/sdb" {
+		t.Fatalf("pvcreate sdb must not erase signatures or bypass prompts: %+v", steps[0])
 	}
 	if steps[1].Name != "vgcreate:vg_data_sdb" || steps[1].Cmd != "vgcreate vg_data_sdb /dev/sdb" {
 		t.Fatalf("vgcreate sdb wrong: %+v", steps[1])

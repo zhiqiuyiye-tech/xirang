@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -169,21 +170,57 @@ func (h *createSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 	}
 	st2, err := r.Step("create_network_policy")
 	if err != nil {
-		r.Fail(fmt.Sprintf("k8s_create_svc: create np step: %v", err))
-		return err
+		cause := fmt.Sprintf("k8s_create_svc: create np step: %v", err)
+		detail := reportCreatedServiceRollback(ctx, h.client, r, svc, cause)
+		r.Fail(detail)
+		return errors.New(detail)
 	}
 	np, err := CreateNetworkPolicy(ctx, h.client, CreateNetworkPolicyReq{
 		Namespace: p.Namespace, ServiceName: svc.Name, PodName: p.PodName, PodUID: p.PodUID,
 		PodSelector: p.Selector, IngressPorts: ingressPorts,
 	})
 	if err != nil {
-		st2.Done("failed", "", err.Error(), err.Error())
-		r.Fail(fmt.Sprintf("k8s_create_svc: create network policy: %v", err))
-		return err
+		cause := fmt.Sprintf("k8s_create_svc: create network policy: %v", err)
+		detail := reportCreatedServiceRollback(ctx, h.client, r, svc, cause)
+		st2.Done("failed", "", err.Error(), detail)
+		r.Fail(detail)
+		return errors.New(detail)
 	}
 	st2.Done("succeeded", np.Name, "", "")
 	r.Succeed()
 	return nil
+}
+
+func newK8sCleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
+}
+
+func reportCreatedServiceRollback(_ context.Context, client kubernetes.Interface, r *tasks.Reporter, svc *corev1.Service, cause string) string {
+	step, stepErr := r.Step("rollback_service")
+	cleanupCtx, cancel := newK8sCleanupContext()
+	defer cancel()
+	uid := svc.UID
+	resourceVersion := svc.ResourceVersion
+	err := client.CoreV1().Services(svc.Namespace).Delete(cleanupCtx, svc.Name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+	})
+	if apierrors.IsNotFound(err) {
+		err = nil
+	}
+	detail := cause
+	status := "succeeded"
+	if err != nil {
+		status = "failed"
+		detail += fmt.Sprintf("; service rollback failed: %v", err)
+	} else {
+		detail += "; service rollback succeeded"
+	}
+	if stepErr != nil {
+		detail += fmt.Sprintf("; unable to record service rollback outcome: %v", stepErr)
+	} else if step != nil {
+		step.Done(status, svc.Name, "", detail)
+	}
+	return detail
 }
 
 // --- updateSvcHandler ---
@@ -236,37 +273,68 @@ func (h *updateSvcHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 		})
 	}
 
+	validatedService, err := serviceForPortUpdate(ctx, h.client, p.Namespace, p.Name, p.ResourceVersion)
+	if err != nil {
+		r.Fail(fmt.Sprintf("k8s_update_svc: validate service: %v", err))
+		return err
+	}
+
 	stNP, err := r.Step("update_network_policy")
 	if err != nil {
 		r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
 		return err
 	}
-	if err := UpdateNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name, ingressPorts); err != nil {
-		stNP.Done("failed", "", err.Error(), err.Error())
-		r.Fail(fmt.Sprintf("k8s_update_svc: update network policy: %v", err))
-		return err
+	changes, err := updateNetworkPoliciesByService(ctx, h.client, p.Namespace, p.Name, ingressPorts)
+	if err != nil {
+		rollback := reportNetworkPolicyRollback(ctx, h.client, r, changes)
+		detail := fmt.Sprintf("k8s_update_svc: update network policy: %v; %s", err, rollback)
+		stNP.Done("failed", "", err.Error(), detail)
+		r.Fail(detail)
+		return errors.New(detail)
 	}
 	stNP.Done("succeeded", p.Name, "", "")
 
 	stSvc, err := r.Step("update_service")
 	if err != nil {
-		r.Fail(fmt.Sprintf("k8s_update_svc: %v", err))
-		return err
+		rollback := reportNetworkPolicyRollback(ctx, h.client, r, changes)
+		detail := fmt.Sprintf("k8s_update_svc: create update step: %v; %s", err, rollback)
+		r.Fail(detail)
+		return errors.New(detail)
 	}
 	svc, err := UpdateServicePorts(ctx, h.client, UpdateServiceReq{
 		Namespace:       p.Namespace,
 		Name:            p.Name,
-		ResourceVersion: p.ResourceVersion,
+		ResourceVersion: validatedService.ResourceVersion,
 		Ports:           ports,
 	})
 	if err != nil {
-		stSvc.Done("failed", "", err.Error(), err.Error())
-		r.Fail(fmt.Sprintf("k8s_update_svc: update service: %v", err))
-		return err
+		rollback := reportNetworkPolicyRollback(ctx, h.client, r, changes)
+		detail := fmt.Sprintf("k8s_update_svc: update service: %v; %s", err, rollback)
+		stSvc.Done("failed", "", err.Error(), detail)
+		r.Fail(detail)
+		return errors.New(detail)
 	}
 	stSvc.Done("succeeded", svc.Name, "", "")
 	r.Succeed()
 	return nil
+}
+
+func reportNetworkPolicyRollback(ctx context.Context, client kubernetes.Interface, r *tasks.Reporter, changes []policyUpdateChange) string {
+	step, stepErr := r.Step("rollback_network_policies")
+	rollbackErr := restoreNetworkPolicyChanges(ctx, client, changes)
+	status := "succeeded"
+	detail := "network policy rollback succeeded"
+	if rollbackErr != nil {
+		status = "failed"
+		detail = fmt.Sprintf("network policy rollback incomplete: %v", rollbackErr)
+	}
+	if stepErr != nil {
+		status = "failed"
+		detail += fmt.Sprintf("; unable to record rollback outcome: %v", stepErr)
+	} else if step != nil {
+		step.Done(status, fmt.Sprintf("%d policy changes", len(changes)), "", detail)
+	}
+	return detail
 }
 
 // --- deleteSvcHandler ---
@@ -416,8 +484,10 @@ func (h *deleteNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return errNoK8sClient
 	}
 	var p struct {
-		Namespace string `json:"namespace"`
-		Name      string `json:"name"`
+		Namespace       string `json:"namespace"`
+		Name            string `json:"name"`
+		UID             string `json:"uid"`
+		ResourceVersion string `json:"resource_version"`
 	}
 	if err := json.Unmarshal([]byte(task.ParamsJSON), &p); err != nil {
 		r.Fail(fmt.Sprintf("k8s_delete_np: parse params: %v", err))
@@ -429,7 +499,7 @@ func (h *deleteNPHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail(fmt.Sprintf("k8s_delete_np: create step: %v", err))
 		return err
 	}
-	if err := DeleteNetworkPolicy(ctx, h.client, p.Namespace, p.Name); err != nil {
+	if err := DeleteNetworkPolicyWithIdentity(ctx, h.client, p.Namespace, p.Name, p.UID, p.ResourceVersion); err != nil {
 		st.Done("failed", "", err.Error(), err.Error())
 		r.Fail(fmt.Sprintf("k8s_delete_np: %v", err))
 		return err

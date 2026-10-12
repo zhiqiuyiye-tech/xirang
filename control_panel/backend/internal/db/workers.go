@@ -83,6 +83,46 @@ func (s *Store) SetWorkerCredentials(ctx context.Context, id int64, encPassword,
 	return err
 }
 
+// SetWorkerSSHPassword updates only the encrypted SSH password. Computing the
+// auth mode in the same statement preserves a concurrently updated private key.
+func (s *Store) SetWorkerSSHPassword(ctx context.Context, id int64, encPassword *string) error {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE worker_nodes SET enc_password=?,
+ auth_mode=CASE WHEN ? IS NULL THEN 'key' WHEN enc_private_key IS NULL THEN 'password' ELSE 'both' END,
+ updated_at=? WHERE id=?`, encPassword, encPassword, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetWorkerSSHPrivateKey updates only the encrypted SSH key. Computing the
+// auth mode in the same statement preserves a concurrently updated password.
+func (s *Store) SetWorkerSSHPrivateKey(ctx context.Context, id int64, encPrivateKey *string) error {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE worker_nodes SET enc_private_key=?,
+ auth_mode=CASE WHEN ? IS NULL THEN CASE WHEN enc_password IS NULL THEN 'key' ELSE 'password' END WHEN enc_password IS NULL THEN 'key' ELSE 'both' END,
+ updated_at=? WHERE id=?`, encPrivateKey, encPrivateKey, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 var workerHealthClock atomic.Int64
 
 // WorkerHealthCheckTime orders probe starts across inventory, heartbeat and

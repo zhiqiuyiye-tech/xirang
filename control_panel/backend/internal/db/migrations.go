@@ -194,6 +194,24 @@ UPDATE admin SET auth_version=auth_version+1;
 				return nil
 			},
 		},
+		{
+			version: 5,
+			apply: func(tx *sql.Tx) error {
+				_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_task_steps_task_seq ON task_steps(task_id, seq)`)
+				return err
+			},
+		},
+		{
+			version: 6,
+			apply: func(tx *sql.Tx) error {
+				query := `CREATE INDEX IF NOT EXISTS idx_tasks_terminal_finished_at
+  ON tasks(status, ` + sqliteTimestampInstantExpr("finished_at") + `)
+  WHERE status IN ('succeeded', 'failed', 'cancelled');
+CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log(` + sqliteTimestampInstantExpr("at") + `, id);`
+				_, err := tx.Exec(query)
+				return err
+			},
+		},
 	}
 
 	for _, m := range migrations {

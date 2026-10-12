@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 type Config struct {
@@ -22,6 +24,10 @@ type Config struct {
 	JWTIssuer                   string
 	JWTAudience                 string
 	TaskTimeout                 time.Duration
+	TaskRetention               time.Duration
+	AuditRetention              time.Duration
+	HistoryCleanupInterval      time.Duration
+	HistoryCleanupBatchSize     int
 	CookieName                  string
 	CookieSecure                bool
 	CookieSameSite              string
@@ -43,6 +49,7 @@ type Config struct {
 	CollectorConcurrency        int
 	StorageStaleAfter           time.Duration
 	ReservedMountPoints         []string
+	NonNFSCSIDrivers            []string
 	NamespaceCleanupAllowlist   []string
 	NamespaceCleanupTimeout     time.Duration
 	NamespaceUnmountTimeout     time.Duration
@@ -90,6 +97,21 @@ func Load() (Config, error) {
 	c.TaskTimeout = envDurOr("TASK_TIMEOUT", 30*time.Minute)
 	if c.TaskTimeout <= 0 {
 		return c, fmt.Errorf("TASK_TIMEOUT must be > 0")
+	}
+	if c.TaskRetention, err = retentionDaysEnv("TASK_RETENTION_DAYS", 90); err != nil {
+		return c, err
+	}
+	if c.AuditRetention, err = retentionDaysEnv("AUDIT_RETENTION_DAYS", 365); err != nil {
+		return c, err
+	}
+	if c.HistoryCleanupInterval, err = positiveDurationEnv("HISTORY_CLEANUP_INTERVAL", time.Hour); err != nil {
+		return c, err
+	}
+	if c.HistoryCleanupInterval < time.Minute {
+		return c, fmt.Errorf("HISTORY_CLEANUP_INTERVAL must be at least 1m to avoid continuous database cleanup")
+	}
+	if c.HistoryCleanupBatchSize, err = strictPositiveIntEnv("HISTORY_CLEANUP_BATCH_SIZE", 500); err != nil {
+		return c, err
 	}
 
 	c.CookieName = envOr("COOKIE_NAME", "cp_session")
@@ -158,6 +180,13 @@ func Load() (Config, error) {
 	for _, mountPoint := range c.ReservedMountPoints {
 		if !strings.HasPrefix(mountPoint, "/") {
 			return c, fmt.Errorf("RESERVED_MOUNT_POINTS entries must be absolute paths, got %q", mountPoint)
+		}
+	}
+
+	c.NonNFSCSIDrivers = envSliceOr("STORAGE_NON_NFS_CSI_DRIVERS", nil)
+	for _, driver := range c.NonNFSCSIDrivers {
+		if problems := validation.IsDNS1123Subdomain(driver); len(problems) != 0 {
+			return c, fmt.Errorf("STORAGE_NON_NFS_CSI_DRIVERS entry %q is invalid: %s", driver, strings.Join(problems, ", "))
 		}
 	}
 

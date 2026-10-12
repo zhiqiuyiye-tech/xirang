@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +50,35 @@ func unsetMinimalEnv() {
 	os.Unsetenv("COLLECTOR_CONCURRENCY")
 	os.Unsetenv("STORAGE_STALE_AFTER")
 	os.Unsetenv("RESERVED_MOUNT_POINTS")
+	os.Unsetenv("STORAGE_NON_NFS_CSI_DRIVERS")
+}
+
+func TestLoadNonNFSCSIDrivers(t *testing.T) {
+	setMinimalEnv()
+	defer unsetMinimalEnv()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.NonNFSCSIDrivers) != 0 {
+		t.Fatalf("default NonNFSCSIDrivers=%v, want empty", cfg.NonNFSCSIDrivers)
+	}
+
+	t.Setenv("STORAGE_NON_NFS_CSI_DRIVERS", " ebs.csi.aws.com, pd.csi.storage.gke.io ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ebs.csi.aws.com", "pd.csi.storage.gke.io"}
+	if !reflect.DeepEqual(cfg.NonNFSCSIDrivers, want) {
+		t.Fatalf("NonNFSCSIDrivers=%v, want %v", cfg.NonNFSCSIDrivers, want)
+	}
+
+	t.Setenv("STORAGE_NON_NFS_CSI_DRIVERS", "not a driver")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "STORAGE_NON_NFS_CSI_DRIVERS") || !strings.Contains(err.Error(), "not a driver") {
+		t.Fatalf("Load() error=%v, want error naming STORAGE_NON_NFS_CSI_DRIVERS and the invalid entry", err)
+	}
 }
 
 func TestLoad_OK(t *testing.T) {

@@ -20,6 +20,18 @@ const defaultTaskTimeout = 30 * time.Minute
 // panel's own goroutine/SSH-connection usage when tasks target many workers.
 const maxConcurrentTasks = 16
 
+// maxPendingTasks bounds tasks accepted into the scheduler but not yet
+// executing. Active tasks use the separate maxConcurrentTasks limit.
+const maxPendingTasks = 512
+
+// QueueFullError reports that all pending-task admission slots are occupied.
+type QueueFullError struct{}
+
+func (*QueueFullError) Error() string { return "task queue is full" }
+
+// ErrQueueFull is the typed error returned when the pending queue is full.
+var ErrQueueFull = &QueueFullError{}
+
 // Engine is the in-process scheduler for long operations. Handlers are
 // registered by type name and run in their own goroutine. Progress is
 // recorded to the tasks/task_steps tables and streamed to SSE subscribers.
@@ -49,6 +61,9 @@ type Engine struct {
 
 	// inflight caps globally concurrent task goroutines.
 	inflight chan struct{}
+
+	// pending tracks admitted tasks that have not yet acquired execution slots.
+	pending chan struct{}
 }
 
 // NewEngine returns an Engine backed by the given store.
@@ -60,6 +75,7 @@ func NewEngine(store *db.Store) *Engine {
 		taskTimeout: defaultTaskTimeout,
 		slots:       map[string]chan struct{}{},
 		inflight:    make(chan struct{}, maxConcurrentTasks),
+		pending:     make(chan struct{}, maxPendingTasks),
 	}
 }
 
@@ -120,7 +136,7 @@ func (e *Engine) notifyCompletion(id int64) {
 // launches the handler in a goroutine. The task row stays "pending" while it
 // is queued behind another task on the same target and is flipped to
 // "running" only when the handler actually starts (see run). Unknown types
-// return an error and create no row.
+// and queue-full submissions return typed errors without creating a row.
 func (e *Engine) Submit(ctx context.Context, typeName, targetKind string, targetID int64, params map[string]any) (int64, error) {
 	e.mu.Lock()
 	h, ok := e.handlers[typeName]
@@ -136,11 +152,17 @@ func (e *Engine) Submit(ctx context.Context, typeName, targetKind string, target
 		}
 		paramsJSON = string(b)
 	}
+	select {
+	case e.pending <- struct{}{}:
+	default:
+		return 0, ErrQueueFull
+	}
 	id, err := e.store.CreateTask(ctx, db.Task{
 		Type: typeName, TargetKind: targetKind, TargetID: targetID,
 		Status: "pending", ParamsJSON: paramsJSON,
 	})
 	if err != nil {
+		<-e.pending
 		return 0, err
 	}
 	go e.run(id, targetKind, targetID, h)
@@ -173,22 +195,22 @@ func (e *Engine) slotFor(targetKind string, targetID int64) chan struct{} {
 // On handler error or panic, the task is marked failed via the reporter.
 // Handler-driven Succeed/Fail calls also persist terminal state.
 func (e *Engine) run(id int64, targetKind string, targetID int64, h Handler) {
-	task, err := e.store.GetTask(context.Background(), id)
-	if err != nil {
-		return
-	}
+	// The timeout includes time spent queued for either execution slot, not
+	// only time spent inside the handler. This lets stale queued work fail and
+	// release its admission reservation without waiting behind a blocked task.
+	ctx, cancel := context.WithTimeout(context.Background(), e.timeout())
+	defer cancel()
+
 	r := &Reporter{store: e.store, engine: e, taskID: id}
+	pendingReserved := true
+	releasePending := func() {
+		if pendingReserved {
+			<-e.pending
+			pendingReserved = false
+		}
+	}
+	defer releasePending()
 	defer e.notifyCompletion(id)
-
-	// Serialize per target: at most one task goroutine per target executes at
-	// a time. The previous task's own timeout guarantees the queue drains.
-	slot := e.slotFor(targetKind, targetID)
-	slot <- struct{}{}
-	defer func() { <-slot }()
-
-	// Global cap on concurrently running tasks.
-	e.inflight <- struct{}{}
-	defer func() { <-e.inflight }()
 
 	// Recover panics: gin.Recovery only covers HTTP goroutines, task handlers
 	// run here. A panic must fail the task, not take down the process.
@@ -198,11 +220,40 @@ func (e *Engine) run(id int64, targetKind string, targetID int64, h Handler) {
 		}
 	}()
 
+	task, err := e.store.GetTask(context.Background(), id)
+	if err != nil {
+		return
+	}
+
+	// Serialize per target: at most one task goroutine per target executes at
+	// a time. A timed-out waiter fails without holding the slot.
+	slot := e.slotFor(targetKind, targetID)
+	select {
+	case slot <- struct{}{}:
+		defer func() { <-slot }()
+	case <-ctx.Done():
+		r.Fail(ctx.Err().Error())
+		return
+	}
+
+	// Global cap on concurrently executing tasks. Time spent waiting here is
+	// also covered by the task deadline and remains part of the pending queue.
+	select {
+	case e.inflight <- struct{}{}:
+		defer func() { <-e.inflight }()
+	case <-ctx.Done():
+		r.Fail(ctx.Err().Error())
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		r.Fail(err.Error())
+		return
+	}
+
 	_ = e.store.SetTaskStatus(context.Background(), id, "running", false)
 	e.emit(StepEvent{TaskID: id, Status: "running"})
+	releasePending()
 
-	ctx, cancel := context.WithTimeout(context.Background(), e.timeout())
-	defer cancel()
 	if err := h.Run(ctx, task, r); err != nil {
 		r.Fail(err.Error())
 	}

@@ -95,7 +95,7 @@ if kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1; then
     SECRET_EXISTS=1
 fi
 
-# read_secret_key echoes the existing base64 value for a Secret data key
+# read_secret_key echoes the existing base64-encoded Secret data value
 # (empty if the secret or key is absent). Called only when SECRET_EXISTS=1.
 read_secret_key() {
     kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" \
@@ -110,10 +110,10 @@ if [ "${SECRET_EXISTS}" = "1" ] && [ "${RESET_SECRETS}" = "0" ]; then
     # Re-rendering secret.yaml with identical values is a no-op on the cluster;
     # changes only.
     log "Secret '${SECRET_NAME}' exists - reusing its values (recovery secret unchanged)."
-    AES_KEY="$(read_secret_key AES_KEY)"
+    AES_KEY_DATA="$(read_secret_key AES_KEY)"
     JWT_SECRET="$(read_secret_key JWT_SECRET)"
     ADMIN_INIT_PASSWORD_B64="$(read_secret_key ADMIN_INIT_PASSWORD)"
-    if [ -z "${AES_KEY}" ] || [ -z "${JWT_SECRET}" ] || [ -z "${ADMIN_INIT_PASSWORD_B64}" ]; then
+    if [ -z "${AES_KEY_DATA}" ] || [ -z "${JWT_SECRET}" ] || [ -z "${ADMIN_INIT_PASSWORD_B64}" ]; then
         die "existing Secret is missing AES_KEY/JWT_SECRET/ADMIN_INIT_PASSWORD; re-run with --reset-secrets to regenerate."
     fi
 else
@@ -129,8 +129,11 @@ else
     fi
 
     log "Generating AES_KEY (32 random bytes, base64)..."
-    AES_KEY="$(openssl rand 32 | base64 | tr -d '\n')"
-    if [ -z "${AES_KEY}" ]; then die "failed to generate AES_KEY"; fi
+    AES_KEY_ENV="$(openssl rand 32 | base64 | tr -d '\n')"
+    if [ -z "${AES_KEY_ENV}" ]; then die "failed to generate AES_KEY"; fi
+    # Secret.data needs base64 of the environment value, which is itself base64.
+    AES_KEY_DATA="$(printf '%s' "${AES_KEY_ENV}" | base64 | tr -d '\n')"
+    unset AES_KEY_ENV
 
     log "Generating JWT_SECRET (32 random bytes, base64)..."
     JWT_SECRET="$(openssl rand 32 | base64 | tr -d '\n')"
@@ -172,12 +175,12 @@ metadata:
     app.kubernetes.io/name: control-panel
 type: Opaque
 data:
-  AES_KEY: ${AES_KEY}
+  AES_KEY: ${AES_KEY_DATA}
   JWT_SECRET: ${JWT_SECRET}
   ADMIN_INIT_PASSWORD: ${ADMIN_INIT_PASSWORD_B64}
 EOF
 chmod 600 "${SECRET_FILE}" 2>/dev/null || true
-unset AES_KEY JWT_SECRET ADMIN_INIT_PASSWORD_B64
+unset AES_KEY_DATA AES_KEY_ENV JWT_SECRET ADMIN_INIT_PASSWORD_B64
 
 # --- apply manifests -------------------------------------------------------
 

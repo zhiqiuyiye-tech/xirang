@@ -46,6 +46,8 @@ type Collector struct {
 	mu         sync.Mutex
 	pending    map[string]struct{}
 	refreshing map[int64]bool
+	dirty      map[int64]struct{}
+	deferred   map[int64]struct{}
 }
 
 func New(store *db.Store, runner ssh.Runner, config Config) *Collector {
@@ -75,6 +77,7 @@ func New(store *db.Store, runner ssh.Runner, config Config) *Collector {
 	return &Collector{
 		store: store, runner: runner, config: config,
 		queue: make(chan job, 1024), pending: make(map[string]struct{}), refreshing: make(map[int64]bool),
+		dirty: make(map[int64]struct{}), deferred: make(map[int64]struct{}),
 	}
 }
 
@@ -110,10 +113,18 @@ func (c *Collector) worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-c.queue:
-			switch item.kind {
-			case jobInventory:
-				_ = c.collectInventory(ctx, item.workerID)
-			case jobHeartbeat:
+			c.enqueueDeferred()
+			if item.kind == jobInventory {
+				for {
+					_ = c.collectInventory(ctx, item.workerID)
+					if !c.finish(item) {
+						break
+					}
+					c.beginInventoryRerun(item.workerID)
+				}
+				continue
+			}
+			if item.kind == jobHeartbeat {
 				_ = c.checkHeartbeat(ctx, item.workerID)
 			}
 			c.finish(item)
@@ -125,43 +136,97 @@ func jobKey(kind jobKind, workerID int64) string {
 	return fmt.Sprintf("%s/%d", kind, workerID)
 }
 
+// enqueueDeferred schedules accepted refresh requests when a worker has freed
+// queue capacity. It only makes nonblocking sends, so a full queue never stalls
+// workers that are draining it.
+func (c *Collector) enqueueDeferred() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for workerID := range c.deferred {
+		item := job{kind: jobInventory, workerID: workerID}
+		select {
+		case c.queue <- item:
+			delete(c.deferred, workerID)
+		default:
+			return
+		}
+	}
+}
+
 func (c *Collector) enqueue(item job) bool {
 	key := jobKey(item.kind, item.workerID)
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, exists := c.pending[key]; exists {
-		c.mu.Unlock()
 		return false
 	}
 	c.pending[key] = struct{}{}
 	if item.kind == jobInventory {
+		delete(c.dirty, item.workerID)
 		c.refreshing[item.workerID] = true
 	}
-	c.mu.Unlock()
 	select {
 	case c.queue <- item:
 		return true
 	default:
-		c.mu.Lock()
 		delete(c.pending, key)
 		if item.kind == jobInventory {
 			delete(c.refreshing, item.workerID)
 		}
-		c.mu.Unlock()
 		return false
 	}
 }
 
-func (c *Collector) finish(item job) {
+func (c *Collector) finish(item job) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.pending, jobKey(item.kind, item.workerID))
 	if item.kind == jobInventory {
+		if _, rerun := c.dirty[item.workerID]; rerun {
+			return true
+		}
 		delete(c.refreshing, item.workerID)
 	}
+	delete(c.pending, jobKey(item.kind, item.workerID))
+	return false
+}
+
+func (c *Collector) beginInventoryRerun(workerID int64) {
+	c.mu.Lock()
+	delete(c.dirty, workerID)
+	c.mu.Unlock()
 }
 
 func (c *Collector) EnqueueInventory(workerID int64) bool {
 	return c.enqueue(job{kind: jobInventory, workerID: workerID})
+}
+
+// EnqueueInventoryAfterCurrent ensures inventory changes made by a completed
+// operation are collected after any queued or running inventory for the worker.
+// Multiple requests while the current run is active coalesce into one rerun.
+func (c *Collector) EnqueueInventoryAfterCurrent(workerID int64) bool {
+	item := job{kind: jobInventory, workerID: workerID}
+	key := jobKey(item.kind, item.workerID)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, active := c.pending[key]; active {
+		if _, alreadyDeferred := c.deferred[workerID]; alreadyDeferred {
+			return false
+		}
+		if _, alreadyDirty := c.dirty[workerID]; alreadyDirty {
+			return false
+		}
+		c.dirty[workerID] = struct{}{}
+		return true
+	}
+	c.pending[key] = struct{}{}
+	c.refreshing[workerID] = true
+	select {
+	case c.queue <- item:
+		return true
+	default:
+		c.deferred[workerID] = struct{}{}
+		return true
+	}
 }
 
 func (c *Collector) EnqueueHeartbeat(workerID int64) bool {

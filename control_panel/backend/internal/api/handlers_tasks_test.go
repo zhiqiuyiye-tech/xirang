@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/workers"
 )
 
@@ -53,6 +54,56 @@ func TestGetTaskByIDNoParamsJSON(t *testing.T) {
 	}
 	if strings.Contains(body, "secret-pw") {
 		t.Fatalf("API response leaks password: %s", body)
+	}
+}
+
+func TestGetProvisionTaskReturnsSafeRegistrationDetails(t *testing.T) {
+	r, _, store, tk := newRouter(t)
+	params, err := json.Marshal(map[string]any{
+		"worker_id":   7,
+		"vg_name":     "vg_data",
+		"lv_name":     "lv_notebook_1",
+		"size_gb":     200,
+		"fs_type":     "xfs",
+		"mount_point": "/data02/notebook_1",
+		"password":    "must-not-be-returned",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := store.CreateTask(context.Background(), db.Task{
+		Type: "storage_provision_nfs", TargetKind: "storage", TargetID: 7,
+		Status: "succeeded", ParamsJSON: string(params),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/tasks/"+strconv.FormatInt(taskID, 10), nil)
+	req.Header.Set("Authorization", authHeader(t, tk))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Registration struct {
+			VGName     string  `json:"vg_name"`
+			LVName     string  `json:"lv_name"`
+			SizeGB     float64 `json:"size_gb"`
+			FSType     string  `json:"fs_type"`
+			MountPoint string  `json:"mount_point"`
+		} `json:"registration"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	got := response.Registration
+	if got.VGName != "vg_data" || got.LVName != "lv_notebook_1" || got.SizeGB != 200 || got.FSType != "xfs" || got.MountPoint != "/data02/notebook_1" {
+		t.Fatalf("registration details=%+v", got)
+	}
+	if strings.Contains(w.Body.String(), "must-not-be-returned") || strings.Contains(w.Body.String(), "params_json") {
+		t.Fatalf("task response leaked the raw parameters: %s", w.Body.String())
 	}
 }
 

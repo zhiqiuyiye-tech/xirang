@@ -26,7 +26,7 @@ var (
 // result does not replace remote process/root/mount revalidation immediately
 // before ordinary unmount. Every member of every supplied namespace must be
 // identified and permitted; the default empty allowlist always denies cleanup.
-func AuthorizeNamespaceCleanup(ctx context.Context, client kubernetes.Interface, workerHost string, exportPath string, holders []storage.NamespaceHolder, allowlist []string) error {
+func AuthorizeNamespaceCleanup(ctx context.Context, client kubernetes.Interface, workerHost string, exportPath string, holders []storage.NamespaceHolder, allowlist []string, nonNFSDrivers ...string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -171,7 +171,7 @@ func AuthorizeNamespaceCleanup(ctx context.Context, client kubernetes.Interface,
 	if !workerMatches {
 		return fmt.Errorf("worker node address changed")
 	}
-	inUse, blockers, err := CheckNFSPodUsage(ctx, client, workerHost, target)
+	inUse, blockers, err := CheckNFSPodUsage(ctx, client, workerHost, target, nonNFSDrivers...)
 	if err != nil {
 		return fmt.Errorf("verify business Pod usage: %w", err)
 	}

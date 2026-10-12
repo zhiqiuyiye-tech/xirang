@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -101,7 +102,11 @@ func recordAudit(c *gin.Context, store *db.Store, action, target, result string,
 			}
 		}
 	}
-	_ = store.InsertAudit(c, db.AuditLog{Actor: actor, Action: action, Target: &target, Result: result, ParamsJSON: paramsJSON})
+	if err := store.InsertAudit(c, db.AuditLog{Actor: actor, Action: action, Target: &target, Result: result, ParamsJSON: paramsJSON}); err != nil {
+		// Keep the completed operation result authoritative and avoid logging
+		// audit payloads, targets, or database errors that may echo values.
+		log.Printf("audit insert failed for action %q", action)
+	}
 }
 
 func workerAuditDetails(c *gin.Context, store *db.Store, target string) map[string]any {

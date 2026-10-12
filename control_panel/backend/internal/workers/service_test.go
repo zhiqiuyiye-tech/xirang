@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
@@ -33,6 +34,7 @@ func setup(t *testing.T) *Service {
 
 type workerSSHStub struct {
 	testErr error
+	evicted chan int64
 }
 
 func (s *workerSSHStub) Run(_ context.Context, _ db.WorkerNode, _ string) (string, string, int, error) {
@@ -42,7 +44,23 @@ func (s *workerSSHStub) RunWithStdin(_ context.Context, _ db.WorkerNode, _ strin
 	return "", "", 0, nil
 }
 func (s *workerSSHStub) TestConnection(_ context.Context, _ db.WorkerNode) error { return s.testErr }
-func (s *workerSSHStub) EvictWorker(_ int64)                                     {}
+func (s *workerSSHStub) EvictWorker(id int64) {
+	if s.evicted != nil {
+		s.evicted <- id
+	}
+}
+func (s *workerSSHStub) evictedWorkers() []int64 {
+	var evicted []int64
+	for s.evicted != nil {
+		select {
+		case id := <-s.evicted:
+			evicted = append(evicted, id)
+		default:
+			return evicted
+		}
+	}
+	return evicted
+}
 
 func TestConnectionPersistsWorkerStatus(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "health.db"))
@@ -123,6 +141,32 @@ func TestUpdatePartialKeepsOmittedFields(t *testing.T) {
 
 // TestUpdateRejectsBadPort verifies an explicitly provided invalid port is
 // rejected rather than silently ignored.
+func TestUpdateEvictsPooledSSHWhenConnectionIdentityChanges(t *testing.T) {
+	svc := setup(t)
+	stub := &workerSSHStub{evicted: make(chan int64, 10)}
+	svc.sshm = stub
+	id, err := svc.Create(context.Background(), CreateReq{Name: "w", Host: "10.0.0.1", Port: 22, Username: "ops"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.Update(context.Background(), id, UpdateReq{Host: "10.0.0.2"}); err != nil {
+		t.Fatal(err)
+	}
+	evicted := stub.evictedWorkers()
+	if len(evicted) != 1 || evicted[0] != id {
+		t.Fatalf("host change must evict worker %d connections, evicted=%v", id, evicted)
+	}
+
+	if err := svc.Update(context.Background(), id, UpdateReq{Name: "renamed"}); err != nil {
+		t.Fatal(err)
+	}
+	evicted = stub.evictedWorkers()
+	if len(evicted) != 0 {
+		t.Fatalf("name-only change should not evict pooled SSH connections, evicted=%v", evicted)
+	}
+}
+
 func TestUpdateRejectsBadPort(t *testing.T) {
 	svc := setup(t)
 	id, _ := svc.Create(context.Background(), CreateReq{Name: "w", Host: "h", Port: 22, Username: "root"})
@@ -161,6 +205,60 @@ func TestSetPrivateKeySetsBothMode(t *testing.T) {
 	got, _ := svc.Get(context.Background(), id)
 	if got.AuthMode != "both" {
 		t.Fatalf("auth_mode=%q want both", got.AuthMode)
+	}
+}
+
+func TestRootPasswordTaskEvictsPooledSSHAndPreservesPrivateKey(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "root-password.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cipher, err := crypto.New(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := &workerSSHStub{evicted: make(chan int64, 10)}
+	engine := tasks.NewEngine(store)
+	svc := NewService(store, cipher, stub, engine)
+	id, err := svc.Create(context.Background(), CreateReq{Name: "w", Host: "host", Port: 22, Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetPrivateKey(context.Background(), id, "encrypted-by-app"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetWorker(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskID, err := svc.ChangeRootPassword(context.Background(), id, "new-root-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		task, err := store.GetTask(context.Background(), taskID)
+		if err == nil && task.Status == "succeeded" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	task, err := store.GetTask(context.Background(), taskID)
+	if err != nil || task.Status != "succeeded" {
+		t.Fatalf("root password task status=%v err=%v", task, err)
+	}
+	worker, err := store.GetWorker(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.EncPrivateKey == nil || before.EncPrivateKey == nil || *worker.EncPrivateKey != *before.EncPrivateKey {
+		t.Fatal("root password task overwrote the separately stored SSH private key")
+	}
+	evicted := stub.evictedWorkers()
+	if len(evicted) < 2 || evicted[len(evicted)-1] != id {
+		t.Fatalf("root password change must evict the worker SSH pool, evicted=%v", evicted)
 	}
 }
 

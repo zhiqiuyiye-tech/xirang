@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -33,23 +34,37 @@ import (
 // the fake clientset so tests can assert on the cluster state after async
 // tasks run. Existing non-k8s tests use newRouter (which delegates here
 // internally with a fake clientset of its own).
-func newRouterWithK8s(t *testing.T) (*gin.Engine, *db.Store, *auth.Tokens, kubernetes.Interface) {
+func newRouterWithK8s(t testing.TB) (*gin.Engine, *db.Store, *auth.Tokens, kubernetes.Interface) {
+	return newRouterWithK8sClient(t, fake.NewSimpleClientset())
+}
+
+func newRouterWithK8sClient(t testing.TB, client kubernetes.Interface) (*gin.Engine, *db.Store, *auth.Tokens, kubernetes.Interface) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	s, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	t.Cleanup(func() { s.Close() })
 	c, _ := crypto.New(make([]byte, 32))
 	sshm := ssh.NewManager(c, 2, time.Minute)
+	t.Cleanup(sshm.Close)
 	eng := tasks.NewEngine(s)
 	ws := workers.NewService(s, c, sshm, eng)
 	tk := auth.NewTokens("secret", time.Hour)
-	cs := fake.NewSimpleClientset()
-	k8s.RegisterK8sHandlers(eng, cs)
-	router, err := NewRouter(tk, ws, s, eng, cs, sshm)
+	k8s.RegisterK8sHandlers(eng, client)
+	router, err := NewRouter(tk, ws, s, eng, client, sshm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return router, s, tk, cs
+	return router, s, tk, client
+}
+
+func seedK8sPodForTest(t *testing.T, client kubernetes.Interface, name, namespace, uid string, podLabels map[string]string) {
+	t.Helper()
+	_, err := client.CoreV1().Pods(namespace).Create(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: name, Namespace: namespace, UID: types.UID(uid), Labels: podLabels,
+	}}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestCreateServiceViaAPI drives the full HTTP path: POST /api/v1/k8s/services
@@ -58,6 +73,7 @@ func newRouterWithK8s(t *testing.T) (*gin.Engine, *db.Store, *auth.Tokens, kuber
 // the k8s_create_svc task handler registered on the engine.
 func TestCreateServiceViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
+	seedK8sPodForTest(t, cs, "p1", "ns1", "u1", map[string]string{"app": "p1"})
 	body, _ := json.Marshal(map[string]any{
 		"namespace": "ns1", "pod_name": "p1", "pod_uid": "u1",
 		"selector": map[string]string{"app": "p1"}, "type": "NodePort",
@@ -198,6 +214,7 @@ func TestDeleteServiceViaAPI(t *testing.T) {
 // returns 202 + task_id and creates the NetworkPolicy.
 func TestCreateNetworkPolicyViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
+	seedK8sPodForTest(t, cs, "p1", "ns1", "u1", map[string]string{"app": "p1"})
 	body, _ := json.Marshal(map[string]any{
 		"namespace": "ns1", "pod_name": "p1", "pod_uid": "u1",
 		"pod_selector":  map[string]string{"app": "p1"},
@@ -230,6 +247,7 @@ func TestCreateNetworkPolicyViaAPI(t *testing.T) {
 // TestListNetworkPoliciesViaAPI verifies the sync list path for network policies.
 func TestListNetworkPoliciesViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
+	seedK8sPodForTest(t, cs, "p1", "ns1", "u1", map[string]string{"app": "p1"})
 	_, err := k8s.CreateNetworkPolicy(context.Background(), cs, k8s.CreateNetworkPolicyReq{
 		Namespace: "ns1", PodName: "p1", PodUID: "u1",
 		PodSelector:  map[string]string{"app": "p1"},
@@ -263,7 +281,7 @@ func TestDeleteNetworkPolicyViaAPI(t *testing.T) {
 	r, _, tk, cs := newRouterWithK8s(t)
 	_, err := cs.NetworkingV1().NetworkPolicies("ns1").Create(context.Background(), &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "np-to-delete", Namespace: "ns1",
+			Name: "np-to-delete", Namespace: "ns1", UID: "np-uid", ResourceVersion: "np-rv",
 			Labels: map[string]string{"managed-by": "control-panel"},
 		},
 	}, metav1.CreateOptions{})

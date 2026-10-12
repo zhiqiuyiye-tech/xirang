@@ -54,7 +54,7 @@ func ValidateDisk(s string) error {
 
 // ValidateMountPoint ensures mountPoint is an absolute, clean path, does not contain
 // directory traversal or shell metacharacters, and is not a system-critical path
-// (/, /boot, /etc, /usr, /var, /root, /bin, /sbin, /lib, /sys, /proc, /dev)
+// (/, /boot, /etc, /usr, /var, /run, /root, /bin, /sbin, /lib, /sys, /proc, /dev)
 // or within configured reserved mounts (e.g. /data01).
 func ValidateMountPoint(mountPoint string, reservedMounts []string) error {
 	if mountPoint == "" {
@@ -72,7 +72,7 @@ func ValidateMountPoint(mountPoint string, reservedMounts []string) error {
 	}
 	systemRoots := []string{
 		"/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
-		"/proc", "/root", "/sbin", "/sys", "/usr", "/var",
+		"/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var",
 	}
 	for _, sys := range systemRoots {
 		if cleaned == sys || strings.HasPrefix(cleaned, sys+"/") {
@@ -101,8 +101,9 @@ func shellLiteral(value string) string {
 }
 
 // PreflightDeviceCmd returns a read-only safety check that must run immediately
-// before pvcreate. It rejects mounted devices, devices belonging to active VGs,
-// system or reserved ancestors, and mounted child partitions.
+// before pvcreate. It rejects mounted devices, existing filesystem/partition/PV
+// signatures, incomplete or unsafe device ancestry, protected mounts, and mounted
+// child partitions.
 func PreflightDeviceCmd(device string, reservedMounts []string) string {
 	patterns := []string{"/", "/boot", "/boot/efi"}
 	for _, mountPoint := range reservedMounts {
@@ -120,28 +121,124 @@ func PreflightDeviceCmd(device string, reservedMounts []string) string {
 		}
 	}
 	d := shellLiteral(device)
-	return fmt.Sprintf(`# cp-storage-preflight
-device=%s
+	script := `# cp-storage-preflight
+ device=@@DEVICE@@
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
 test -b "$device" || { echo "device is not a block device: $device" >&2; exit 1; }
-dtype=$(lsblk -dn -o TYPE "$device" 2>/dev/null | head -n1)
-{ [ "$dtype" = disk ] || [ "$dtype" = part ]; } || { echo "unsupported device type: $dtype" >&2; exit 1; }
+command -v wipefs >/dev/null 2>&1 || fail 'wipefs is unavailable; cannot inspect device signatures'
+signatures=$(wipefs --noheadings --no-act -o TYPE "$device" 2>/dev/null) || fail 'cannot inspect device signatures'
+[ -z "$signatures" ] || fail "device has existing signatures: $signatures"
+
+nl='
+'
+current="$device"
 root="$device"
-while parent=$(lsblk -dn -o PKNAME "$root" 2>/dev/null | head -n1) && [ -n "$parent" ]; do root="/dev/$parent"; done
-while IFS= read -r mp; do
-  [ -z "$mp" ] && continue
-  case "$mp" in %s) echo "device belongs to protected mount: $mp" >&2; exit 1;; esac
+selected_type=
+seen_ancestry='|'
+depth=0
+while :; do
+  [ "$depth" -lt 32 ] || fail 'device ancestry exceeds the safety depth limit'
+  case "$seen_ancestry" in *"|$current|"*) fail 'device ancestry contains a cycle' ;; esac
+  seen_ancestry="${seen_ancestry}${current}|"
+
+  type_probe=$(lsblk -dn -o TYPE "$current" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
+  type_status=$?
+  [ "$type_status" -eq 0 ] || fail 'cannot inspect device type'
+  type_output=${type_probe%?}
+  case "$type_output" in
+    disk|disk"$nl") node_type=disk ;;
+    part|part"$nl") node_type=part ;;
+    *) fail 'device type probe returned empty, malformed, or ambiguous data' ;;
+  esac
+  if [ "$current" = "$device" ]; then selected_type=$node_type; fi
+
+  parent_probe=$(lsblk -dn -o PKNAME "$current" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
+  parent_status=$?
+  [ "$parent_status" -eq 0 ] || fail 'cannot inspect device parent'
+  parent_output=${parent_probe%?}
+  case "$parent_output" in *"$nl") parent_output=${parent_output%"$nl"} ;; esac
+  case "$parent_output" in *"$nl"*) fail 'device parent probe returned multiple rows' ;; esac
+  case "$parent_output" in *[!A-Za-z0-9_-]*) fail 'device parent probe returned a malformed name' ;; esac
+  parent="$parent_output"
+
+  case "$node_type" in
+    part) [ -n "$parent" ] || fail 'partition parent could not be proven' ;;
+    disk) [ -z "$parent" ] || fail 'disk unexpectedly reports a parent' ;;
+  esac
+  if [ -z "$parent" ]; then
+    [ "$node_type" = disk ] || fail 'device ancestry does not terminate at a disk'
+    root="$current"
+    break
+  fi
+
+  root="/dev/$parent"
+  current="$root"
+  depth=$((depth + 1))
+done
+
+mountpoint_probe=$(lsblk -nr -o MOUNTPOINT "$root" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
+mountpoint_status=$?
+[ "$mountpoint_status" -eq 0 ] || fail 'cannot inspect ancestor mountpoints'
+mountpoints=${mountpoint_probe%?}
+[ -n "$mountpoints" ] || fail 'ancestor mountpoint probe returned no data'
+while IFS= read -r mp || [ -n "$mp" ]; do
+  [ -n "$mp" ] || continue
+  case "$mp" in
+    /*) ;;
+    *) fail 'ancestor mountpoint probe returned malformed data' ;;
+  esac
+  case "$mp" in
+    *[!A-Za-z0-9_./-]*) fail 'ancestor mountpoint probe returned unrepresentable data' ;;
+  esac
+  case "$mp" in @@PROTECTED_PATTERNS@@) echo "device belongs to protected mount: $mp" >&2; exit 1 ;; esac
 done <<EOF
-$(lsblk -nr -o MOUNTPOINT "$root" 2>/dev/null)
+$mountpoints
 EOF
-[ -z "$(findmnt -rn -S "$device" 2>/dev/null)" ] || { echo "device is mounted" >&2; exit 1; }
-if [ "$dtype" = disk ]; then
-  for child in $(lsblk -nr -o NAME "$device" 2>/dev/null); do
-    [ -z "$(findmnt -rn -S "/dev/$child" 2>/dev/null)" ] || { echo "child partition is mounted: /dev/$child" >&2; exit 1; }
-  done
+
+findmnt_probe=$(findmnt -rn -S "$device" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
+findmnt_status=$?
+findmnt_output=${findmnt_probe%?}
+case "$findmnt_status" in
+  0) [ -n "$findmnt_output" ] || fail 'device mount probe returned empty successful data'; fail 'device is mounted' ;;
+  1) [ -z "$findmnt_output" ] || fail 'device mount probe returned data with no-match status' ;;
+  *) fail 'device mount probe failed' ;;
+esac
+
+if [ "$selected_type" = disk ]; then
+  children_probe=$(lsblk -nr -o NAME "$device" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
+  children_status=$?
+  [ "$children_status" -eq 0 ] || fail 'cannot inspect disk child devices'
+  children=${children_probe%?}
+  [ -n "$children" ] || fail 'disk child query returned no names'
+  case "$children" in *"$nl") children=${children%"$nl"} ;; esac
+  [ -n "$children" ] || fail 'disk child query returned no names'
+  seen_children='|'
+  while IFS= read -r child || [ -n "$child" ]; do
+    [ -n "$child" ] || fail 'disk child query returned an empty name'
+    case "$child" in *[!A-Za-z0-9_-]*) fail 'disk child query returned a malformed name' ;; esac
+    case "$seen_children" in *"|$child|"*) fail 'disk child query returned duplicate names' ;; esac
+    seen_children="${seen_children}${child}|"
+
+    child_probe=$(findmnt -rn -S "/dev/$child" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
+    child_status=$?
+    child_output=${child_probe%?}
+    case "$child_status" in
+      0) [ -n "$child_output" ] || fail 'child mount probe returned empty successful data'; echo "child partition is mounted: /dev/$child" >&2; exit 1 ;;
+      1) [ -z "$child_output" ] || fail 'child mount probe returned data with no-match status' ;;
+      *) fail 'child mount probe failed' ;;
+    esac
+  done <<EOF
+$children
+EOF
 fi
-vg=$(pvs --noheadings -o vg_name "$device" 2>/dev/null | tr -d ' ')
-if [ -n "$vg" ]; then echo "device belongs to active volume group: $vg" >&2; exit 1; fi
-echo SAFE`, d, strings.Join(quotedPatterns, "|"))
+
+echo SAFE`
+	script = strings.Replace(script, "device=@@DEVICE@@", "device="+d, 1)
+	return strings.Replace(script, "@@PROTECTED_PATTERNS@@", strings.Join(quotedPatterns, "|"), 1)
 }
 
 // ValidateExportOpts validates the NFS export options string (the part after
@@ -259,18 +356,16 @@ func BaseName(path string) string {
 	return path
 }
 
-// CreateVGSteps builds, per disk: wipefs + pvcreate + vgcreate. Each disk is its
-// own VG so disks of different physical block sizes can coexist (LVM otherwise
-// refuses to mix them in one VG). Each disk is its own step pair so a single
-// disk failure aborts before later disks and the failure names which disk.
-// wipefs first ensures pvcreate does not prompt on stale filesystem signatures.
-// -y -ff on pvcreate bypasses interactive prompts when reusing stale partitions/PVs.
+// CreateVGSteps builds a per-disk pvcreate + vgcreate pair. The caller runs a
+// strict read-only preflight first; these commands deliberately do not use
+// wipefs or LVM force/yes flags, so a signature that appears after preflight
+// still causes pvcreate to refuse initialization.
 func CreateVGSteps(r CreateVGReq) []Step {
 	steps := make([]Step, 0, len(r.Disks)*2)
 	for _, d := range r.Disks {
 		vg := VGNameForDisk(r.VGNamePrefix, d)
 		steps = append(steps,
-			Step{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("wipefs -a %s && pvcreate -y -ff %s", d, d)},
+			Step{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("pvcreate %s", d)},
 			Step{Name: "vgcreate:" + vg, Cmd: fmt.Sprintf("vgcreate %s %s", vg, d)},
 		)
 	}

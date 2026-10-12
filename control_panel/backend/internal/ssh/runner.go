@@ -23,6 +23,43 @@ const keepaliveTimeout = 10 * time.Second
 // keepalive probe; the caller closes the connection and dials a fresh one.
 var errKeepaliveTimeout = errors.New("ssh keepalive timed out")
 
+// maxSSHOutputBytes limits retained output for each SSH stream independently.
+// Writers still consume their full input so remote output is always drained.
+const maxSSHOutputBytes = 1 << 20
+
+const sshOutputTruncatedMarker = "\n[output truncated: exceeded 1 MiB limit]"
+
+type boundedOutput struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func newBoundedOutput() *boundedOutput { return &boundedOutput{} }
+
+func (b *boundedOutput) Write(p []byte) (int, error) {
+	inputLength := len(p)
+	remaining := maxSSHOutputBytes - b.buffer.Len()
+	if remaining > 0 {
+		keep := len(p)
+		if keep > remaining {
+			keep = remaining
+		}
+		_, _ = b.buffer.Write(p[:keep])
+	}
+	if inputLength > remaining {
+		b.truncated = true
+	}
+	return inputLength, nil
+}
+
+func (b *boundedOutput) String() string {
+	output := b.buffer.String()
+	if b.truncated {
+		return output + sshOutputTruncatedMarker
+	}
+	return output
+}
+
 // ping verifies a pooled client is still alive, bounded by keepaliveTimeout
 // (and ctx). On timeout the client is closed, which forces the in-flight
 // SendRequest to return and unblocks its goroutine.
@@ -73,6 +110,10 @@ func (m *Manager) acquire(ctx context.Context, w db.WorkerNode) (*xssh.Client, e
 		pc := pool[len(pool)-1]
 		m.pools[w.ID] = pool[:len(pool)-1]
 		m.mu.Unlock()
+		if !sameConnectionIdentity(pc.worker, w) {
+			pc.client.Close()
+			return m.dial(ctx, w)
+		}
 		// Spec §5: ping before use, evict and rebuild broken connections.
 		// A keepalive global request verifies the underlying connection is
 		// still alive; if it errors (or times out) the connection is dead -
@@ -91,15 +132,32 @@ func (m *Manager) acquire(ctx context.Context, w db.WorkerNode) (*xssh.Client, e
 	return m.dial(ctx, w)
 }
 
-func (m *Manager) release(wID int64, c *xssh.Client) {
+func (m *Manager) release(w db.WorkerNode, c *xssh.Client) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	pool := m.pools[wID]
+	pool := m.pools[w.ID]
 	if len(pool) >= m.poolSize {
 		c.Close()
 		return
 	}
-	m.pools[wID] = append(pool, pooledConn{client: c, releasedAt: time.Now()})
+	m.pools[w.ID] = append(pool, pooledConn{client: c, releasedAt: time.Now(), worker: w})
+}
+
+// sameConnectionIdentity determines whether an idle SSH transport was
+// authenticated for the endpoint and encrypted credentials in the current row.
+// The stored credential values are ciphertext only; plaintext credentials are
+// never retained in the connection pool metadata.
+func sameConnectionIdentity(a, b db.WorkerNode) bool {
+	return a.Host == b.Host && a.Port == b.Port && a.Username == b.Username &&
+		sameEncryptedValue(a.EncPassword, b.EncPassword) &&
+		sameEncryptedValue(a.EncPrivateKey, b.EncPrivateKey)
+}
+
+func sameEncryptedValue(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // Run executes cmd on w and returns stdout, stderr, exit code. It is a
@@ -122,7 +180,7 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 	reuse := false
 	defer func() {
 		if stopped := stop(); reuse && stopped && ctx.Err() == nil {
-			m.release(w.ID, client)
+			m.release(w, client)
 		} else {
 			client.Close()
 		}
@@ -135,9 +193,9 @@ func (m *Manager) RunWithStdin(ctx context.Context, w db.WorkerNode, cmd string,
 		return "", "", -1, fmt.Errorf("ssh session open: %w", err)
 	}
 	defer sess.Close()
-	var outB, errB bytes.Buffer
-	sess.Stdout = &outB
-	sess.Stderr = &errB
+	outB, errB := newBoundedOutput(), newBoundedOutput()
+	sess.Stdout = outB
+	sess.Stderr = errB
 	if stdin != nil {
 		sess.Stdin = stdin
 	}

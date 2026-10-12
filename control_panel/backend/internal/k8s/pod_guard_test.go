@@ -212,3 +212,47 @@ func TestCheckNFSPodUsage_UnknownExportPath_BlocksIfAnyNFSOnWorker(t *testing.T)
 		t.Fatalf("expected blocked when exportPath is unknown and worker has mounts, got inUse=%v", inUse)
 	}
 }
+
+func newCSIPVUsageClient(driver string, attributes map[string]string) *fake.Clientset {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}, Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.10"}}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"}, Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}}}}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-csi"}}
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-csi"}, Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: driver, VolumeHandle: "volume", VolumeAttributes: attributes}}}}
+	return fake.NewSimpleClientset(node, pod, pvc, pv)
+}
+
+func TestCheckNFSPodUsage_KnownNonNFSCSI(t *testing.T) {
+	const driver = "ebs.csi.aws.com"
+	client := newCSIPVUsageClient(driver, nil)
+	inUse, blockers, err := CheckNFSPodUsage(context.Background(), client, "10.0.0.10", "/data/lv", driver)
+	if err != nil || inUse || len(blockers) != 0 {
+		t.Fatalf("allowlisted CSI PV must not block NFS reclaim: inUse=%v blockers=%v err=%v", inUse, blockers, err)
+	}
+}
+
+func TestCheckNFSPodUsage_UnlistedCSI(t *testing.T) {
+	client := newCSIPVUsageClient("ebs.csi.aws.com", nil)
+	if _, _, err := CheckNFSPodUsage(context.Background(), client, "10.0.0.10", "/data/lv"); err == nil {
+		t.Fatal("unlisted CSI PV must fail closed")
+	}
+}
+
+func TestCheckNFSPodUsage_NFSCsiMissingAttributes(t *testing.T) {
+	for _, attributes := range []map[string]string{{"share": "/data/lv"}, {"server": "10.0.0.10"}} {
+		client := newCSIPVUsageClient("nfs.csi.k8s.io", attributes)
+		if _, _, err := CheckNFSPodUsage(context.Background(), client, "10.0.0.10", "/data/lv", "nfs.csi.k8s.io"); err == nil {
+			t.Fatalf("NFS CSI attributes %v must fail closed", attributes)
+		}
+	}
+}
+
+func TestCheckNFSPodUsage_AllowlistedInlineCSI(t *testing.T) {
+	const driver = "ebs.csi.aws.com"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}, Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.10"}}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"}, Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{Driver: driver}}}}}}
+	client := fake.NewSimpleClientset(node, pod)
+	inUse, blockers, err := CheckNFSPodUsage(context.Background(), client, "10.0.0.10", "/data/lv", driver)
+	if err != nil || inUse || len(blockers) != 0 {
+		t.Fatalf("allowlisted inline CSI source must not block NFS reclaim: inUse=%v blockers=%v err=%v", inUse, blockers, err)
+	}
+}

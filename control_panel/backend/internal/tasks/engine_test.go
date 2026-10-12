@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -60,6 +61,161 @@ func TestEngineSubmitAndRun(t *testing.T) {
 	if len(steps) != 2 {
 		t.Fatalf("steps=%d", len(steps))
 	}
+}
+
+type queueGateHandler struct {
+	started  chan struct{}
+	release  <-chan struct{}
+	finished chan struct{}
+}
+
+func (h *queueGateHandler) Run(ctx context.Context, _ *db.Task, r *Reporter) error {
+	select {
+	case h.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-h.release:
+		r.Succeed()
+		h.finished <- struct{}{}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestEngineBoundsPendingTaskQueue(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "bounded-queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	engine := NewEngine(store)
+	release := make(chan struct{})
+	handler := &queueGateHandler{
+		started: make(chan struct{}, 1), release: release,
+		finished: make(chan struct{}, 514),
+	}
+	engine.Register("gate", handler)
+
+	firstID, err := engine.Submit(context.Background(), "gate", "worker", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.started:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("first task did not start")
+	}
+
+	ids := []int64{firstID}
+	for i := 0; i < 512; i++ {
+		id, err := engine.Submit(context.Background(), "gate", "worker", 1, nil)
+		if err != nil {
+			close(release)
+			t.Fatalf("accepted only %d queued tasks: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	_, overflowErr := engine.Submit(context.Background(), "gate", "worker", 1, nil)
+	var queueFull *QueueFullError
+	if !errors.As(overflowErr, &queueFull) {
+		// Release the blocked tasks before failing so the test cannot leak goroutines.
+		close(release)
+		for range ids {
+			select {
+			case <-handler.finished:
+			case <-time.After(5 * time.Second):
+				t.Fatal("accepted task did not finish after release")
+			}
+		}
+		t.Fatalf("overflow submission error=%v, want typed queue-full error", overflowErr)
+	}
+	rows, err := store.ListTasks(context.Background(), 1000)
+	if err != nil {
+		close(release)
+		t.Fatalf("list accepted tasks: %v", err)
+	}
+	if len(rows) != len(ids) {
+		close(release)
+		t.Fatalf("task rows=%d, want %d; rejected submission must not write a row", len(rows), len(ids))
+	}
+	close(release)
+	for range ids {
+		select {
+		case <-handler.finished:
+		case <-time.After(5 * time.Second):
+			t.Fatal("accepted task did not finish after release")
+		}
+	}
+}
+
+func TestEngineQueuedTaskDeadlineIncludesSlotWait(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "queued-timeout.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	engine := NewEngine(store)
+	engine.SetTaskTimeout(5 * time.Second)
+	releaseFirst := make(chan struct{})
+	firstStarted := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(closeRelease)
+	var mu sync.Mutex
+	calls := 0
+	engine.Register("queue-timeout", handlerFunc(func(_ context.Context, _ *db.Task, r *Reporter) error {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if call == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		r.Succeed()
+		return nil
+	}))
+
+	firstID, err := engine.Submit(context.Background(), "queue-timeout", "worker", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		closeRelease()
+		t.Fatal("first task did not start")
+	}
+
+	engine.SetTaskTimeout(100 * time.Millisecond)
+	queuedID, err := engine.Submit(context.Background(), "queue-timeout", "worker", 1, nil)
+	if err != nil {
+		closeRelease()
+		t.Fatal(err)
+	}
+	waitFor(t, engine, queuedID, "failed", 2*time.Second)
+	queued, err := store.GetTask(context.Background(), queuedID)
+	if err != nil {
+		closeRelease()
+		t.Fatal(err)
+	}
+	if queued.Error == nil || !strings.Contains(*queued.Error, "deadline") {
+		closeRelease()
+		t.Fatalf("queued task error=%v, want deadline exceeded", queued.Error)
+	}
+	mu.Lock()
+	if calls != 1 {
+		mu.Unlock()
+		closeRelease()
+		t.Fatalf("handler calls=%d, want only the first task to run", calls)
+	}
+	mu.Unlock()
+
+	closeRelease()
+	waitFor(t, engine, firstID, "succeeded", 2*time.Second)
 }
 
 func TestEngineCompletionHookReceivesTerminalTask(t *testing.T) {

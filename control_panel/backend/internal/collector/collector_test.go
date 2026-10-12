@@ -150,3 +150,127 @@ func TestInventoryRequestsAreDeduplicatedWhileQueuedOrRunning(t *testing.T) {
 		t.Fatalf("request did not finish exactly once: refreshing=%v calls=%d", c.IsInventoryRefreshing(workerID), runner.callCount())
 	}
 }
+
+func TestEnqueueInventoryAfterCurrentCoalescesQueuedRefreshes(t *testing.T) {
+	store, workerID := newTestStore(t)
+	runner := &fakeRunner{out: "###LSBLK###\n"}
+	c := New(store, runner, Config{
+		HeartbeatInterval: time.Hour, InventoryInterval: time.Hour,
+		HeartbeatTimeout: time.Second, InventoryTimeout: time.Second, Concurrency: 1,
+	})
+	if !c.EnqueueInventory(workerID) {
+		t.Fatal("initial inventory should enqueue")
+	}
+	if !c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("first after-current request should schedule a follow-up")
+	}
+	if c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("duplicate after-current request should coalesce")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for c.IsInventoryRefreshing(workerID) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.IsInventoryRefreshing(workerID) {
+		t.Fatal("inventory worker did not finish")
+	}
+	if calls := runner.callCount(); calls != 2 {
+		t.Fatalf("queued refresh plus one coalesced follow-up made %d calls, want 2", calls)
+	}
+}
+
+func TestEnqueueInventoryAfterCurrentCoalescesRunningRefreshes(t *testing.T) {
+	store, workerID := newTestStore(t)
+	block := make(chan struct{})
+	runner := &fakeRunner{blockCh: block, out: "###LSBLK###\n"}
+	c := New(store, runner, Config{
+		HeartbeatInterval: time.Hour, InventoryInterval: time.Hour,
+		HeartbeatTimeout: time.Second, InventoryTimeout: time.Second, Concurrency: 1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	if !c.EnqueueInventory(workerID) {
+		t.Fatal("initial inventory should enqueue")
+	}
+	deadline := time.Now().Add(time.Second)
+	for runner.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if runner.callCount() == 0 {
+		t.Fatal("inventory did not start")
+	}
+	if !c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("first after-current request should schedule a follow-up")
+	}
+	if c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("duplicate after-current request should coalesce")
+	}
+	close(block)
+	deadline = time.Now().Add(2 * time.Second)
+	for (c.IsInventoryRefreshing(workerID) || runner.callCount() < 2) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.IsInventoryRefreshing(workerID) || runner.callCount() != 2 {
+		t.Fatalf("running refresh plus one coalesced follow-up made %d calls; refreshing=%v", runner.callCount(), c.IsInventoryRefreshing(workerID))
+	}
+}
+
+func TestEnqueueAfterCurrentCoalescesWithScheduledFollowup(t *testing.T) {
+	store, workerID := newTestStore(t)
+	c := New(store, &fakeRunner{}, Config{Concurrency: 1})
+	item := job{kind: jobInventory, workerID: workerID}
+	if !c.EnqueueInventory(workerID) {
+		t.Fatal("initial inventory should enqueue")
+	}
+	if !c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("first after-current request should mark the run dirty")
+	}
+	if !c.finish(item) {
+		t.Fatal("finishing the dirty run should schedule a follow-up")
+	}
+	if c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("request should coalesce with the already scheduled follow-up")
+	}
+}
+
+func TestEnqueueInventoryAfterCurrentDefersWhenQueueIsFull(t *testing.T) {
+	store, workerID := newTestStore(t)
+	runner := &fakeRunner{out: "###LSBLK###\n"}
+	c := New(store, runner, Config{Concurrency: 1})
+	for i := 0; i < cap(c.queue); i++ {
+		c.queue <- job{kind: jobKind("noop"), workerID: int64(i + 1)}
+	}
+
+	if !c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("full queue should defer, not drop, the post-operation refresh")
+	}
+	if c.EnqueueInventoryAfterCurrent(workerID) {
+		t.Fatal("duplicate deferred refresh should coalesce")
+	}
+	if !c.IsInventoryRefreshing(workerID) {
+		t.Fatal("deferred refresh should remain visible as refreshing")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for runner.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	for c.IsInventoryRefreshing(workerID) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if calls := runner.callCount(); calls != 1 {
+		t.Fatalf("deferred refresh made %d runner calls, want exactly one", calls)
+	}
+	snapshot, err := store.GetInventorySnapshot(context.Background(), workerID)
+	if err != nil || snapshot == nil || snapshot.CollectedAt == nil {
+		t.Fatalf("deferred refresh did not persist a fresh collection: snapshot=%+v err=%v", snapshot, err)
+	}
+}

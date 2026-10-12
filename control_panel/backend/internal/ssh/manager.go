@@ -21,6 +21,7 @@ import (
 type pooledConn struct {
 	client     *xssh.Client
 	releasedAt time.Time
+	worker     db.WorkerNode
 }
 
 // ErrCredentialsNotConfigured identifies local setup that prevents any probe.

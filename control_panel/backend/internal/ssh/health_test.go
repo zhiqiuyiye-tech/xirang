@@ -172,7 +172,7 @@ func TestRunReplacesStalledPooledConnectionWithinDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.release(w.ID, client)
+	manager.release(w, client)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	out, _, code, err := manager.Run(ctx, w, "true")

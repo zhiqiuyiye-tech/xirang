@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -18,6 +19,49 @@ import (
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
 )
+
+func TestConnectionIdentityDetectsTargetAndCredentialChanges(t *testing.T) {
+	password := "ciphertext-password"
+	privateKey := "ciphertext-key"
+	base := db.WorkerNode{
+		ID: 1, Host: "worker-a", Port: 22, Username: "root",
+		EncPassword: &password, EncPrivateKey: &privateKey,
+	}
+	if !sameConnectionIdentity(base, base) {
+		t.Fatal("unchanged worker identity must reuse a pooled connection")
+	}
+	nameOnly := base
+	nameOnly.Name = "renamed"
+	if !sameConnectionIdentity(base, nameOnly) {
+		t.Fatal("name-only changes must not invalidate SSH connection identity")
+	}
+	for name, changed := range map[string]db.WorkerNode{
+		"host":        func() db.WorkerNode { w := base; w.Host = "worker-b"; return w }(),
+		"port":        func() db.WorkerNode { w := base; w.Port = 2222; return w }(),
+		"username":    func() db.WorkerNode { w := base; w.Username = "ops"; return w }(),
+		"password":    func() db.WorkerNode { v := "new-ciphertext"; w := base; w.EncPassword = &v; return w }(),
+		"private key": func() db.WorkerNode { v := "new-ciphertext"; w := base; w.EncPrivateKey = &v; return w }(),
+	} {
+		if sameConnectionIdentity(base, changed) {
+			t.Errorf("%s change must invalidate a pooled connection", name)
+		}
+	}
+}
+
+func TestBoundedOutputTruncatesAndDrainsExcessBytes(t *testing.T) {
+	output := newBoundedOutput()
+	payload := bytes.Repeat([]byte("x"), maxSSHOutputBytes+128)
+	n, err := output.Write(payload)
+	if err != nil || n != len(payload) {
+		t.Fatalf("Write returned n=%d err=%v, want full stream consumption", n, err)
+	}
+	if output.buffer.Len() != maxSSHOutputBytes {
+		t.Fatalf("buffer length=%d, want cap %d", output.buffer.Len(), maxSSHOutputBytes)
+	}
+	if !strings.Contains(output.String(), "[output truncated") {
+		t.Fatal("truncated output is missing its marker")
+	}
+}
 
 func startTestSSHd(t *testing.T, rootPassword string, responseDelay ...time.Duration) (addr string, testPrivKey string) {
 	t.Helper()

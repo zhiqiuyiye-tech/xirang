@@ -226,17 +226,30 @@
     var routes = {};
     var currentSSE = null;
     var taskPollTimer = null;
+    var taskStatusTimer = null;
     var tasksListTimer = null;
+
+    function clearTaskPollTimer() {
+        if (taskPollTimer !== null) {
+            clearInterval(taskPollTimer);
+            taskPollTimer = null;
+        }
+    }
+
+    function clearTaskStatusTimer() {
+        if (taskStatusTimer !== null) {
+            clearInterval(taskStatusTimer);
+            taskStatusTimer = null;
+        }
+    }
 
     function closeSSE() {
         if (currentSSE) {
             try { currentSSE.close(); } catch (e) {}
             currentSSE = null;
         }
-        if (taskPollTimer) {
-            clearInterval(taskPollTimer);
-            taskPollTimer = null;
-        }
+        clearTaskPollTimer();
+        clearTaskStatusTimer();
     }
 
     function clearTasksListTimer() {
@@ -2131,17 +2144,12 @@
         var addr = info.service_address || '10.0.0.1';
         var ws = info.workspace_uuid || '';
 
-        function renderSQL(u, n, p, a, w) {
-            return "INSERT INTO esx_tai.file_storage (uuid, name, path, service_address, workspace_uuid, type)\n" +
-                "VALUES ('" + u + "', '" + n + "', '" + p + "', '" + a + "', '" + (w || '<workspace_uuid>') + "', 'EnterprtseAllocate');";
-        }
-
         var html = '<div class="modal-overlay" id="plat-modal"><div class="modal" style="max-width: 680px;">' +
             '<h3 class="modal-title">' +
             '<span>平台存储手动录入参考</span>' +
             '<span class="badge badge-primary font-mono">' + esc(name) + '</span>' +
             '</h3>' +
-            '<p class="muted mb-2" style="font-size:12.5px;">该 NFS 共享已由底层系统格式化并持久化导出。由于平台要求在控制台或数据库手动录入，可直接参考以下配置字段或一键复制 SQL 录入：</p>' +
+            '<p class="muted mb-2" style="font-size:12.5px;">该 NFS 共享已由底层系统格式化并持久化导出。平台登记时可参考以下配置字段：</p>' +
             '<div class="card" style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;margin-bottom:12px;">' +
             '<div class="row" style="row-gap:8px;">' +
             '<div class="col"><span class="muted" style="font-size:12px;">存储 UUID:</span><br><code class="font-mono" id="pl-uuid-val">' + esc(uuid) + '</code></div>' +
@@ -2156,48 +2164,13 @@
             '<div class="col"><div class="form-field" style="margin-bottom:0;"><label style="font-size:12px;">所属工作区 UUID (workspace_uuid)</label><input type="text" id="pl-ws-input" value="' + esc(ws) + '" placeholder="如 ws-d8t5nq1uma3bg0ocu5cg" style="padding:4px 8px;font-size:12px;"></div></div>' +
             '</div>' +
             '</div>' +
-            '<div class="form-field"><label>平台注册 SQL 参考语句 (esx_tai.file_storage)</label>' +
-            '<textarea id="pl-sql-box" class="font-mono" readonly style="width:100%;height:85px;font-size:12px;padding:8px;background:#0f172a;color:#f8fafc;border-radius:6px;resize:none;">' + esc(renderSQL(uuid, name, path, addr, ws)) + '</textarea>' +
-            '</div>' +
-            '<div class="row mt-2" style="justify-content: space-between; align-items: center;">' +
-            '<div><span id="pl-copy-msg" class="text-success" style="font-size:13px;font-weight:600;"></span></div>' +
-            '<div style="display:flex;gap:8px;">' +
+            '<div class="row mt-2" style="justify-content: flex-end;">' +
             '<button type="button" class="btn btn-outline" id="pl-cancel">关闭</button>' +
-            '<button type="button" class="btn btn-primary" id="pl-copy-sql">一键复制 SQL</button>' +
-            '</div>' +
             '</div></div></div>';
 
         content.insertAdjacentHTML('beforeend', html);
         var modal = document.getElementById('plat-modal');
         document.getElementById('pl-cancel').addEventListener('click', function () { modal.remove(); });
-        var wsInput = document.getElementById('pl-ws-input');
-        var sqlBox = document.getElementById('pl-sql-box');
-        var copyBtn = document.getElementById('pl-copy-sql');
-        var copyMsg = document.getElementById('pl-copy-msg');
-
-        wsInput.addEventListener('input', function () {
-            sqlBox.value = renderSQL(uuid, name, path, addr, wsInput.value.trim());
-        });
-
-        copyBtn.addEventListener('click', function () {
-            var text = sqlBox.value;
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).then(function () {
-                    copyMsg.textContent = '✓ SQL 已成功复制到剪贴板！';
-                    setTimeout(function () { copyMsg.textContent = ''; }, 3000);
-                }).catch(function () {
-                    sqlBox.select();
-                    document.execCommand('copy');
-                    copyMsg.textContent = '✓ SQL 已成功复制到剪贴板！';
-                    setTimeout(function () { copyMsg.textContent = ''; }, 3000);
-                });
-            } else {
-                sqlBox.select();
-                document.execCommand('copy');
-                copyMsg.textContent = '✓ SQL 已成功复制到剪贴板！';
-                setTimeout(function () { copyMsg.textContent = ''; }, 3000);
-            }
-        });
     }
 
     async function showInitVGForm(content, wid, disks, onDone) {
@@ -2349,6 +2322,19 @@
     });
 
     var stepsData = {};
+    var currentTaskRegistration = null;
+
+    function taskRegistrationForResponse(response) {
+        var details = response && response.registration;
+        if (!details || typeof details !== 'object' || Array.isArray(details)) return null;
+        return {
+            vg_name: typeof details.vg_name === 'string' ? details.vg_name : '',
+            lv_name: typeof details.lv_name === 'string' ? details.lv_name : '',
+            size_gb: Number.isFinite(details.size_gb) ? details.size_gb : 0,
+            fs_type: typeof details.fs_type === 'string' ? details.fs_type : '',
+            mount_point: typeof details.mount_point === 'string' ? details.mount_point : ''
+        };
+    }
 
     function updateSSEBadge(status) {
         var el = document.getElementById('task-sse-badge');
@@ -2369,6 +2355,7 @@
         var id = hash.split('/')[2];
         closeSSE();
         stepsData = {};
+        currentTaskRegistration = null;
 
         content.innerHTML = '<div class="page-header">' +
             '<div>' +
@@ -2397,8 +2384,9 @@
             var result = r.data;
             var task = result.task || result;
             var steps = result.steps || [];
+            currentTaskRegistration = taskRegistrationForResponse(result);
 
-            renderTaskInfo(task);
+            renderTaskInfo(task, currentTaskRegistration);
             steps.forEach(function (s) { upsertStep(s); });
             renderStepsFromCache();
 
@@ -2412,7 +2400,8 @@
         }
     });
 
-    function renderTaskInfo(task) {
+    function renderTaskInfo(task, registration) {
+        if (registration !== undefined) currentTaskRegistration = registration;
         var el = document.getElementById('task-info');
         if (!el) return;
         el.innerHTML = '<div class="row" style="row-gap: 16px;">' +
@@ -2439,7 +2428,7 @@
             '<div class="col"><span class="muted" style="font-size:12px;">结束时间：</span><span class="font-mono" style="font-size:12.5px;">' + esc(fmtTime(task.finished_at)) + '</span></div>' +
             '</div>' +
             (task.error ? '<div class="error-msg mt-2" style="white-space:pre-wrap;font-family:monospace;font-size:12px;max-height:300px;overflow-y:auto;">' + esc(task.error) + '</div>' : '') +
-            (task.type === 'storage_provision_nfs' && task.status === 'succeeded'
+            (task.type === 'storage_provision_nfs' && task.status === 'succeeded' && currentTaskRegistration
                 ? '<div class="mt-2" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;">' +
                   '<div><strong class="text-success">✓ NFS 存储卷供给完成</strong><span class="muted" style="margin-left:8px;font-size:12px;">已完成底层格式化与网络导出，可直接用于平台注册</span></div>' +
                   '<button class="btn btn-sm btn-primary" id="btn-plat-from-task">查看/复制平台注册参数</button>' +
@@ -2454,8 +2443,7 @@
                     var wr = await apiJSON('/workers/' + task.target_id);
                     if (wr.resp.ok && wr.data && wr.data.host) addr = wr.data.host;
                 } catch (e) {}
-                var p = {};
-                try { p = JSON.parse(task.params_json || '{}'); } catch (e) {}
+                var p = currentTaskRegistration || {};
                 showPlatformRegistrationModal(document.getElementById('content'), {
                     name: nfsStorageName(p.lv_name || ('task-' + task.id)),
                     service_address: addr,
@@ -2513,7 +2501,8 @@
             if (r.resp.ok && r.data) {
                 var task = r.data.task || r.data;
                 var steps = r.data.steps || [];
-                renderTaskInfo(task);
+                currentTaskRegistration = taskRegistrationForResponse(r.data);
+                renderTaskInfo(task, currentTaskRegistration);
                 steps.forEach(function (s) { upsertStep(s); });
                 renderStepsFromCache();
                 if (task.status !== 'pending' && task.status !== 'running') {
@@ -2537,6 +2526,7 @@
         currentSSE = es;
 
         es.addEventListener('task', function (e) {
+            if (currentSSE !== es) return;
             try {
                 var task = JSON.parse(e.data);
                 renderTaskInfo(task);
@@ -2549,6 +2539,7 @@
         });
 
         es.addEventListener('step', function (e) {
+            if (currentSSE !== es) return;
             try {
                 var step = JSON.parse(e.data);
                 var seq = step.seq != null ? step.seq : step.Seq;
@@ -2563,14 +2554,25 @@
             } catch (err) {}
         });
 
-        es.onerror = function () {
-            // Keep polling fallback active if SSE is interrupted
+        es.onopen = function () {
+            if (currentSSE !== es) return;
+            clearTaskPollTimer();
+            if (taskStatusTimer === null) {
+                taskStatusTimer = setInterval(function () {
+                    if (currentSSE === es) fetchTaskInfo(taskID);
+                }, 30000);
+            }
         };
 
-        // Fallback polling: guarantees updates even if SSE is interrupted or proxy-buffered
-        taskPollTimer = setInterval(function () {
-            fetchTaskInfo(taskID);
-        }, 2000);
+        es.onerror = function () {
+            if (currentSSE !== es) return;
+            clearTaskStatusTimer();
+            if (taskPollTimer !== null) return;
+            // Keep a fast fallback while the active EventSource is unavailable.
+            taskPollTimer = setInterval(function () {
+                if (currentSSE === es) fetchTaskInfo(taskID);
+            }, 2000);
+        };
     }
 
     // ====================================================================

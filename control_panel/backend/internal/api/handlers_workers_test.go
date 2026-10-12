@@ -24,7 +24,7 @@ import (
 	"xirang/control_panel/internal/workers"
 )
 
-func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.Tokens) {
+func newRouter(t *testing.T, opts ...RouterOption) (*gin.Engine, *workers.Service, *db.Store, *auth.Tokens) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	s, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -40,7 +40,7 @@ func newRouter(t *testing.T) (*gin.Engine, *workers.Service, *db.Store, *auth.To
 	cs := fake.NewSimpleClientset()
 	k8s.RegisterK8sHandlers(eng, cs)
 	storage.RegisterStorageHandlers(eng, sshm, s)
-	router, err := NewRouter(tk, ws, s, eng, cs, sshm)
+	router, err := NewRouter(tk, ws, s, eng, cs, sshm, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

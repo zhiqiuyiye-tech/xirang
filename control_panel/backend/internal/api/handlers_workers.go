@@ -134,7 +134,7 @@ func (h *workerHandlers) changeRootPassword(c *gin.Context) {
 	}
 	taskID, err := h.ws.ChangeRootPassword(c, id, r.Password)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusBadRequest), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "worker.change_root_password", c.Param("id"), "submitted", map[string]any{"task_id": taskID})
@@ -148,7 +148,7 @@ func (h *workerHandlers) installDeps(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	taskID, err := h.eng.Submit(c, "install_deps", "worker", id, map[string]any{"worker_id": id})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "worker.install_deps", c.Param("id"), "submitted", map[string]any{"task_id": taskID})

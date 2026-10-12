@@ -77,17 +77,21 @@ func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Sto
 			o(&cfg)
 		}
 	}
+	recovery := NewNamespaceRecovery(runner, cfg.reservedMounts, cfg.unmountTimeout)
 	deletion := &deleteLVHandler{
 		runner: runner, store: store, reservedMounts: cfg.reservedMounts,
 		podGuardChecker: cfg.podGuardChecker, cleanupAuthorizer: cfg.cleanupAuthorizer,
 		cleanupTimeout: cfg.cleanupTimeout,
-		recovery:       NewNamespaceRecovery(runner, cfg.reservedMounts, cfg.unmountTimeout),
+		recovery:       recovery,
 	}
 	eng.Register("storage_provision_nfs", &provisionHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
 	eng.Register("storage_reclaim_nfs", &reclaimHandler{store: store, reservedMounts: cfg.reservedMounts, delete: deletion})
 	eng.Register("install_deps", &installDepsHandler{runner: runner, store: store})
 	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
-	eng.Register("storage_resize_lv", &resizeLVHandler{runner: runner, store: store})
+	eng.Register("storage_resize_lv", &resizeLVHandler{
+		runner: runner, store: store, reservedMounts: cfg.reservedMounts,
+		podGuardChecker: cfg.podGuardChecker, recovery: recovery,
+	})
 	eng.Register("storage_delete_lv", deletion)
 }
 
@@ -188,15 +192,19 @@ func (h *provisionHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repo
 // failed undo shows as failed), but rollback itself never blocks the failure
 // path - every step is attempted regardless.
 func (h *provisionHandler) rollback(ctx context.Context, w db.WorkerNode, r *tasks.Reporter, req ProvisionReq, done []string) {
+	// A task can expire while queued or executing. Cleanup keeps a separate,
+	// bounded budget while retaining context values and the worker task slot.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
 	rb := RollbackFor(req, done)
 	for _, st := range rb {
 		sh, err := r.Step(st.Name)
 		if err != nil {
 			continue // best-effort: skip steps that can't be recorded
 		}
-		out, stderr, code, _ := h.runner.Run(ctx, w, st.Cmd)
-		if code != 0 {
-			sh.Done("failed", out, stderr, fmt.Sprintf("rollback step %s failed (code=%d): %s", st.Name, code, stderr))
+		out, stderr, code, runErr := h.runner.Run(cleanupCtx, w, st.Cmd)
+		if code != 0 || runErr != nil {
+			sh.Done("failed", out, stderr, fmt.Sprintf("rollback step %s failed (code=%d): %s %v", st.Name, code, stderr, runErr))
 			continue
 		}
 		sh.Done("succeeded", out, stderr, "")
@@ -555,8 +563,94 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 // resizeLVHandler extends (action=grow, default) or reduces (action=shrink) an
 // LV by DeltaGB, using -r so the filesystem is resized in the same operation.
 type resizeLVHandler struct {
-	runner ssh.Runner
-	store  *db.Store
+	runner          ssh.Runner
+	store           *db.Store
+	reservedMounts  []string
+	podGuardChecker PodGuardChecker
+	recovery        *NamespaceRecovery
+}
+
+// checkResizeSafety gathers fresh local and cluster evidence for one LV. It
+// never issues a mutating storage command; callers run it both before and
+// immediately before the existing resize sequence.
+func (h *resizeLVHandler) checkResizeSafety(ctx context.Context, w db.WorkerNode, vgName, lvName string) (DeviceIdentity, error) {
+	var identity DeviceIdentity
+	if h.recovery == nil {
+		return identity, fmt.Errorf("logical volume identity inspector is unavailable")
+	}
+	lvDev := fmt.Sprintf("/dev/%s/%s", vgName, lvName)
+	identity, err := h.recovery.Inspect(ctx, w, lvDev)
+	if err != nil {
+		return DeviceIdentity{}, fmt.Errorf("inspect logical volume identity: %w", err)
+	}
+
+	out, stderr, code, runErr := h.runner.Run(ctx, w, buildLVResizeSafetyCommand(lvDev))
+	if runErr != nil || code != 0 {
+		return DeviceIdentity{}, fmt.Errorf("read-only resize safety probe failed (status=%d): %v %s", code, runErr, strings.TrimSpace(stderr))
+	}
+	state, err := parseLVResizeSafetyState(out)
+	if err != nil {
+		return DeviceIdentity{}, fmt.Errorf("parse resize safety evidence: %w", err)
+	}
+
+	paths := sortedUnique(append(append([]string{}, state.MountTargets...), state.FstabTargets...))
+	if len(paths) == 0 {
+		paths = []string{""} // whole-worker proof when the LV has no known export binding
+	}
+	var podIssues []string
+	if h.podGuardChecker == nil {
+		podIssues = append(podIssues, "Kubernetes pod usage checker is unavailable for LV target paths")
+	} else {
+		for _, target := range paths {
+			inUse, blockers, guardErr := h.podGuardChecker(ctx, w.Host, target)
+			if guardErr != nil {
+				podIssues = append(podIssues, fmt.Sprintf("Pod usage check for %s failed: %v", target, guardErr))
+			}
+			if inUse {
+				detail := strings.Join(blockers, ", ")
+				if detail == "" {
+					detail = "active consumers reported"
+				}
+				podIssues = append(podIssues, fmt.Sprintf("Pod usage check found consumers for %s: %s", target, detail))
+			}
+		}
+	}
+	if len(podIssues) > 0 {
+		return DeviceIdentity{}, fmt.Errorf("resize Pod safety check failed: %s", strings.Join(podIssues, "; "))
+	}
+
+	for _, target := range state.FstabTargets {
+		if err := ValidateMountPoint(target, h.reservedMounts); err != nil {
+			return DeviceIdentity{}, fmt.Errorf("LV fstab target %s is protected: %w", target, err)
+		}
+	}
+	if len(state.MountTargets) > 0 {
+		return DeviceIdentity{}, fmt.Errorf("logical volume is currently mounted at %s", strings.Join(state.MountTargets, ", "))
+	}
+	if state.SwapActive {
+		return DeviceIdentity{}, fmt.Errorf("logical volume is active as swap")
+	}
+	if state.DeviceOpenCount > 0 {
+		return DeviceIdentity{}, fmt.Errorf("logical volume has %d device-mapper opens", state.DeviceOpenCount)
+	}
+	fsOut, fsErrOut, fsCode, fsErr := h.runner.Run(ctx, w, resizeFilesystemCommand(lvDev))
+	if fsErr != nil || fsCode != 0 {
+		return DeviceIdentity{}, fmt.Errorf("cannot confirm filesystem for offline resize (status=%d): %v %s", fsCode, fsErr, strings.TrimSpace(fsErrOut))
+	}
+	switch strings.TrimSpace(fsOut) {
+	case "ext2", "ext3", "ext4":
+	default:
+		return DeviceIdentity{}, fmt.Errorf("filesystem %q does not support this guarded offline resize workflow", strings.TrimSpace(fsOut))
+	}
+
+	verifiedIdentity, err := h.recovery.Inspect(ctx, w, lvDev)
+	if err != nil {
+		return DeviceIdentity{}, fmt.Errorf("re-inspect logical volume identity after safety checks: %w", err)
+	}
+	if verifiedIdentity != identity {
+		return DeviceIdentity{}, fmt.Errorf("logical volume identity changed during resize safety checks")
+	}
+	return verifiedIdentity, nil
 }
 
 func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -571,6 +665,13 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail(fmt.Sprintf("parse params: %v", err))
 		return err
 	}
+	if p.Action == "" {
+		p.Action = "grow"
+	}
+	if p.Action != "grow" && p.Action != "shrink" {
+		r.Fail("action must be grow or shrink")
+		return fmt.Errorf("action must be grow or shrink")
+	}
 	for _, f := range []string{p.VGName, p.LVName} {
 		if err := ValidateName(f); err != nil {
 			r.Fail(fmt.Sprintf("invalid param: %v", err))
@@ -581,26 +682,66 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail("delta_gb must be > 0")
 		return fmt.Errorf("delta_gb must be > 0")
 	}
-	grow := p.Action != "shrink"
+	grow := p.Action == "grow"
 	w, err := h.store.GetWorker(ctx, p.WorkerID)
 	if err != nil {
 		r.Fail(err.Error())
 		return err
 	}
-	for _, s := range ResizeLVSteps(ResizeLVReq{VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB}) {
-		sh, err := r.Step(s.Name)
-		if err != nil {
-			r.Fail(fmt.Sprintf("create step: %v", err))
-			return err
-		}
-		out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
-		if err != nil || code != 0 {
-			sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
-			r.Fail(fmt.Sprintf("resize failed at %s: %s", s.Name, stderr))
-			return fmt.Errorf("resize failed at %s", s.Name)
-		}
-		sh.Done("succeeded", out, stderr, "")
+
+	preflight, err := r.Step("resize_safety_preflight")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
 	}
+	initialIdentity, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName)
+	if err != nil {
+		preflight.Done("failed", "", "", err.Error())
+		r.Fail(fmt.Sprintf("resize safety preflight failed: %v", err))
+		return err
+	}
+	preflight.Done("succeeded", "", "", "logical volume is unused and unprotected")
+
+	recheck, err := r.Step("resize_safety_recheck")
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	recheckedIdentity, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName)
+	if err == nil && recheckedIdentity != initialIdentity {
+		err = fmt.Errorf("logical volume identity changed before resize")
+	}
+	if err != nil {
+		recheck.Done("failed", "", "", err.Error())
+		r.Fail(fmt.Sprintf("resize safety recheck failed: %v", err))
+		return err
+	}
+	recheck.Done("succeeded", "", "", "logical volume identity and safety state are unchanged")
+
+	guardedCmd, err := buildGuardedResizeCommand(
+		ResizeLVReq{VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB},
+		recheckedIdentity, h.reservedMounts,
+	)
+	if err != nil {
+		r.Fail(err.Error())
+		return err
+	}
+	sh, err := r.Step(ResizeLVSteps(ResizeLVReq{VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB})[0].Name)
+	if err != nil {
+		r.Fail(fmt.Sprintf("create step: %v", err))
+		return err
+	}
+	out, stderr, code, runErr := h.runner.Run(ctx, *w, guardedCmd)
+	if runErr != nil || code != 0 {
+		message := fmt.Sprintf("resize failed (code=%d): %s", code, strings.TrimSpace(stderr+"\n"+out))
+		if runErr != nil {
+			message += "; " + runErr.Error()
+		}
+		sh.Done("failed", out, stderr, message)
+		r.Fail(message)
+		return fmt.Errorf("%s", message)
+	}
+	sh.Done("succeeded", out, stderr, "")
 	r.Succeed()
 	return nil
 }

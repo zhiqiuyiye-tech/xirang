@@ -48,6 +48,29 @@ func TestSetWorkerCredentials(t *testing.T) {
 	}
 }
 
+func TestWorkerCredentialFieldUpdatesPreserveOtherCredential(t *testing.T) {
+	s := newStore(t)
+	id, err := s.CreateWorker(context.Background(), WorkerNode{Name: "w", Host: "h", Port: 22, Username: "root", AuthMode: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "encrypted-key"
+	password := "encrypted-password"
+	if err := s.SetWorkerSSHPrivateKey(context.Background(), id, &key); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetWorkerSSHPassword(context.Background(), id, &password); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetWorker(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EncPrivateKey == nil || *got.EncPrivateKey != key || got.EncPassword == nil || *got.EncPassword != password || got.AuthMode != "both" {
+		t.Fatalf("field-specific updates did not preserve both credentials: %+v", got)
+	}
+}
+
 func TestDeleteWorker(t *testing.T) {
 	s := newStore(t)
 	id, _ := s.CreateWorker(context.Background(), WorkerNode{Name: "w", Host: "h", Port: 22, Username: "root", AuthMode: "key"})

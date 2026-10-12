@@ -29,7 +29,10 @@ rotate AES_KEY/JWT (invalidating encrypted worker creds + sessions). lookup
 returns empty during `helm template` and on first install. We use hasKey so a
 Secret that exists but is missing the key falls back to a fresh gen instead of
 rendering an empty string (which would crash the pod on the required-env check).
-Usage: include "control-panel.secretValue" (dict "Release" .Release "key" "AES_KEY" "pinned" .Values.secrets.aesKey "gen" (randBytes 32 | b64enc))
+The helper expects `pinned` and `gen` to be encoded Secret.data values. AES_KEY's
+application environment value is itself base64 text, so its caller base64-encodes
+the pinned value once more; JWT_SECRET and ADMIN_INIT_PASSWORD have their own
+encoding contracts at their call sites.
 */}}
 {{- define "control-panel.secretValue" -}}
 {{- $v := . -}}

@@ -2,6 +2,17 @@ package db
 
 import "testing"
 
+func TestTaskStepsLookupIndexExists(t *testing.T) {
+	store := newStore(t)
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_task_steps_task_seq'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("task_steps lookup index count=%d, want 1", count)
+	}
+}
+
 func TestSQLiteVersionAtLeast(t *testing.T) {
 	cases := []struct {
 		version string

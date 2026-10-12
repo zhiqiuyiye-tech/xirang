@@ -11,12 +11,31 @@ function loadNFSRenderers() {
       renderLVMountedPods: renderLVMountedPods,
       renderPodNFSMountDetails: renderPodNFSMountDetails,
       podNFSMountSummary: podNFSMountSummary,
-      renderPortMappingPodIdentity: typeof renderPortMappingPodIdentity === 'function' ? renderPortMappingPodIdentity : null
+      renderPortMappingPodIdentity: typeof renderPortMappingPodIdentity === 'function' ? renderPortMappingPodIdentity : null,
+      taskRegistrationForResponse: taskRegistrationForResponse,
+      subscribeSSE: subscribeSSE,
+      setAuthenticatedForTest: function (value) { isAuthenticated = value; },
+      taskPollTimerForTest: function () { return taskPollTimer; },
+      taskStatusTimerForTest: function () { return taskStatusTimer; },
+      closeSSEForTest: closeSSE,
+      currentSSEForTest: function () { return currentSSE; },
+      fetchTaskInfoForTest: fetchTaskInfo,
+      setFetchTaskInfoForTest: function (fn) { fetchTaskInfo = fn; },
+      setRenderTaskInfoForTest: function (fn) { renderTaskInfo = fn; },
+      setApiJSONForTest: function (fn) { apiJSON = fn; }
     };
   `;
   const instrumentedSource = appSource.replace(/\}\)\(\);\s*$/, injection + '\n})();');
   assert.notEqual(instrumentedSource, appSource, 'test hook must be inserted into the application closure');
 
+  const eventSources = [];
+  const timers = [];
+  const clearedTimers = [];
+  class FakeEventSource {
+    constructor(url, options) { this.url = url; this.options = options; this.listeners = {}; eventSources.push(this); }
+    addEventListener(name, listener) { this.listeners[name] = listener; }
+    close() { this.closed = true; }
+  }
   const window = {
     location: { search: '', pathname: '/', hash: '' },
     addEventListener() {},
@@ -25,12 +44,124 @@ function loadNFSRenderers() {
     cookie: '',
     title: 'Xirang Control Panel',
     addEventListener() {},
+    getElementById() { return null; },
   };
-  runInNewContext(instrumentedSource, { window, document });
+  runInNewContext(instrumentedSource, {
+    window, document, EventSource: FakeEventSource,
+    setInterval(fn, ms) { const timer = { id: timers.length + 1, fn, ms }; timers.push(timer); return timer.id; },
+    clearInterval(id) { clearedTimers.push(id); },
+  });
+  Object.assign(window.__nfsDisplayTest, { eventSources, timers, clearedTimers });
   return window.__nfsDisplayTest;
 }
 
 const renderers = loadNFSRenderers();
+
+test('task registration response exposes only whitelisted provision fields', () => {
+  const details = renderers.taskRegistrationForResponse({ registration: {
+    vg_name: 'vg_data', lv_name: 'lv_nb_1', size_gb: 200,
+    fs_type: 'xfs', mount_point: '/data02/nb_1', password: 'must-not-pass-through',
+  } });
+  assert.deepEqual(JSON.parse(JSON.stringify(details)), {
+    vg_name: 'vg_data', lv_name: 'lv_nb_1', size_gb: 200,
+    fs_type: 'xfs', mount_point: '/data02/nb_1',
+  });
+  assert.equal(renderers.taskRegistrationForResponse({ task: {} }), null);
+});
+
+test('task detail polling uses fast fallback on errors and slow checks while SSE is open', () => {
+  let statusChecks = 0;
+  renderers.setFetchTaskInfoForTest(() => { statusChecks++; });
+  renderers.setAuthenticatedForTest(true);
+  renderers.subscribeSSE('42');
+  const stream = renderers.eventSources.at(-1);
+  assert.equal(renderers.taskPollTimerForTest(), null);
+  assert.equal(renderers.taskStatusTimerForTest(), null);
+
+  stream.onerror();
+  assert.ok(renderers.taskPollTimerForTest());
+  assert.equal(renderers.timers.at(-1).ms, 2000);
+  const fallbackId = renderers.taskPollTimerForTest();
+
+  stream.onopen();
+  assert.equal(renderers.taskPollTimerForTest(), null);
+  assert.ok(renderers.clearedTimers.includes(fallbackId));
+  const statusTimerId = renderers.taskStatusTimerForTest();
+  assert.ok(statusTimerId);
+  assert.equal(renderers.timers.find((timer) => timer.id === statusTimerId).ms, 30000);
+  renderers.timers.find((timer) => timer.id === statusTimerId).fn();
+  assert.equal(statusChecks, 1);
+
+  stream.onerror();
+  assert.equal(renderers.taskStatusTimerForTest(), null);
+  assert.ok(renderers.clearedTimers.includes(statusTimerId));
+  assert.equal(renderers.timers.at(-1).ms, 2000);
+  stream.onopen();
+  assert.ok(renderers.taskStatusTimerForTest());
+  renderers.closeSSEForTest();
+});
+
+test('periodic status reconciliation detects terminal tasks and clears timers', async () => {
+  renderers.setFetchTaskInfoForTest(renderers.fetchTaskInfoForTest);
+  renderers.setRenderTaskInfoForTest(() => {});
+  let statusFetches = 0;
+  renderers.setApiJSONForTest(async () => {
+    statusFetches++;
+    return { resp: { ok: true }, data: { task: { id: 7, status: 'succeeded' }, steps: [] } };
+  });
+  renderers.setAuthenticatedForTest(true);
+  renderers.subscribeSSE('terminal');
+  const stream = renderers.eventSources.at(-1);
+  stream.onopen();
+  const statusTimerId = renderers.taskStatusTimerForTest();
+
+  await renderers.fetchTaskInfoForTest('terminal');
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(statusFetches, 1);
+  assert.equal(renderers.currentSSEForTest(), null);
+  assert.equal(renderers.taskPollTimerForTest(), null);
+  assert.equal(renderers.taskStatusTimerForTest(), null);
+  assert.ok(renderers.clearedTimers.includes(statusTimerId));
+});
+
+test('stale EventSource callbacks cannot change the current task poller', () => {
+  renderers.setAuthenticatedForTest(true);
+  renderers.subscribeSSE('stale');
+  const staleStream = renderers.eventSources.at(-1);
+  staleStream.onerror();
+
+  renderers.subscribeSSE('current');
+  const currentStream = renderers.eventSources.at(-1);
+  currentStream.onopen();
+  const currentStatusTimerId = renderers.taskStatusTimerForTest();
+  const timerCount = renderers.timers.length;
+
+  staleStream.onopen();
+  staleStream.onerror();
+  assert.equal(renderers.taskPollTimerForTest(), null);
+  assert.equal(renderers.taskStatusTimerForTest(), currentStatusTimerId);
+  assert.equal(renderers.timers.length, timerCount);
+  renderers.closeSSEForTest();
+});
+
+test('route cleanup clears polling and ignores callbacks from closed streams', () => {
+  renderers.setAuthenticatedForTest(true);
+  renderers.subscribeSSE('route-cleanup');
+  const closedStream = renderers.eventSources.at(-1);
+  closedStream.onerror();
+  const fallbackTimerId = renderers.taskPollTimerForTest();
+
+  renderers.closeSSEForTest();
+  closedStream.onopen();
+  closedStream.onerror();
+
+  assert.equal(renderers.taskPollTimerForTest(), null);
+  assert.equal(renderers.taskStatusTimerForTest(), null);
+  assert.ok(renderers.clearedTimers.includes(fallbackTimerId));
+});
 
 function countOccurrences(value, needle) {
   return value.split(needle).length - 1;

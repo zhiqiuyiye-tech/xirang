@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +21,42 @@ type taskHandlers struct {
 	tk                  *auth.Tokens
 	cookieName          string
 	authRecheckInterval time.Duration
+}
+
+func taskSubmitStatus(err error, fallbackStatus int) int {
+	var queueFull *tasks.QueueFullError
+	if errors.As(err, &queueFull) {
+		return http.StatusServiceUnavailable
+	}
+	return fallbackStatus
+}
+
+type taskRegistrationDetails struct {
+	VGName     string `json:"vg_name"`
+	LVName     string `json:"lv_name"`
+	SizeGB     int    `json:"size_gb"`
+	FSType     string `json:"fs_type"`
+	MountPoint string `json:"mount_point"`
+}
+
+func registrationDetailsForTask(task *db.Task) *taskRegistrationDetails {
+	if task == nil || task.Type != "storage_provision_nfs" || task.Status != "succeeded" {
+		return nil
+	}
+	var params struct {
+		VGName     string  `json:"vg_name"`
+		LVName     string  `json:"lv_name"`
+		SizeGB     float64 `json:"size_gb"`
+		FSType     string  `json:"fs_type"`
+		MountPoint string  `json:"mount_point"`
+	}
+	if err := json.Unmarshal([]byte(task.ParamsJSON), &params); err != nil || params.VGName == "" || params.LVName == "" || params.SizeGB <= 0 || params.FSType == "" || params.MountPoint == "" {
+		return nil
+	}
+	return &taskRegistrationDetails{
+		VGName: params.VGName, LVName: params.LVName, SizeGB: int(params.SizeGB),
+		FSType: params.FSType, MountPoint: params.MountPoint,
+	}
 }
 
 func (h *taskHandlers) authSessionValid(ctx context.Context, token string) bool {
@@ -62,7 +100,11 @@ func (h *taskHandlers) get(c *gin.Context) {
 		return
 	}
 	steps, _ := h.store.ListSteps(c, id)
-	c.JSON(http.StatusOK, gin.H{"id": t.ID, "task": t, "steps": steps})
+	response := gin.H{"id": t.ID, "task": t, "steps": steps}
+	if registration := registrationDetailsForTask(t); registration != nil {
+		response["registration"] = registration
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // stream: SSE. Authenticated via HttpOnly Cookie (EventSource default) or

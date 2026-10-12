@@ -15,9 +15,13 @@ import (
 // CheckNFSPodUsage uses fresh reads, including Pending and Terminating pods.
 // Unknown references stop reclamation. Parent hostPath mounts are intentionally
 // left to AuthorizeNamespaceCleanup; directly mounted target/child paths block.
-func CheckNFSPodUsage(ctx context.Context, client kubernetes.Interface, workerHost, exportPath string) (bool, []string, error) {
+func CheckNFSPodUsage(ctx context.Context, client kubernetes.Interface, workerHost, exportPath string, nonNFSDrivers ...string) (bool, []string, error) {
 	if client == nil {
 		return false, nil, fmt.Errorf("kubernetes client is unavailable")
+	}
+	nonNFSCSIDrivers := make(map[string]struct{}, len(nonNFSDrivers))
+	for _, driver := range nonNFSDrivers {
+		nonNFSCSIDrivers[driver] = struct{}{}
 	}
 	nodes, err := loadWorkerNodes(ctx, client, workerHost)
 	if err != nil {
@@ -55,6 +59,18 @@ func CheckNFSPodUsage(ctx context.Context, client kubernetes.Interface, workerHo
 	for _, pod := range pods.Items {
 		podID := pod.Namespace + "/" + pod.Name
 		for _, vol := range pod.Spec.Volumes {
+			// With no proven export path, a device assigned on this worker
+			// cannot be excluded merely because it is not currently open.
+			if target == "" && podUsesRawVolume(pod, vol.Name) {
+				nodeName, known := nodes.aliases[pod.Spec.NodeName]
+				if !known || nodes.targetName == "" {
+					return false, nil, fmt.Errorf("%s: cannot resolve placement of raw block device assignment", podID)
+				}
+				if nodeName == nodes.targetName {
+					blockers = append(blockers, podID+" (raw block device assignment)")
+					break
+				}
+			}
 			source := vol.VolumeSource
 			reason := ""
 			if source.NFS != nil {
@@ -86,6 +102,9 @@ func CheckNFSPodUsage(ctx context.Context, client kubernetes.Interface, workerHo
 				if isNFS {
 					source = corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{Server: srv, Path: p}}
 				} else if pv.Spec.CSI != nil {
+					if _, ok := nonNFSCSIDrivers[pv.Spec.CSI.Driver]; ok {
+						continue
+					}
 					return false, nil, fmt.Errorf("%s: cannot exclude NFS for CSI PV %s", podID, pv.Name)
 				} else if pv.Spec.HostPath != nil {
 					source = corev1.VolumeSource{HostPath: pv.Spec.HostPath}
@@ -100,6 +119,9 @@ func CheckNFSPodUsage(ctx context.Context, client kubernetes.Interface, workerHo
 			}
 			if source.CSI != nil {
 				if source.CSI.Driver != "nfs.csi.k8s.io" {
+					if _, ok := nonNFSCSIDrivers[source.CSI.Driver]; ok {
+						continue
+					}
 					return false, nil, fmt.Errorf("%s: cannot exclude NFS for inline CSI %q", podID, source.CSI.Driver)
 				}
 				source = corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{Server: source.CSI.VolumeAttributes["server"], Path: source.CSI.VolumeAttributes["share"]}}
@@ -221,6 +243,33 @@ func hostPathBlocks(pod corev1.Pod, volumeName, raw, target string, nodes worker
 	}
 	return false, nil
 }
+func podUsesRawVolume(pod corev1.Pod, volumeName string) bool {
+	uses := func(devices []corev1.VolumeDevice) bool {
+		for _, device := range devices {
+			if device.Name == volumeName {
+				return true
+			}
+		}
+		return false
+	}
+	for _, container := range pod.Spec.Containers {
+		if uses(container.VolumeDevices) {
+			return true
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
+		if uses(container.VolumeDevices) {
+			return true
+		}
+	}
+	for _, container := range pod.Spec.EphemeralContainers {
+		if uses(container.VolumeDevices) {
+			return true
+		}
+	}
+	return false
+}
+
 func podVolumeMounts(pod corev1.Pod) []corev1.VolumeMount {
 	var mounts []corev1.VolumeMount
 	for _, c := range pod.Spec.Containers {

@@ -18,6 +18,7 @@ import (
 	"xirang/control_panel/internal/crypto"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/k8s"
+	"xirang/control_panel/internal/retention"
 	"xirang/control_panel/internal/ssh"
 	"xirang/control_panel/internal/storage"
 	"xirang/control_panel/internal/tasks"
@@ -81,13 +82,13 @@ func main() {
 	var podChecker storage.PodGuardChecker
 	if k8sClient != nil {
 		podChecker = func(ctx context.Context, workerHost, exportPath string) (bool, []string, error) {
-			return k8s.CheckNFSPodUsage(ctx, k8sClient, workerHost, exportPath)
+			return k8s.CheckNFSPodUsage(ctx, k8sClient, workerHost, exportPath, cfg.NonNFSCSIDrivers...)
 		}
 	}
 	var namespaceAuthorizer storage.NamespaceCleanupAuthorizer
 	if len(cfg.NamespaceCleanupAllowlist) > 0 && k8sClient != nil {
 		namespaceAuthorizer = func(ctx context.Context, workerHost, exportPath string, holders []storage.NamespaceHolder) error {
-			return k8s.AuthorizeNamespaceCleanup(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist)
+			return k8s.AuthorizeNamespaceCleanup(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist, cfg.NonNFSCSIDrivers...)
 		}
 	}
 	storage.RegisterStorageHandlers(
@@ -99,6 +100,20 @@ func main() {
 
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
+	historyCleaner, err := retention.New(store, db.HistoryRetentionPolicy{
+		TaskRetention: cfg.TaskRetention, AuditRetention: cfg.AuditRetention,
+		BatchSize: cfg.HistoryCleanupBatchSize,
+	}, cfg.HistoryCleanupInterval)
+	if err != nil {
+		log.Fatalf("history cleanup: %v", err)
+	}
+	historyDone := make(chan struct{})
+	go func() {
+		defer close(historyDone)
+		historyCleaner.Run(appCtx)
+	}()
+	// Stop and join cleanup before the deferred Store.Close releases SQLite.
+	defer func() { appCancel(); <-historyDone }()
 	inventoryCollector := collector.New(store, sshm, collector.Config{
 		HeartbeatInterval: cfg.WorkerHeartbeatInterval,
 		InventoryInterval: cfg.StorageRefreshInterval,
@@ -117,7 +132,7 @@ func main() {
 		}
 		if strings.HasPrefix(task.Type, "storage_") || task.Type == "install_deps" {
 			inventoryCollector.EnqueueHeartbeat(task.TargetID)
-			inventoryCollector.EnqueueInventory(task.TargetID)
+			inventoryCollector.EnqueueInventoryAfterCurrent(task.TargetID)
 		}
 	})
 
@@ -139,7 +154,12 @@ func main() {
 		log.Fatalf("router: %v", err)
 	}
 
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: r}
+	srv := &http.Server{
+		Addr: cfg.ListenAddr, Handler: r,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		// Leave WriteTimeout unset so long-lived SSE streams can remain open.
+	}
 	go func() {
 		log.Printf("listening on %s", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

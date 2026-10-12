@@ -102,22 +102,34 @@ func (s *Service) Update(ctx context.Context, id int64, r UpdateReq) error {
 	if err != nil {
 		return err
 	}
+	identityChanged := false
 	if r.Name != "" {
 		w.Name = r.Name
 	}
-	if r.Host != "" {
+	if r.Host != "" && r.Host != w.Host {
 		w.Host = r.Host
+		identityChanged = true
 	}
 	if r.Port != 0 {
 		if err := validatePort(r.Port); err != nil {
 			return err
 		}
-		w.Port = r.Port
+		if r.Port != w.Port {
+			w.Port = r.Port
+			identityChanged = true
+		}
 	}
-	if r.Username != "" {
+	if r.Username != "" && r.Username != w.Username {
 		w.Username = r.Username
+		identityChanged = true
 	}
-	return s.store.UpdateWorker(ctx, *w)
+	if err := s.store.UpdateWorker(ctx, *w); err != nil {
+		return err
+	}
+	if identityChanged {
+		s.sshm.EvictWorker(id)
+	}
+	return nil
 }
 
 func (s *Service) Delete(ctx context.Context, id int64) error {
@@ -152,37 +164,33 @@ func (s *Service) TestConnection(ctx context.Context, id int64) error {
 }
 
 func (s *Service) SetPrivateKey(ctx context.Context, id int64, pem string) error {
-	w, err := s.store.GetWorker(ctx, id)
-	if err != nil {
+	if _, err := s.store.GetWorker(ctx, id); err != nil {
 		return err
 	}
 	enc, err := s.c.Encrypt([]byte(pem))
 	if err != nil {
 		return err
 	}
-	mode := "key"
-	if w.EncPassword != nil {
-		mode = "both"
+	if err := s.store.SetWorkerSSHPrivateKey(ctx, id, &enc); err != nil {
+		return err
 	}
 	s.sshm.EvictWorker(id)
-	return s.store.SetWorkerCredentials(ctx, id, w.EncPassword, &enc, mode)
+	return nil
 }
 
 func (s *Service) SetPanelPassword(ctx context.Context, id int64, password string) error {
-	w, err := s.store.GetWorker(ctx, id)
-	if err != nil {
+	if _, err := s.store.GetWorker(ctx, id); err != nil {
 		return err
 	}
 	enc, err := s.c.Encrypt([]byte(password))
 	if err != nil {
 		return err
 	}
-	mode := "password"
-	if w.EncPrivateKey != nil {
-		mode = "both"
+	if err := s.store.SetWorkerSSHPassword(ctx, id, &enc); err != nil {
+		return err
 	}
 	s.sshm.EvictWorker(id)
-	return s.store.SetWorkerCredentials(ctx, id, &enc, w.EncPrivateKey, mode)
+	return nil
 }
 
 // ChangeRootPassword 提交任务：SSH 到 worker 执行 chpasswd，成功后同步密码入库。
@@ -245,14 +253,11 @@ func (h *rootPasswordHandler) Run(ctx context.Context, task *db.Task, r *tasks.R
 		r.Fail(fmt.Sprintf("encrypt password: %v", err))
 		return err
 	}
-	mode := "password"
-	if w.EncPrivateKey != nil {
-		mode = "both"
-	}
-	if err := h.service.store.SetWorkerCredentials(ctx, w.ID, &enc, w.EncPrivateKey, mode); err != nil {
+	if err := h.service.store.SetWorkerSSHPassword(ctx, w.ID, &enc); err != nil {
 		r.Fail(err.Error())
 		return err
 	}
+	h.service.sshm.EvictWorker(w.ID)
 	r.Succeed()
 	return nil
 }

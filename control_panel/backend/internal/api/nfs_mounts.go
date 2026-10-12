@@ -190,16 +190,7 @@ func queryNFSAssociations(
 		return result
 	}
 
-	pvcs := make(map[string]corev1.PersistentVolumeClaim, len(pvcList.Items))
-	for i := range pvcList.Items {
-		pvc := pvcList.Items[i]
-		pvcs[namespacedKey(pvc.Namespace, pvc.Name)] = pvc
-	}
-	pvs := make(map[string]corev1.PersistentVolume, len(pvList.Items))
-	for i := range pvList.Items {
-		pv := pvList.Items[i]
-		pvs[pv.Name] = pv
-	}
+	pvcs, pvs := indexReferencedClaimsAndVolumes(pods, pvcList.Items, pvList.Items)
 	workersByServer := indexWorkersByServer(workers)
 
 	for i := range pods {

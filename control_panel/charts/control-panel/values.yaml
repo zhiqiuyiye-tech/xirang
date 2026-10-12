@@ -58,6 +58,13 @@ securityContext: {}
 # Application environment configuration
 config:
   requireK8s: true
+  # Only confirmed non-NFS CSI drivers belong in this list; empty keeps classification fail-closed.
+  nonNfsCsiDrivers: []
+  # Finished task history expires; succeeded NFS supply snapshots remain available.
+  taskRetentionDays: 90
+  auditRetentionDays: 365
+  historyCleanupInterval: "1h"
+  historyCleanupBatchSize: 500
   cookieSecure: false  # Required for the current HTTP-only internal deployment
   cookieSameSite: "Strict"
   jwtTTL: "30m"
@@ -86,7 +93,7 @@ persistence:
 
 # Secrets auto-generated on install.
 secrets:
-  aesKey: ""         # leave empty to auto-generate (base64 32-byte)
+  aesKey: ""         # app AES_KEY value: base64 text for 32 raw key bytes
   jwtSecret: ""      # leave empty to auto-generate (base64)
   adminPassword: ""  # leave empty to auto-generate bootstrap/recovery secret
 

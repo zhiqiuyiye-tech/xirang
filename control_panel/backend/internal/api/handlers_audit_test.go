@@ -3,9 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/workers"
 )
@@ -170,5 +174,54 @@ func TestAuditHistoricalParamsAreFiltered(t *testing.T) {
 	}
 	if !strings.Contains(body, `"details"`) || !strings.Contains(body, "31555") || !strings.Contains(body, "notebook-a") {
 		t.Fatalf("safe details missing: %s", body)
+	}
+}
+
+func TestRecordAuditLogsInsertFailureWithoutChangingCompletedResponse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit-failure.db")
+	store, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TRIGGER reject_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT, 'test audit rejection'); END`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	previousWriter := log.Writer()
+	var logOutput bytes.Buffer
+	log.SetOutput(&logOutput)
+	defer log.SetOutput(previousWriter)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/completed", nil)
+	ctx.Status(http.StatusCreated)
+	if _, err := ctx.Writer.WriteString("operation completed"); err != nil {
+		t.Fatal(err)
+	}
+	recordAudit(ctx, store, "storage.operation_completed", "credential-target", "succeeded", map[string]any{
+		"username": "private-user", "password": "never-log-this-password", "private_key": "never-log-this-key",
+	})
+
+	if recorder.Code != http.StatusCreated || recorder.Body.String() != "operation completed" {
+		t.Fatalf("audit failure changed completed response: status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	logged := logOutput.String()
+	if !strings.Contains(logged, "audit insert failed") || !strings.Contains(logged, "storage.operation_completed") {
+		t.Fatalf("audit failure was not logged with its operation: %q", logged)
+	}
+	for _, secret := range []string{"credential-target", "private-user", "never-log-this-password", "never-log-this-key", "test audit rejection"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("audit failure log contains sensitive value %q: %s", secret, logged)
+		}
 	}
 }

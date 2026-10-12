@@ -197,6 +197,34 @@ func TestAuthorizeNamespaceCleanup_FreshIdentityChanges(t *testing.T) {
 	}
 }
 
+func TestAuthorizeNamespaceCleanup_AllowlistedNonNFSCSI(t *testing.T) {
+	client, holders := cleanupFixture()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "csi-app", Namespace: "default"}, Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}}}}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"}, Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-csi"}}
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-csi"}, Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: "ebs.csi.aws.com", VolumeHandle: "volume"}}}}
+	for _, create := range []func() error{
+		func() error {
+			_, err := client.CoreV1().Pods("default").Create(context.Background(), pod, metav1.CreateOptions{})
+			return err
+		},
+		func() error {
+			_, err := client.CoreV1().PersistentVolumeClaims("default").Create(context.Background(), pvc, metav1.CreateOptions{})
+			return err
+		},
+		func() error {
+			_, err := client.CoreV1().PersistentVolumes().Create(context.Background(), pv, metav1.CreateOptions{})
+			return err
+		},
+	} {
+		if err := create(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := AuthorizeNamespaceCleanup(context.Background(), client, "10.0.0.10", "/data/lv", holders, []string{"monitoring/promtail/promtail"}, "ebs.csi.aws.com"); err != nil {
+		t.Fatalf("configured non-NFS CSI PV must not block cleanup authorization: %v", err)
+	}
+}
+
 func TestAuthorizeNamespaceCleanup_QueryFailureAndUnknownWorker(t *testing.T) {
 	c, h := cleanupFixture()
 	for _, host := range []string{"unknown-worker", "10.0.0.99"} {

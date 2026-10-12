@@ -90,7 +90,7 @@ const inventoryCmd = "echo '###VGS###'; vgs --units g --noheadings --nosuffix --
 	"echo '###DF###'; df -B1 -P 2>/dev/null; " +
 	"echo '###NFS###'; (systemctl is-active nfs-server 2>/dev/null || systemctl is-active nfs-kernel-server 2>/dev/null || echo inactive); " +
 	"echo '###EXPORTS###'; (exportfs -v 2>/dev/null || cat /etc/exports 2>/dev/null); " +
-	"echo '###LSBLK###'; lsblk -b -P -n -o NAME,TYPE,SIZE,MOUNTPOINT,FSTYPE,PKNAME 2>/dev/null"
+	"echo '###LSBLK###'; lsblk -b -P -n -o NAME,TYPE,SIZE,MOUNTPOINT,FSTYPE,PKNAME,PTTYPE 2>/dev/null"
 
 // lsblkRow is one parsed lsblk -P line.
 type lsblkRow struct {
@@ -100,6 +100,7 @@ type lsblkRow struct {
 	Mountpoint string
 	Fstype     string
 	Pkname     string
+	Pttype     string
 }
 
 // ListInventory SSHes to the worker once and returns its VGs, LVs (with mount
@@ -437,16 +438,19 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 		}
 	}
 
-	// Safe initialization candidates may be unmounted whole disks or unmounted
-	// partitions. A candidate is rejected if its physical ancestor is a system
-	// disk or reserved disk (/data01), if it is currently mounted, if it has
-	// child devices (partitions), or if it already belongs to an active volume group.
-	// Devices with stale unmounted filesystems or unassigned PVs are valid candidates
-	// because create_vg will wipe them prior to initialization.
+	// Safe initialization candidates are unmounted whole disks or unmounted
+	// partitions with no detectable filesystem, partition, or PV signature. A
+	// candidate is rejected if its physical ancestor is a system or reserved
+	// disk, if it is mounted, if it has child devices, or if it belongs to an
+	// active volume group. Signature-bearing devices require an explicit manual
+	// recovery path instead of automatic wipefs initialization.
 	candidateBytesByDisk := map[string]int64{}
 	unusedMap := map[string]bool{}
 	for _, row := range lsblkRows {
 		if row.Type != "disk" && row.Type != "part" {
+			continue
+		}
+		if row.Fstype != "" || row.Pttype != "" {
 			continue
 		}
 		device := "/dev/" + row.Name
@@ -643,6 +647,8 @@ func parseLSBLKLine(line string) (lsblkRow, bool) {
 			row.Fstype = v
 		case "PKNAME":
 			row.Pkname = v
+		case "PTTYPE":
+			row.Pttype = v
 		}
 	}
 	if row.Name == "" {

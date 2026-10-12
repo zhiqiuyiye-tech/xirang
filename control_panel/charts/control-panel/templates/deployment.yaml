@@ -68,6 +68,16 @@ spec:
               value: ":{{ .Values.service.port }}"
             - name: REQUIRE_K8S
               value: "{{ .Values.config.requireK8s }}"
+            - name: STORAGE_NON_NFS_CSI_DRIVERS
+              value: {{ join "," (.Values.config.nonNfsCsiDrivers | default (list)) | quote }}
+            - name: TASK_RETENTION_DAYS
+              value: {{ .Values.config.taskRetentionDays | quote }}
+            - name: AUDIT_RETENTION_DAYS
+              value: {{ .Values.config.auditRetentionDays | quote }}
+            - name: HISTORY_CLEANUP_INTERVAL
+              value: {{ .Values.config.historyCleanupInterval | quote }}
+            - name: HISTORY_CLEANUP_BATCH_SIZE
+              value: {{ .Values.config.historyCleanupBatchSize | quote }}
             - name: COOKIE_SECURE
               value: "{{ .Values.config.cookieSecure }}"
             - name: COOKIE_SAMESITE

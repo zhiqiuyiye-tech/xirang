@@ -182,18 +182,28 @@ type UpdateServiceReq struct {
 	Ports           []PortSpec
 }
 
-// UpdateServicePorts replaces the port spec of a control-panel managed Service in-place,
-// maintaining optimistic concurrency control via ResourceVersion.
-func UpdateServicePorts(ctx context.Context, client kubernetes.Interface, req UpdateServiceReq) (*corev1.Service, error) {
-	svc, err := client.CoreV1().Services(req.Namespace).Get(ctx, req.Name, metav1.GetOptions{})
+// serviceForPortUpdate verifies that the current Service can be edited and
+// matches the caller's concurrency token before a paired policy is changed.
+func serviceForPortUpdate(ctx context.Context, client kubernetes.Interface, namespace, name, resourceVersion string) (*corev1.Service, error) {
+	svc, err := client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 	if svc.Labels["managed-by"] != "control-panel" {
-		return nil, fmt.Errorf("cannot edit externally managed service %s/%s", req.Namespace, req.Name)
+		return nil, fmt.Errorf("cannot edit externally managed service %s/%s", namespace, name)
 	}
-	if req.ResourceVersion != "" && svc.ResourceVersion != req.ResourceVersion {
-		return nil, fmt.Errorf("conflict: service %s/%s was modified, please refresh", req.Namespace, req.Name)
+	if resourceVersion != "" && svc.ResourceVersion != resourceVersion {
+		return nil, fmt.Errorf("conflict: service %s/%s was modified, please refresh", namespace, name)
+	}
+	return svc, nil
+}
+
+// UpdateServicePorts replaces the port spec of a control-panel managed Service in-place,
+// maintaining optimistic concurrency control via ResourceVersion.
+func UpdateServicePorts(ctx context.Context, client kubernetes.Interface, req UpdateServiceReq) (*corev1.Service, error) {
+	svc, err := serviceForPortUpdate(ctx, client, req.Namespace, req.Name, req.ResourceVersion)
+	if err != nil {
+		return nil, err
 	}
 	ports := make([]corev1.ServicePort, 0, len(req.Ports))
 	for _, p := range req.Ports {

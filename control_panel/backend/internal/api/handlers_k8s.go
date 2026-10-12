@@ -51,7 +51,7 @@ func (h *k8sHandlers) createService(c *gin.Context) {
 	}
 	taskID, err := h.eng.Submit(c, "k8s_create_svc", "k8s", 0, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "k8s.create_service", fmt.Sprint(req["namespace"])+"/"+fmt.Sprint(req["pod_name"]), "submitted", req, map[string]any{"task_id": taskID})
@@ -115,7 +115,7 @@ func (h *k8sHandlers) deleteService(c *gin.Context) {
 	details := map[string]any{"ports": ports, "type": svc.Spec.Type}
 	taskID, err := h.eng.Submit(c, "k8s_delete_svc", "k8s", 0, params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "k8s.delete_service", c.Query("namespace")+"/"+c.Param("name"), "submitted", params, details, map[string]any{"task_id": taskID})
@@ -140,7 +140,7 @@ func (h *k8sHandlers) updateService(c *gin.Context) {
 	}
 	taskID, err := h.eng.Submit(c, "k8s_update_svc", "k8s", 0, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "k8s.update_service", fmt.Sprint(req["namespace"])+"/"+c.Param("name"), "submitted", req, map[string]any{"task_id": taskID})
@@ -163,7 +163,7 @@ func (h *k8sHandlers) createNetworkPolicy(c *gin.Context) {
 	}
 	taskID, err := h.eng.Submit(c, "k8s_create_np", "k8s", 0, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "k8s.create_network_policy", fmt.Sprint(req["namespace"])+"/"+fmt.Sprint(req["name"]), "submitted", req, map[string]any{"task_id": taskID})
@@ -194,16 +194,35 @@ func (h *k8sHandlers) deleteNetworkPolicy(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "k8s client unavailable (non-cluster mode)"})
 		return
 	}
+	namespace, name := c.Query("namespace"), c.Param("name")
+	if namespace == "" || name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "namespace and name required"})
+		return
+	}
+	policy, err := h.client.NetworkingV1().NetworkPolicies(namespace).Get(c, name, metav1.GetOptions{})
+	if err != nil {
+		status := http.StatusBadGateway
+		if apierrors.IsNotFound(err) {
+			status = http.StatusNotFound
+		}
+		if apierrors.IsForbidden(err) {
+			status = http.StatusForbidden
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
 	params := map[string]any{
-		"namespace": c.Query("namespace"),
-		"name":      c.Param("name"),
+		"namespace":        namespace,
+		"name":             name,
+		"uid":              string(policy.UID),
+		"resource_version": policy.ResourceVersion,
 	}
 	taskID, err := h.eng.Submit(c, "k8s_delete_np", "k8s", 0, params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
-	h.audit(c, "k8s.delete_network_policy", c.Query("namespace")+"/"+c.Param("name"), "submitted", params, map[string]any{"task_id": taskID})
+	h.audit(c, "k8s.delete_network_policy", namespace+"/"+name, "submitted", params, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
 }
 

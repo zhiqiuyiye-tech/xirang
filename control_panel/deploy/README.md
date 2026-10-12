@@ -117,10 +117,15 @@ cd control_panel/deploy
 `install.sh` will:
 
 1. Validate that `kubectl` is reachable.
-2. Generate `AES_KEY` (32 random bytes, base64) via `openssl rand 32 | base64`.
+2. Generate the `AES_KEY` environment value (32 random bytes, base64) via
+   `openssl rand 32 | base64`. The installer base64-encodes that text again for
+   Kubernetes `Secret.data`; Kubernetes decodes one layer before injecting the
+   environment variable, and the application decodes the remaining layer.
 3. Generate `JWT_SECRET` (32 random bytes, base64) the same way.
 4. Prompt for the bootstrap/recovery password (min 8 chars, input hidden).
-5. Render the real `secret.yaml` (git-ignored) with the base64-encoded values.
+5. Render the real `secret.yaml` (git-ignored), storing the base64 `AES_KEY`
+   environment value as Kubernetes `Secret.data` (an additional base64 layer).
+   `JWT_SECRET` and `ADMIN_INIT_PASSWORD` are encoded for `Secret.data` once.
 6. `kubectl apply` all manifests (`rbac.yaml`, `pvc.yaml`, `secret.yaml`,
    `deployment.yaml`, `service.yaml`).
 7. Print the NodePort access URL.
@@ -267,15 +272,35 @@ account, audit log, worker registrations, and encrypted per-worker SSH private
 keys) will be lost. Back up `/data/control_panel.db` first if you need to
 preserve it.
 
+## History Retention
+
+Back up SQLite or archive required historical output before upgrading. The
+server cleans old history at startup and every hour, with a 30-second sweep
+budget and separate short transactions. By default, ordinary finished tasks
+and their steps retain 90 days (`finished_at`), while audit events retain 365
+days. Each transaction deletes at most 500 rows from each table. Running,
+pending, unknown-time tasks and successful NFS supply task snapshots are kept;
+old steps of kept NFS supply tasks can expire. This preserves the existing
+registration and task-ID-based reclaim data.
+
+Configure positive values using `TASK_RETENTION_DAYS` (90),
+`AUDIT_RETENTION_DAYS` (365), `HISTORY_CLEANUP_INTERVAL` (`1h`), and
+`HISTORY_CLEANUP_BATCH_SIZE` (500) in the Deployment environment. The cleanup
+interval must be at least `1m` to avoid continuous database contention. Invalid
+values fail startup. The Helm equivalents are `config.taskRetentionDays`,
+`config.auditRetentionDays`, `config.historyCleanupInterval`, and
+`config.historyCleanupBatchSize`. No automatic `VACUUM` is performed; freed
+SQLite pages are reused and the file may not immediately shrink.
+
 ## Security Notes
 
 - **Pod Deployment & Permissions**: The container runs as root by default to ensure complete compatibility with host storage permissions (e.g. `local-path` / `hostPath` volumes owned by root:root) and arbitrary persistent volume mount points. Can be restricted via `securityContext` if desired.
 - **HttpOnly Cookies & CSRF Protection**: Browser sessions authenticate via `HttpOnly` same-origin cookies and double-submit CSRF tokens. Sensitive tokens are never stored in browser `localStorage` or transmitted via URL query parameters.
 - **Session and logout semantics**: sessions use `HttpOnly`, `SameSite=Strict` cookies and a JWT TTL capped at 30 minutes. Key rotation and “退出所有会话” bump `auth_version`; “退出此浏览器” only clears that browser's cookie. Failed signatures use per-source in-memory throttling; there is no persistent global account lock.
-- **Shared identity**: all operators use the same `admin` account and private key. The audit log cannot attribute an action to an individual key holder; rotating the key requires redistributing the replacement file to everyone.
+- **Shared identity (accepted deployment choice)**: all operators use the same `admin` account and private key. The operator confirmed that individual accounts are not required. The audit log cannot reliably attribute an action to a person; rotating the shared key requires redistributing its replacement to all authorized holders.
 - **Secret management**: `AES_KEY`, `JWT_SECRET`, and `ADMIN_INIT_PASSWORD` are delivered via the Kubernetes Secret. Keep `ADMIN_INIT_PASSWORD` as the offline recovery secret even after password login is disabled.
 - **SQLite runtime**: the bundled driver currently reports `3.53.3`; startup rejects SQLite versions older than `3.35.0` because challenge consumption uses `UPDATE ... RETURNING`.
-- **RBAC least privilege**: the control panel's ServiceAccount only manages `services` and `networkpolicies` (full CRUD) and reads `pods` and `nodes` (read-only). It has **no** access to `secrets`, `configmaps`, or `pods/exec`.
+- **Kubernetes management scope (accepted deployment choice)**: the ServiceAccount retains cluster-wide management of `services` and `networkpolicies`, plus read-only Pod/PVC/PV/Node/DaemonSet access. The operator chose not to add a namespace write allowlist. This is resource-type scoping, not namespace isolation. It has no access to `secrets`, `configmaps`, or `pods/exec`. See [the risk decisions and redacted exposure review](../docs/2026-10-11-remaining-risk-decisions.md).
 - **Per-worker SSH credentials**: stored AES-encrypted in SQLite; operators upload credentials through the web UI after first login.
 - **SSH Host Key Policy**: Currently uses `InsecureIgnoreHostKey()` for trusted internal network deployment. In production environments, verify that SSH connections from the control panel Pod to worker nodes route through a dedicated, trusted management network.
 
@@ -293,6 +318,8 @@ preserve it.
 | `services` | `""` (core) | get, list, watch, create, update, delete |
 | `networkpolicies` | `networking.k8s.io` | get, list, watch, create, update, delete |
 | `pods` | `""` (core) | get, list, watch (read-only) |
+| `persistentvolumeclaims`, `persistentvolumes` | `""` (core) | get, list (read-only) |
+| `daemonsets` | `apps` | get (read-only) |
 | `nodes` | `""` (core) | get, list, watch (read-only) |
 
 No `secrets`, `configmaps`, `pods/exec`, or `pods/portforward` permissions are

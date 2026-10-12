@@ -35,6 +35,65 @@ func TestOpenForeignKeysOn(t *testing.T) {
 	}
 }
 
+func TestUpgradeFromV4AddsTaskStepTaskSeqIndex(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v4.db")
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(migration0001); err != nil {
+		rawDB.Close()
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMP NOT NULL)`); err != nil {
+		rawDB.Close()
+		t.Fatal(err)
+	}
+	for _, version := range []int{1, 2, 3, 4} {
+		if _, err := rawDB.Exec("INSERT INTO schema_migrations(version, applied_at) VALUES(?, datetime('now'))", version); err != nil {
+			rawDB.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("upgrade v4 database: %v", err)
+	}
+	defer store.Close()
+
+	rows, err := store.db.Query("PRAGMA index_info(idx_task_steps_task_seq)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var seqno, cid int
+		var name string
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			t.Fatal(err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) != 2 || columns[0] != "task_id" || columns[1] != "seq" {
+		t.Fatalf("index columns=%v, want [task_id seq]", columns)
+	}
+	var applied int
+	if err := store.db.QueryRow("SELECT COUNT(1) FROM schema_migrations WHERE version=5").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("v5 migration record count=%d, want 1", applied)
+	}
+}
+
 func TestUpgradeFromV1Database(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "v1.db")
 	rawDB, err := sql.Open("sqlite", dbPath)

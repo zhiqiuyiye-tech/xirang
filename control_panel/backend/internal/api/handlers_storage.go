@@ -23,6 +23,8 @@ type storageCollector interface {
 	IsInventoryRefreshing(workerID int64) bool
 }
 
+const storageVGRequestTimeout = 30 * time.Second
+
 // storageHandlers exposes the storage API endpoints backed by the task engine,
 // SQLite snapshot storage, and background collector.
 type storageHandlers struct {
@@ -46,7 +48,7 @@ func (h *storageHandlers) provision(c *gin.Context) {
 	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_provision_nfs", "storage", wid, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "storage.provision_nfs", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
@@ -90,7 +92,7 @@ func (h *storageHandlers) reclaim(c *gin.Context) {
 	}
 	taskID, err := h.eng.Submit(c, "storage_reclaim_nfs", "storage", wid, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "storage.reclaim_nfs", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
@@ -129,7 +131,9 @@ func (h *storageHandlers) listVgs(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "worker not found"})
 		return
 	}
-	vgs, err := storage.ListVGs(c, h.runner, *w)
+	vgsCtx, cancel := context.WithTimeout(c.Request.Context(), storageVGRequestTimeout)
+	defer cancel()
+	vgs, err := storage.ListVGs(vgsCtx, h.runner, *w)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -158,7 +162,7 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 		snapshot = nil
 		if h.collector != nil && !refreshing {
 			h.collector.EnqueueInventory(wid)
-			refreshing = true
+			refreshing = h.collector.IsInventoryRefreshing(wid)
 		}
 	}
 
@@ -196,6 +200,7 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 			PhysicalDisks: []storage.PhysicalDiskInfo{}, UnusedDisks: []storage.DiskInfo{},
 		}
 		enriched := inventoryResponseWithMounts(emptyInventory, state)
+		refreshing = h.collector != nil && h.collector.IsInventoryRefreshing(wid)
 		response := gin.H{
 			"vgs": enriched.VGs, "lvs": enriched.LVs,
 			"physical_disks": enriched.PhysicalDisks, "unused_disks": enriched.UnusedDisks,
@@ -215,7 +220,7 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 	stale := snapshot.CollectedAt == nil || (h.staleAfter > 0 && time.Since(*snapshot.CollectedAt) > h.staleAfter)
 	if stale && !refreshing && h.collector != nil {
 		h.collector.EnqueueInventory(wid)
-		refreshing = true
+		refreshing = h.collector.IsInventoryRefreshing(wid)
 	}
 
 	var inv storage.InventoryInfo
@@ -239,6 +244,7 @@ func (h *storageHandlers) listInventory(c *gin.Context) {
 	}
 
 	enriched := inventoryResponseWithMounts(inv, state)
+	refreshing = h.collector != nil && h.collector.IsInventoryRefreshing(wid)
 	response := gin.H{
 		"vgs": enriched.VGs, "lvs": enriched.LVs,
 		"physical_disks": enriched.PhysicalDisks, "unused_disks": enriched.UnusedDisks,
@@ -276,16 +282,14 @@ func (h *storageHandlers) listNFSHosts(c *gin.Context) {
 	if snapshotsErr != nil {
 		preflightErrorCode = "inventory_snapshot_list_failed"
 	}
-	associations := queryNFSAssociations(c, h.client, h.store, workers, parseNFSWorkerInventories(snapshots), h.staleAfter, preflightErrorCode)
+	parsedInventories := parseNFSWorkerInventories(snapshots)
+	associations := queryNFSAssociations(c, h.client, h.store, workers, parsedInventories, h.staleAfter, preflightErrorCode)
 
 	results := make([]map[string]any, 0, len(workers))
 	for _, w := range workers {
 		refreshing := h.collector != nil && h.collector.IsInventoryRefreshing(w.ID)
 		snap, hasSnap := snapMap[w.ID]
-		var inv storage.InventoryInfo
-		if hasSnap && snap.PayloadJSON != "" {
-			_ = json.Unmarshal([]byte(snap.PayloadJSON), &inv)
-		}
+		inv := parsedInventories[w.ID].inventory
 		if inv.PhysicalDisks == nil {
 			inv.PhysicalDisks = []storage.PhysicalDiskInfo{}
 		}
@@ -359,7 +363,7 @@ func (h *storageHandlers) listNFSHosts(c *gin.Context) {
 
 // refresh: POST /api/v1/storage/refresh
 // Body: {worker_id?: int64}. Schedules an immediate background inventory probe
-// for one worker or all workers and responds 202.
+// for one worker or all workers and responds 202 when work is queued or active.
 func (h *storageHandlers) refresh(c *gin.Context) {
 	var req map[string]any
 	_ = c.ShouldBindJSON(&req)
@@ -376,16 +380,38 @@ func (h *storageHandlers) refresh(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "worker not found"})
 			return
 		}
-		if h.collector != nil {
-			h.collector.EnqueueInventory(wid)
+		if h.collector == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inventory refresh could not be queued"})
+			return
+		}
+		queued := h.collector.EnqueueInventory(wid)
+		if !queued && !h.collector.IsInventoryRefreshing(wid) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inventory refresh could not be queued"})
+			return
 		}
 		c.JSON(http.StatusAccepted, gin.H{"refreshing": true, "worker_id": wid})
 		return
 	}
 
-	count := 0
-	if h.collector != nil {
-		count, _ = h.collector.EnqueueAllInventory(c)
+	if h.collector == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inventory refresh could not be queued"})
+		return
+	}
+	count, _ := h.collector.EnqueueAllInventory(c)
+	if count == 0 {
+		workers, err := h.store.ListWorkers(c)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "inventory refresh could not be scheduled"})
+			return
+		}
+		for _, worker := range workers {
+			if h.collector.IsInventoryRefreshing(worker.ID) {
+				c.JSON(http.StatusAccepted, gin.H{"refreshing": true, "count": count})
+				return
+			}
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inventory refresh could not be queued"})
+		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"refreshing": true, "count": count})
 }
@@ -402,7 +428,7 @@ func (h *storageHandlers) createVG(c *gin.Context) {
 	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_create_vg", "storage", wid, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "storage.create_vg", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
@@ -421,7 +447,7 @@ func (h *storageHandlers) resizeLV(c *gin.Context) {
 	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_resize_lv", "storage", wid, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "storage.resize_lv", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
@@ -440,7 +466,7 @@ func (h *storageHandlers) deleteLV(c *gin.Context) {
 	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_delete_lv", "storage", wid, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(taskSubmitStatus(err, http.StatusInternalServerError), gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "storage.delete_lv", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})

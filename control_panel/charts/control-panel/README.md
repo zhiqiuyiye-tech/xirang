@@ -67,10 +67,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.12.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.13.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.12`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.13`.
 
 ## Install
 
@@ -287,6 +287,45 @@ with NPU IDs 0–7 and Phy-IDs 0–15 has eight physical cards and sixteen devic
 The worker's used / total ratio now compares Kubernetes allocated devices with
 Kubernetes allocatable devices. Notebook counts use the same device unit.
 
+## Administrator and Kubernetes Management Scope
+
+The deployment owner explicitly chose to retain one shared `admin` account/key
+and the current cross-namespace Service/NetworkPolicy management permissions.
+Audits cannot reliably identify an individual key holder, and the ClusterRole
+is not a namespace isolation boundary. Existing protected-namespace, object
+identity and destructive-operation checks remain. No personal-account model,
+namespace write allowlist, Secret access or Pod exec access is added. See the
+[risk decisions and redacted credential review](../../docs/2026-10-11-remaining-risk-decisions.md)
+for the confirmed limitations and local scan coverage.
+
+## History Retention
+
+Before upgrading, back up the SQLite database if historical task output or audits
+must be archived. Cleanup runs at startup and every hour by default. Ordinary
+terminal tasks (`succeeded`, `failed`, `cancelled`) expire 90 days after
+`finished_at`; audits expire 365 days after their event time. Running/pending
+and other nonterminal tasks, missing or unrecognized finish timestamps, and
+records exactly at the cutoff are retained.
+
+All successful `storage_provision_nfs` task rows and their registration/reclaim
+parameters are retained as resource snapshots, even after their old step logs
+expire. This deliberately retains snapshots whose resource lifetime is not yet
+tracked separately; it keeps existing task-ID-based NFS registration/reclaim
+working. It is not an archive of all historical command output.
+
+Each transaction deletes at most 500 rows per table by default. Old steps are
+removed first; an ordinary task is deleted only after it has no remaining steps,
+so foreign-key cascades cannot silently remove an unlimited step set. Sweeps
+are limited to 30 seconds; a backlog continues on the next scheduled sweep.
+Failed batches roll back, and cleanup stops before SQLite is closed on shutdown.
+The database reuses freed pages; this cleanup does not run `VACUUM` or promise
+an immediate reduction of the database file size.
+
+The four settings below map to `TASK_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS`,
+`HISTORY_CLEANUP_INTERVAL`, and `HISTORY_CLEANUP_BATCH_SIZE`. All must be positive;
+the cleanup interval must be at least `1m` to prevent continuous sweeps. Invalid
+values fail startup rather than silently disabling cleanup.
+
 ## Configuration Reference
 
 | Key | Default | Description |
@@ -300,6 +339,11 @@ Kubernetes allocatable devices. Notebook counts use the same device unit.
 | `service.nodePort` | `30180` | NodePort (when type is NodePort) |
 | `ingress.enabled` | `false` | Enable Ingress resource |
 | `config.requireK8s` | `true` | Fail fast on pod start if k8s client fails |
+| `config.nonNfsCsiDrivers` | `[]` | Exact names of confirmed non-NFS CSI drivers; empty preserves fail-closed behavior, and unlisted CSI drivers still block NFS reclaim |
+| `config.taskRetentionDays` | `90` | Age of terminal task history/step logs measured from finish time; successful NFS supply snapshot rows remain |
+| `config.auditRetentionDays` | `365` | Age of audit events before history cleanup |
+| `config.historyCleanupInterval` | `1h` | Interval between bounded cleanup sweeps; startup also performs a sweep |
+| `config.historyCleanupBatchSize` | `500` | Maximum deleted rows per table and transaction |
 | `config.cookieSecure` | `false` | Session cookies cannot use `Secure` in the required HTTP deployment |
 | `config.cookieSameSite` | `Strict` | Required SameSite policy for the shared admin session |
 | `config.jwtTTL` | `30m` | Session lifetime; values over 30 minutes fail startup |
@@ -315,6 +359,6 @@ Kubernetes allocatable devices. Notebook counts use the same device unit.
 | `securityContext` | `{}` | Container security context |
 | `persistence.enabled` | `true` | PVC for SQLite database |
 | `persistence.storageClassName` | `"local-path"` | StorageClass (must be block or local) |
-| `secrets.aesKey` | `""` (auto) | Pin AES_KEY (base64 32-byte) |
+| `secrets.aesKey` | `""` (auto) | Pin the AES_KEY environment value (base64 text for 32 raw key bytes); the chart encodes the Kubernetes Secret data layer |
 | `secrets.jwtSecret` | `""` (auto) | Pin JWT_SECRET (base64) |
 | `secrets.adminPassword` | `""` (auto) | Pin bootstrap/recovery secret |

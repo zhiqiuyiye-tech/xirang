@@ -153,11 +153,6 @@ sudo lvremove /dev/vg_data/lv_notebook_500g
 找到带有 `lv_notebook_200g` 和 `lv_notebook_500g` 的那两行，**把它们删掉**。
 
 
-添加nfs到集群
+添加NFS到集群
 
-mysql -u root -p -h 172.16.88.7 -P 6301                    Aba98b87@vq
-
-```bash
-INSERT INTO esx_tai.file_storage (uuid, name, path, service_address, workspace_uuid, type)
-Values('cof540cd-eb8b-4619-Bad2-82b0eBe4532g', 'jxsr-nfs-200g', '/data02/notebook_a_200g', '10.37.1.45', 'ws-d8t5nq1uma3bg0ocu5cg', 'EnterprtseAllocate');
-```
+登记 NFS 存储时，请通过获批的集群管理界面或内部运维流程操作，并按申请填写存储标识、名称、导出路径、服务地址、工作空间和存储类型。数据库连接参数或直接连接命令请填写为：[数据库连接信息占位符]；实际凭据和连接目标仅通过授权的受控配置或密钥管理渠道获取，不在本文档中记录。

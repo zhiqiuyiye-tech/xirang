@@ -163,6 +163,278 @@ func TestProvisionHandlerRejectsBadSize(t *testing.T) {
 	}
 }
 
+func TestResizeLVHandlerRejectsUnknownActionBeforeSSH(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	runner := newScriptRunner()
+	RegisterStorageHandlers(eng, runner, store)
+	wid, err := store.CreateWorker(context.Background(), db.WorkerNode{Name: "w", Host: "127.0.0.1", Port: 22, Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := eng.Submit(context.Background(), "storage_resize_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_data", "action": "shrik", "delta_gb": 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, store, id, "failed", 2*time.Second)
+	if len(runner.calls) != 0 {
+		t.Fatalf("invalid action must not run an SSH command: %v", runner.calls)
+	}
+}
+
+type resizeSafetyTaskResult struct {
+	status    string
+	taskError string
+	runner    *scriptRunner
+}
+
+func runResizeSafetyTask(t *testing.T, action string, safetyResults, identityResults []scriptResult, reserved []string, checker PodGuardChecker, filesystem ...string) resizeSafetyTaskResult {
+	t.Helper()
+	store, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	eng := tasks.NewEngine(store)
+	runner := newScriptRunner()
+	fsType := "ext4"
+	if len(filesystem) > 0 {
+		fsType = filesystem[0]
+	}
+	runner.add("cp-storage-resize-filesystem", scriptResult{stdout: fsType})
+	runner.add("device='/dev/vg_data/lv_data'", safetyResults...)
+	if identityResults != nil {
+		runner.add("cp-storage-namespace-inspect", identityResults...)
+	}
+	opts := make([]any, 0, 2)
+	if len(reserved) > 0 {
+		opts = append(opts, WithReservedMounts(reserved...))
+	}
+	if checker != nil {
+		opts = append(opts, WithPodGuardChecker(checker))
+	}
+	RegisterStorageHandlers(eng, runner, store, opts...)
+	wid, err := store.CreateWorker(context.Background(), db.WorkerNode{
+		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := eng.Submit(context.Background(), "storage_resize_lv", "storage", wid, map[string]any{
+		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_data", "action": action, "delta_gb": 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var got *db.Task
+	for time.Now().Before(deadline) {
+		got, err = store.GetTask(context.Background(), id)
+		if err == nil && (got.Status == "succeeded" || got.Status == "failed") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got == nil || (got.Status != "succeeded" && got.Status != "failed") {
+		t.Fatalf("resize task %d never reached a terminal state", id)
+	}
+	taskError := ""
+	if got.Error != nil {
+		taskError = *got.Error
+	}
+	return resizeSafetyTaskResult{status: got.Status, taskError: taskError, runner: runner}
+}
+
+func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
+	identity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
+	changedIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"replacement-uuid","major_minor":"253:1"}}`}
+	tests := []struct {
+		name              string
+		safety            []scriptResult
+		identities        []scriptResult
+		reserved          []string
+		podMode           string
+		wantProbeCount    int
+		wantIdentityCount int
+		wantPodCount      int
+	}{
+		{
+			name:    "mounted data LV",
+			safety:  []scriptResult{{stdout: `{"mount_targets":["/data02/live"],"fstab_targets":[],"swap_active":false,"device_open_count":0}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "protected OS fstab target",
+			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/etc/storage"],"swap_active":false,"device_open_count":0}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "default reserved fstab target",
+			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data01/archive"],"swap_active":false,"device_open_count":0}`}},
+			podMode: "unused",
+		},
+		{
+			name:     "custom reserved fstab target",
+			safety:   []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/custom/protected/archive"],"swap_active":false,"device_open_count":0}`}},
+			reserved: []string{"/custom/protected"},
+			podMode:  "unused",
+		},
+		{
+			name:    "active swap",
+			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":[],"swap_active":true,"device_open_count":0}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "open device",
+			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":[],"swap_active":false,"device_open_count":1}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "Pod in use",
+			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`}},
+			podMode: "in-use",
+		},
+		{
+			name:    "Pod guard error",
+			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`}},
+			podMode: "error",
+		},
+		{
+			name:   "Pod guard unavailable for target path",
+			safety: []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`}},
+		},
+		{
+			name:   "safety probe error",
+			safety: []scriptResult{{stderr: "probe failed", exitCode: 1}},
+		},
+		{
+			name:   "safety probe transport error",
+			safety: []scriptResult{{runErr: context.Canceled}},
+		},
+		{
+			name:   "malformed safety evidence",
+			safety: []scriptResult{{stdout: `{not-json}`}},
+		},
+		{
+			name:              "identity replaced during recheck probe",
+			podMode:           "unused",
+			safety:            []scriptResult{{stdout: unusedLVResizeState}, {stdout: unusedLVResizeState}},
+			identities:        []scriptResult{identity, identity, identity, changedIdentity},
+			wantIdentityCount: 4,
+		},
+		{
+			name: "identity replaced during recheck Pod callback",
+			safety: []scriptResult{
+				{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`},
+				{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`},
+			},
+			identities:        []scriptResult{identity, identity, identity, changedIdentity},
+			podMode:           "unused",
+			wantIdentityCount: 4,
+			wantPodCount:      2,
+		},
+		{
+			name:           "state becomes mounted during recheck",
+			safety:         []scriptResult{{stdout: unusedLVResizeState}, {stdout: `{"mount_targets":["/data02/new"],"fstab_targets":[],"swap_active":false,"device_open_count":0}`}},
+			identities:     []scriptResult{identity, identity},
+			podMode:        "unused",
+			wantProbeCount: 2,
+		},
+		{
+			name: "Pod becomes in use during recheck",
+			safety: []scriptResult{
+				{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`},
+				{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`},
+			},
+			identities:     []scriptResult{identity, identity},
+			podMode:        "in-use-on-recheck",
+			wantProbeCount: 2,
+		},
+	}
+	for _, tc := range tests {
+		for _, action := range []string{"grow", "shrink"} {
+			t.Run(tc.name+"/"+action, func(t *testing.T) {
+				var podPaths []string
+				podCalls := 0
+				var checker PodGuardChecker
+				if tc.podMode != "" {
+					checker = func(_ context.Context, _, exportPath string) (bool, []string, error) {
+						podCalls++
+						podPaths = append(podPaths, exportPath)
+						switch tc.podMode {
+						case "in-use":
+							return true, []string{"default/business"}, nil
+						case "in-use-on-recheck":
+							return podCalls > 1, []string{"default/business"}, nil
+						case "error":
+							return false, nil, context.Canceled
+						default:
+							return false, nil, nil
+						}
+					}
+				}
+				result := runResizeSafetyTask(t, action, tc.safety, tc.identities, tc.reserved, checker)
+				if result.status != "failed" {
+					t.Fatalf("unsafe resize status=%q, want failed; commands=%v", result.status, result.runner.calls)
+				}
+				for _, command := range result.runner.calls {
+					if strings.Contains(command, "lvextend -r -L ") || strings.Contains(command, "lvreduce -y -r -L ") {
+						t.Fatalf("rejected resize issued mutation %q; commands=%v", command, result.runner.calls)
+					}
+				}
+				if tc.wantProbeCount > 0 && result.runner.counts["device='/dev/vg_data/lv_data'"] != tc.wantProbeCount {
+					t.Fatalf("safety probe count=%d, want %d", result.runner.counts["device='/dev/vg_data/lv_data'"], tc.wantProbeCount)
+				}
+				if tc.name == "mounted data LV" && (len(podPaths) != 1 || podPaths[0] != "/data02/live") {
+					t.Fatalf("mounted path Pod guard calls=%v, want [/data02/live]", podPaths)
+				}
+				if tc.name == "protected OS fstab target" && (!strings.Contains(result.taskError, "protected system path") || !strings.Contains(result.taskError, `"/etc"`)) {
+					t.Fatalf("protected fstab path failed for an unexpected reason: %q", result.taskError)
+				}
+				if tc.wantIdentityCount > 0 && result.runner.counts["cp-storage-namespace-inspect"] != tc.wantIdentityCount {
+					t.Fatalf("identity inspections=%d, want %d", result.runner.counts["cp-storage-namespace-inspect"], tc.wantIdentityCount)
+				}
+				if tc.wantPodCount > 0 && len(podPaths) != tc.wantPodCount {
+					t.Fatalf("Pod guard calls=%d, want %d (paths=%v)", len(podPaths), tc.wantPodCount, podPaths)
+				}
+			})
+		}
+	}
+}
+
+func TestResizeLVHandlerAllowsUnusedLV(t *testing.T) {
+	identity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
+	for _, action := range []string{"grow", "shrink"} {
+		t.Run(action, func(t *testing.T) {
+			result := runResizeSafetyTask(t, action,
+				[]scriptResult{{stdout: unusedLVResizeState}, {stdout: unusedLVResizeState}},
+				[]scriptResult{identity, identity}, nil, noPodUsers)
+			if result.status != "succeeded" {
+				t.Fatalf("safe resize status=%q, want succeeded; commands=%v", result.status, result.runner.calls)
+			}
+			want := "lvextend -r -L +10G /dev/vg_data/lv_data"
+			if action == "shrink" {
+				want = "lvreduce -y -r -L -10G /dev/vg_data/lv_data"
+			}
+			if !strings.Contains(strings.Join(result.runner.calls, "\n"), want) || !strings.Contains(strings.Join(result.runner.calls, "\n"), "# cp-storage-safe-resize") {
+				t.Fatalf("safe resize did not run guarded %q; commands=%v", want, result.runner.calls)
+			}
+			if result.runner.counts["device='/dev/vg_data/lv_data'"] != 3 {
+				t.Fatalf("safe resize probe count=%d, want 3", result.runner.counts["device='/dev/vg_data/lv_data'"])
+			}
+			if result.runner.counts["cp-storage-namespace-inspect"] != 4 {
+				t.Fatalf("safe resize probe identity inspection count=%d, want 4", result.runner.counts["cp-storage-namespace-inspect"])
+			}
+		})
+	}
+}
+
 func waitFor(t *testing.T, store *db.Store, id int64, want string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -182,6 +454,7 @@ type scriptResult struct {
 	stdout   string
 	stderr   string
 	exitCode int
+	runErr   error
 }
 
 // scriptRunner implements ssh.Runner by matching command substrings to a list
@@ -213,7 +486,7 @@ func (s *scriptRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (stri
 			}
 			s.counts[sub]++
 			r := results[idx]
-			return r.stdout, r.stderr, r.exitCode, nil
+			return r.stdout, r.stderr, r.exitCode, r.runErr
 		}
 	}
 	if strings.Contains(cmd, "$(id -u)") {

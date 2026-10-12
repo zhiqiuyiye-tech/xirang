@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"xirang/control_panel/internal/db"
 	"xirang/control_panel/internal/workers"
 )
@@ -218,7 +220,7 @@ func itoa(n int64) string {
 }
 
 func TestStorageEndpointsUseCachedSnapshotsAndRefresh(t *testing.T) {
-	r, ws, store, tk := newRouter(t)
+	r, ws, store, tk := newRouter(t, WithCollector(&storageCollectorStub{enqueueResult: true}))
 	wid, err := ws.Create(context.Background(), workers.CreateReq{Name: "w1", Host: "127.0.0.1", Port: 22, Username: "root"})
 	if err != nil {
 		t.Fatal(err)
@@ -431,5 +433,150 @@ func TestStorageEndpointsRequireAuth(t *testing.T) {
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s: code=%d, want 401", e.method, e.path, w.Code)
 		}
+	}
+}
+
+type storageCollectorStub struct {
+	enqueueResult bool
+	refreshing    bool
+	allCount      int
+	allErr        error
+}
+
+func (s *storageCollectorStub) EnqueueInventory(int64) bool { return s.enqueueResult }
+func (s *storageCollectorStub) EnqueueAllInventory(context.Context) (int, error) {
+	return s.allCount, s.allErr
+}
+func (s *storageCollectorStub) IsInventoryRefreshing(int64) bool { return s.refreshing }
+
+func storageHandlerContext(method, target string) (*gin.Context, *httptest.ResponseRecorder) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(method, target, nil)
+	return ctx, recorder
+}
+
+func TestStorageRefreshReturnsUnavailableWhenNotQueuedOrRefreshing(t *testing.T) {
+	_, ws, store, _ := newRouter(t)
+	wid, err := ws.Create(context.Background(), workers.CreateReq{Name: "refresh-worker", Host: "127.0.0.1", Port: 22, Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		enqueued      bool
+		alreadyActive bool
+		wantStatus    int
+	}{
+		{name: "queue saturated", wantStatus: http.StatusServiceUnavailable},
+		{name: "queued", enqueued: true, wantStatus: http.StatusAccepted},
+		{name: "already refreshing", alreadyActive: true, wantStatus: http.StatusAccepted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			collector := &storageCollectorStub{enqueueResult: tc.enqueued, refreshing: tc.alreadyActive}
+			handler := &storageHandlers{store: store, collector: collector}
+			ctx, recorder := storageHandlerContext(http.MethodPost, "/api/v1/storage/refresh?worker_id="+strconv.FormatInt(wid, 10))
+			handler.refresh(ctx)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("refresh status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestStorageRefreshAllReturnsUnavailableWhenNoWorkCanRun(t *testing.T) {
+	_, ws, store, _ := newRouter(t)
+	if _, err := ws.Create(context.Background(), workers.CreateReq{Name: "refresh-all-worker", Host: "127.0.0.1", Port: 22, Username: "root"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		allCount   int
+		allErr     error
+		refreshing bool
+		wantStatus int
+	}{
+		{name: "nothing queued", wantStatus: http.StatusServiceUnavailable},
+		{name: "scheduling error with no active refresh", allErr: context.Canceled, wantStatus: http.StatusServiceUnavailable},
+		{name: "queued", allCount: 1, wantStatus: http.StatusAccepted},
+		{name: "already refreshing", refreshing: true, wantStatus: http.StatusAccepted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			collector := &storageCollectorStub{allCount: tc.allCount, allErr: tc.allErr, refreshing: tc.refreshing}
+			handler := &storageHandlers{store: store, collector: collector}
+			ctx, recorder := storageHandlerContext(http.MethodPost, "/api/v1/storage/refresh")
+			handler.refresh(ctx)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("refresh status=%d body=%s, want %d", recorder.Code, recorder.Body.String(), tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestListInventoryDoesNotClaimRefreshWhenQueueIsFull(t *testing.T) {
+	_, ws, store, _ := newRouter(t)
+	wid, err := ws.Create(context.Background(), workers.CreateReq{Name: "inventory-worker", Host: "127.0.0.1", Port: 22, Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &storageHandlers{store: store, collector: &storageCollectorStub{}}
+	ctx, recorder := storageHandlerContext(http.MethodGet, "/api/v1/storage/inventory?worker_id="+strconv.FormatInt(wid, 10))
+	handler.listInventory(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("inventory status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["refreshing"] != false {
+		t.Fatalf("refreshing=%v after queue rejection, want false", response["refreshing"])
+	}
+}
+
+type requestContextKey struct{}
+
+type contextCheckingRunner struct {
+	hasDeadline bool
+	deadline    time.Time
+	requestTag  any
+}
+
+func (r *contextCheckingRunner) Run(ctx context.Context, _ db.WorkerNode, _ string) (string, string, int, error) {
+	r.deadline, r.hasDeadline = ctx.Deadline()
+	r.requestTag = ctx.Value(requestContextKey{})
+	return "", "", 0, nil
+}
+
+func (r *contextCheckingRunner) RunWithStdin(ctx context.Context, worker db.WorkerNode, command string, _ io.Reader) (string, string, int, error) {
+	return r.Run(ctx, worker, command)
+}
+
+func TestListVGsUsesBoundedRequestDerivedContext(t *testing.T) {
+	_, ws, store, _ := newRouter(t)
+	wid, err := ws.Create(context.Background(), workers.CreateReq{Name: "vgs-worker", Host: "127.0.0.1", Port: 22, Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &contextCheckingRunner{}
+	handler := &storageHandlers{store: store, runner: runner}
+	parent := context.WithValue(context.Background(), requestContextKey{}, "request-context")
+	parent, cancel := context.WithDeadline(parent, time.Now().Add(2*time.Minute))
+	defer cancel()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/storage/vgs?worker_id="+strconv.FormatInt(wid, 10), nil).WithContext(parent)
+	handler.listVgs(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("vgs status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	remaining := time.Until(runner.deadline)
+	if !runner.hasDeadline || remaining > 30*time.Second || remaining < 29*time.Second {
+		t.Fatalf("runner deadline remaining=%v, want approximately 30s", remaining)
+	}
+	if runner.requestTag != "request-context" {
+		t.Fatalf("request context value=%v, want preserved value", runner.requestTag)
 	}
 }

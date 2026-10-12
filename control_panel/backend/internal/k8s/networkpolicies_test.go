@@ -11,7 +11,9 @@ import (
 )
 
 func TestCreateNetworkPolicySetsOwnerRefAndIngress(t *testing.T) {
-	cs := fake.NewSimpleClientset()
+	cs := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "p1", Namespace: "ns1", UID: "uid-1", Labels: map[string]string{"app": "p1"},
+	}})
 	np, err := CreateNetworkPolicy(context.Background(), cs, CreateNetworkPolicyReq{
 		Namespace:    "ns1",
 		ServiceName:  "svc-1",
