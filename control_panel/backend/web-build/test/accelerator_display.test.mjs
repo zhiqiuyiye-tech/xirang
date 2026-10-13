@@ -96,6 +96,17 @@ test('worker loader reports failed requests and skips detached tables', async ()
  assert.equal(cell.innerHTML, 'unchanged');
 });
 
+test('explicit worker refresh requests a new hardware sample', async () => {
+ const tbody = { isConnected: true, querySelectorAll: () => [] };
+ let requestedURL;
+ sandbox.fetch = async url => {
+  requestedURL = url;
+  return { ok: true, status: 200, json: async () => [] };
+ };
+ await window.loadWorkerAccelerators(tbody, true);
+ assert.equal(requestedURL, '/api/v1/workers/accelerators?refresh=1');
+});
+
 test('worker and notebook tables and notebook modal use accelerator renderers', () => {
  assert.match(source, /id="workers-table"[\s\S]*?<th>GPU \/ NPU<\/th>/);
  assert.match(source, /loadWorkerAccelerators\(tbody\)/);

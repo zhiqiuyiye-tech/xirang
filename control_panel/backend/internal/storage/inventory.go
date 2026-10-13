@@ -38,9 +38,9 @@ type LVInfo struct {
 	FreeKnown             bool     `json:"free_known"`
 }
 
-// DiskInfo is an unused whole disk discovered on the worker - not mounted, has
-// no filesystem, no partitions, and is not already a PV. These are candidates
-// for pvcreate+vgcreate into a VG pool.
+// DiskInfo is an initialization candidate on the worker - the selected device
+// is unmounted and has no partition-table, active-PV, or unsupported signature.
+// A known unmounted filesystem signature may be cleared after preflight.
 type DiskInfo struct {
 	Name       string  `json:"name"` // /dev/sdb or /dev/sdb1
 	SizeGB     float64 `json:"size_gb"`
@@ -438,19 +438,19 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 		}
 	}
 
-	// Safe initialization candidates are unmounted whole disks or unmounted
-	// partitions with no detectable filesystem, partition, or PV signature. A
-	// candidate is rejected if its physical ancestor is a system or reserved
-	// disk, if it is mounted, if it has child devices, or if it belongs to an
-	// active volume group. Signature-bearing devices require an explicit manual
-	// recovery path instead of automatic wipefs initialization.
+	// Safe initialization candidates are unmounted whole disks or partitions with
+	// no signature or a known filesystem signature that the handler can safely
+	// clear after its live-device preflight. Partition tables, PVs, and unknown
+	// signatures remain excluded. A candidate is rejected if its physical
+	// ancestor is a system or reserved disk, if it is mounted, if it has child
+	// devices, or if it belongs to an active volume group.
 	candidateBytesByDisk := map[string]int64{}
 	unusedMap := map[string]bool{}
 	for _, row := range lsblkRows {
 		if row.Type != "disk" && row.Type != "part" {
 			continue
 		}
-		if row.Fstype != "" || row.Pttype != "" {
+		if !isReinitializableFilesystem(row.Fstype) || row.Pttype != "" {
 			continue
 		}
 		device := "/dev/" + row.Name
@@ -464,7 +464,7 @@ func parseInventoryWithReserved(out string, reservedMounts []string) *InventoryI
 			continue
 		}
 		// Devices belonging to an active Volume Group must not be wiped.
-		// Free PVs without an active VG are safe to reuse/initialize.
+		// Orphaned PV signatures are excluded by the signature allowlist above.
 		if detail, ok := pvMap[device]; ok && detail.VGName != "" {
 			continue
 		}

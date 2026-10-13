@@ -38,9 +38,15 @@ func ListNodeAcceleratorAllocations(ctx context.Context, client kubernetes.Inter
 	if err != nil {
 		return nil, fmt.Errorf("list pods for accelerator allocations: %w", err)
 	}
-	out := make([]NodeAcceleratorAllocation, 0, len(nodes.Items))
-	byName := make(map[string]int, len(nodes.Items))
-	for _, node := range nodes.Items {
+	return nodeAcceleratorAllocations(nodes.Items, pods.Items), nil
+}
+
+// nodeAcceleratorAllocations is shared by fresh queries and the display-only
+// informer cache. Safety-sensitive operations continue to use fresh reads.
+func nodeAcceleratorAllocations(nodes []corev1.Node, pods []corev1.Pod) []NodeAcceleratorAllocation {
+	out := make([]NodeAcceleratorAllocation, 0, len(nodes))
+	byName := make(map[string]int, len(nodes))
+	for _, node := range nodes {
 		host := ""
 		for _, address := range node.Status.Addresses {
 			if address.Type == corev1.NodeInternalIP {
@@ -55,7 +61,7 @@ func ListNodeAcceleratorAllocations(ctx context.Context, client kubernetes.Inter
 			Total: acceleratorResourceCount(acceleratorResourceCounts(node.Status.Allocatable)),
 		})
 	}
-	for _, pod := range pods.Items {
+	for _, pod := range pods {
 		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
@@ -63,7 +69,7 @@ func ListNodeAcceleratorAllocations(ctx context.Context, client kubernetes.Inter
 			out[index].Used += acceleratorResourceCount(podAcceleratorRequests(pod))
 		}
 	}
-	return out, nil
+	return out
 }
 
 // isAcceleratorCountResource deliberately recognizes device-count names, not

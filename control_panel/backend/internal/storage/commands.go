@@ -9,6 +9,26 @@ import (
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_/-]+$`)
 
+// reinitializableFilesystemTypes are ordinary filesystem signatures that may be
+// cleared after the read-only device preflight confirms the target is unused.
+// Partition-table, LVM, RAID, encrypted, swap, multi-device Btrfs, and unknown
+// signatures stay blocked; a single-device mount check cannot prove all Btrfs
+// members unused.
+var reinitializableFilesystemTypes = []string{"ext2", "ext3", "ext4", "xfs", "vfat", "exfat", "ntfs"}
+
+func isReinitializableFilesystem(fstype string) bool {
+	fstype = strings.ToLower(strings.TrimSpace(fstype))
+	if fstype == "" {
+		return true
+	}
+	for _, allowed := range reinitializableFilesystemTypes {
+		if fstype == allowed {
+			return true
+		}
+	}
+	return false
+}
+
 // diskRe limits disk paths to /dev/ + safe characters.
 var diskRe = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
 
@@ -100,10 +120,10 @@ func shellLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
-// PreflightDeviceCmd returns a read-only safety check that must run immediately
-// before pvcreate. It rejects mounted devices, existing filesystem/partition/PV
-// signatures, incomplete or unsafe device ancestry, protected mounts, and mounted
-// child partitions.
+// PreflightDeviceCmd returns a read-only safety check that must run before
+// signature clearing. It permits only known filesystem signatures to be reset,
+// while rejecting mounted devices, partition tables, PV and unknown signatures,
+// incomplete ancestry, protected mounts, and whole disks with child devices.
 func PreflightDeviceCmd(device string, reservedMounts []string) string {
 	patterns := []string{"/", "/boot", "/boot/efi"}
 	for _, mountPoint := range reservedMounts {
@@ -131,7 +151,15 @@ fail() {
 test -b "$device" || { echo "device is not a block device: $device" >&2; exit 1; }
 command -v wipefs >/dev/null 2>&1 || fail 'wipefs is unavailable; cannot inspect device signatures'
 signatures=$(wipefs --noheadings --no-act -o TYPE "$device" 2>/dev/null) || fail 'cannot inspect device signatures'
-[ -z "$signatures" ] || fail "device has existing signatures: $signatures"
+while IFS= read -r signature || [ -n "$signature" ]; do
+  [ -n "$signature" ] || continue
+  case "$signature" in
+    @@REINITIALIZABLE_SIGNATURES@@) ;;
+    *) fail "device has unsafe or unsupported signature: $signature" ;;
+  esac
+done <<EOF
+$signatures
+EOF
 
 nl='
 '
@@ -217,11 +245,18 @@ if [ "$selected_type" = disk ]; then
   case "$children" in *"$nl") children=${children%"$nl"} ;; esac
   [ -n "$children" ] || fail 'disk child query returned no names'
   seen_children='|'
+  selected_seen=false
+  has_children=false
   while IFS= read -r child || [ -n "$child" ]; do
     [ -n "$child" ] || fail 'disk child query returned an empty name'
     case "$child" in *[!A-Za-z0-9_-]*) fail 'disk child query returned a malformed name' ;; esac
     case "$seen_children" in *"|$child|"*) fail 'disk child query returned duplicate names' ;; esac
     seen_children="${seen_children}${child}|"
+    if [ "$selected_seen" = false ]; then
+      selected_seen=true
+      continue
+    fi
+    has_children=true
 
     child_probe=$(findmnt -rn -S "/dev/$child" 2>/dev/null; probe_status=$?; printf '\001'; exit "$probe_status")
     child_status=$?
@@ -234,11 +269,14 @@ if [ "$selected_type" = disk ]; then
   done <<EOF
 $children
 EOF
+  [ "$selected_seen" = true ] || fail 'disk child query did not include the selected device'
+  [ "$has_children" = false ] || fail 'disk has child devices; select an unused partition instead'
 fi
 
 echo SAFE`
 	script = strings.Replace(script, "device=@@DEVICE@@", "device="+d, 1)
-	return strings.Replace(script, "@@PROTECTED_PATTERNS@@", strings.Join(quotedPatterns, "|"), 1)
+	script = strings.Replace(script, "@@PROTECTED_PATTERNS@@", strings.Join(quotedPatterns, "|"), 1)
+	return strings.Replace(script, "@@REINITIALIZABLE_SIGNATURES@@", strings.Join(reinitializableFilesystemTypes, "|"), 1)
 }
 
 // ValidateExportOpts validates the NFS export options string (the part after
@@ -356,15 +394,16 @@ func BaseName(path string) string {
 	return path
 }
 
-// CreateVGSteps builds a per-disk pvcreate + vgcreate pair. The caller runs a
-// strict read-only preflight first; these commands deliberately do not use
-// wipefs or LVM force/yes flags, so a signature that appears after preflight
-// still causes pvcreate to refuse initialization.
+// CreateVGSteps builds a per-disk wipefs + pvcreate + vgcreate sequence. The
+// caller runs the strict read-only preflight first. Wipefs is limited by that
+// preflight to known unmounted filesystem signatures; pvcreate does not use
+// force flags, so new or unexpected signatures still cause initialization to fail.
 func CreateVGSteps(r CreateVGReq) []Step {
-	steps := make([]Step, 0, len(r.Disks)*2)
+	steps := make([]Step, 0, len(r.Disks)*3)
 	for _, d := range r.Disks {
 		vg := VGNameForDisk(r.VGNamePrefix, d)
 		steps = append(steps,
+			Step{Name: "wipefs:" + d, Cmd: fmt.Sprintf("wipefs -a %s", d)},
 			Step{Name: "pvcreate:" + d, Cmd: fmt.Sprintf("pvcreate %s", d)},
 			Step{Name: "vgcreate:" + vg, Cmd: fmt.Sprintf("vgcreate %s %s", vg, d)},
 		)

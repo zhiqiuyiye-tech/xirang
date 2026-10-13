@@ -250,7 +250,7 @@ func TestParseInventory_MapsLVToPhysicalDisks(t *testing.T) {
 	}
 }
 
-func TestParseInventory_UnmountedFilesystemsAreNotCandidates(t *testing.T) {
+func TestParseInventory_UnmountedFilesystemDevicesCanBeReinitialized(t *testing.T) {
 	const out = "###VGS###\n###LVS###\n###PVS###\n###DF###\n" +
 		"Filesystem 1024-blocks Used Available Capacity Mounted on\n" +
 		"/dev/sda1 100000000000 10000000000 90000000000 10% /\n" +
@@ -264,15 +264,15 @@ func TestParseInventory_UnmountedFilesystemsAreNotCandidates(t *testing.T) {
 		`NAME="sde" TYPE="disk" SIZE="200000000000" MOUNTPOINT="" FSTYPE="" PKNAME="" PTTYPE="gpt"`
 
 	inv := parseInventory(out)
-	if len(inv.UnusedDisks) != 1 || inv.UnusedDisks[0].Name != "/dev/sdd" {
-		t.Fatalf("only the unformatted disk should be an initialization candidate, got %+v", inv.UnusedDisks)
+	if len(inv.UnusedDisks) != 3 || inv.UnusedDisks[0].Name != "/dev/sdb" || inv.UnusedDisks[1].Name != "/dev/sdc1" || inv.UnusedDisks[2].Name != "/dev/sdd" {
+		t.Fatalf("unmounted filesystem devices and blank disks should be candidates, but partition-table devices must remain excluded: %+v", inv.UnusedDisks)
 	}
 	byName := map[string]PhysicalDiskInfo{}
 	for _, disk := range inv.PhysicalDisks {
 		byName[disk.Name] = disk
 	}
-	if byName["/dev/sdb"].Role != "data" {
-		t.Fatalf("unmounted filesystem disk must not be reported unused, got %s", byName["/dev/sdb"].Role)
+	if byName["/dev/sdb"].Role != "unused" || byName["/dev/sdc"].Role != "unused" {
+		t.Fatalf("unmounted filesystem devices should be classified as unused: sdb=%+v sdc=%+v", byName["/dev/sdb"], byName["/dev/sdc"])
 	}
 }
 

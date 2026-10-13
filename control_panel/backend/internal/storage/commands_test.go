@@ -148,7 +148,7 @@ func TestPreflightDeviceRequiresSignatureProbe(t *testing.T) {
 	for _, required := range []string{
 		"command -v wipefs",
 		"wipefs --noheadings --no-act -o TYPE",
-		"device has existing signatures",
+		"device has unsafe or unsupported signature",
 	} {
 		if !strings.Contains(cmd, required) {
 			t.Fatalf("preflight command missing fail-closed probe %q: %s", required, cmd)
@@ -157,34 +157,40 @@ func TestPreflightDeviceRequiresSignatureProbe(t *testing.T) {
 }
 
 func TestCreateVGSteps_New(t *testing.T) {
-	// Each disk becomes its OWN VG: 2 disks -> 2x (pvcreate + vgcreate) = 4 steps.
-	// The VG name is derived from the prefix + disk basename (vg_data + sdb -> vg_data_sdb).
+	// Each disk becomes its OWN VG: 2 disks -> wipe signatures, then pvcreate + vgcreate.
+	// Signature removal is explicit and follows the separate read-only safety preflight.
 	steps := CreateVGSteps(CreateVGReq{VGNamePrefix: "vg_data", Disks: []string{"/dev/sdb", "/dev/sdc"}})
-	if len(steps) != 4 {
-		t.Fatalf("expected 4 steps (2 disks x 2), got %d", len(steps))
+	if len(steps) != 6 {
+		t.Fatalf("expected 6 steps (2 disks x 3), got %d", len(steps))
 	}
-	if steps[0].Name != "pvcreate:/dev/sdb" || steps[0].Cmd != "pvcreate /dev/sdb" {
-		t.Fatalf("pvcreate sdb must not erase signatures or bypass prompts: %+v", steps[0])
+	if steps[0].Name != "wipefs:/dev/sdb" || steps[0].Cmd != "wipefs -a /dev/sdb" {
+		t.Fatalf("wipefs sdb must be explicit and scoped to the selected device: %+v", steps[0])
 	}
-	if steps[1].Name != "vgcreate:vg_data_sdb" || steps[1].Cmd != "vgcreate vg_data_sdb /dev/sdb" {
-		t.Fatalf("vgcreate sdb wrong: %+v", steps[1])
+	if steps[1].Name != "pvcreate:/dev/sdb" || steps[1].Cmd != "pvcreate /dev/sdb" {
+		t.Fatalf("pvcreate sdb must not bypass prompts: %+v", steps[1])
 	}
-	if steps[2].Name != "pvcreate:/dev/sdc" {
-		t.Fatalf("pvcreate sdc wrong: %+v", steps[2])
+	if steps[2].Name != "vgcreate:vg_data_sdb" || steps[2].Cmd != "vgcreate vg_data_sdb /dev/sdb" {
+		t.Fatalf("vgcreate sdb wrong: %+v", steps[2])
 	}
-	if steps[3].Name != "vgcreate:vg_data_sdc" || steps[3].Cmd != "vgcreate vg_data_sdc /dev/sdc" {
-		t.Fatalf("vgcreate sdc wrong: %+v", steps[3])
+	if steps[3].Name != "wipefs:/dev/sdc" || steps[3].Cmd != "wipefs -a /dev/sdc" {
+		t.Fatalf("wipefs sdc wrong: %+v", steps[3])
+	}
+	if steps[4].Name != "pvcreate:/dev/sdc" || steps[4].Cmd != "pvcreate /dev/sdc" {
+		t.Fatalf("pvcreate sdc wrong: %+v", steps[4])
+	}
+	if steps[5].Name != "vgcreate:vg_data_sdc" || steps[5].Cmd != "vgcreate vg_data_sdc /dev/sdc" {
+		t.Fatalf("vgcreate sdc wrong: %+v", steps[5])
 	}
 }
 
 func TestCreateVGSteps_NvmeName(t *testing.T) {
 	// NVMe disks (/dev/nvme0n1) keep their full basename in the VG name.
 	steps := CreateVGSteps(CreateVGReq{VGNamePrefix: "vg_data", Disks: []string{"/dev/nvme0n1"}})
-	if len(steps) != 2 {
-		t.Fatalf("expected 2 steps, got %d", len(steps))
+	if len(steps) != 3 {
+		t.Fatalf("expected 3 steps, got %d", len(steps))
 	}
-	if steps[1].Name != "vgcreate:vg_data_nvme0n1" || steps[1].Cmd != "vgcreate vg_data_nvme0n1 /dev/nvme0n1" {
-		t.Fatalf("nvme vgcreate wrong: %+v", steps[1])
+	if steps[2].Name != "vgcreate:vg_data_nvme0n1" || steps[2].Cmd != "vgcreate vg_data_nvme0n1 /dev/nvme0n1" {
+		t.Fatalf("nvme vgcreate wrong: %+v", steps[2])
 	}
 }
 

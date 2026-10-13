@@ -26,6 +26,7 @@ type preflightRuntimeFixture struct {
 	name     string
 	lsblk    map[string]preflightCommandResult
 	findmnt  map[string]preflightCommandResult
+	wipefs   preflightCommandResult
 	wantSafe bool
 }
 
@@ -34,8 +35,39 @@ func TestPreflightDeviceFullCommandWithFixtures(t *testing.T) {
 		{
 			name:     "unused whole disk is safe",
 			lsblk:    unusedDiskPreflightFixture(),
-			findmnt:  noFindmntMatches(preflightDeviceMarker, "/dev/sdb", "/dev/sdb1"),
+			findmnt:  noFindmntMatches(preflightDeviceMarker, "/dev/sdb"),
 			wantSafe: true,
+		},
+		{
+			name:     "unmounted ext4 signature can be cleared after preflight",
+			lsblk:    unusedDiskPreflightFixture(),
+			findmnt:  noFindmntMatches(preflightDeviceMarker, "/dev/sdb"),
+			wipefs:   preflightCommandResult{output: "ext4\n"},
+			wantSafe: true,
+		},
+		{
+			name:    "partition table signature is rejected",
+			lsblk:   unusedDiskPreflightFixture(),
+			findmnt: noFindmntMatches(preflightDeviceMarker),
+			wipefs:  preflightCommandResult{output: "gpt\n"},
+		},
+		{
+			name:    "active LVM signature is rejected",
+			lsblk:   unusedDiskPreflightFixture(),
+			findmnt: noFindmntMatches(preflightDeviceMarker),
+			wipefs:  preflightCommandResult{output: "LVM2_member\n"},
+		},
+		{
+			name:    "unknown signature is rejected",
+			lsblk:   unusedDiskPreflightFixture(),
+			findmnt: noFindmntMatches(preflightDeviceMarker),
+			wipefs:  preflightCommandResult{output: "crypto_LUKS\n"},
+		},
+		{
+			name:    "filesystem signature probe failure is rejected",
+			lsblk:   unusedDiskPreflightFixture(),
+			findmnt: noFindmntMatches(preflightDeviceMarker),
+			wipefs:  preflightCommandResult{status: 2},
 		},
 		{
 			name:     "unused spare partition with proven disk parent is safe",
@@ -51,6 +83,7 @@ func TestPreflightDeviceFullCommandWithFixtures(t *testing.T) {
 				return fixture
 			}(),
 			findmnt: noFindmntMatches(preflightDeviceMarker),
+			wipefs:  preflightCommandResult{output: "ext4\n"},
 		},
 		{
 			name: "selected type query failure is rejected",
@@ -152,6 +185,16 @@ func TestPreflightDeviceFullCommandWithFixtures(t *testing.T) {
 			name:    "mounted device is rejected",
 			lsblk:   unusedPartitionPreflightFixture(),
 			findmnt: map[string]preflightCommandResult{preflightDeviceMarker: {output: "/data02\n"}},
+			wipefs:  preflightCommandResult{output: "ext4\n"},
+		},
+		{
+			name: "disk with an unmounted child partition is rejected",
+			lsblk: func() map[string]preflightCommandResult {
+				fixture := unusedDiskPreflightFixture()
+				fixture["NAME|"+preflightDeviceMarker] = preflightCommandResult{output: "sdb\nsdb1\n"}
+				return fixture
+			}(),
+			findmnt: noFindmntMatches(preflightDeviceMarker, "/dev/sdb", "/dev/sdb1"),
 		},
 		{
 			name: "disk child query failure is rejected",
@@ -181,8 +224,12 @@ func TestPreflightDeviceFullCommandWithFixtures(t *testing.T) {
 			findmnt: noFindmntMatches(preflightDeviceMarker),
 		},
 		{
-			name:  "disk child findmnt failure is rejected",
-			lsblk: unusedDiskPreflightFixture(),
+			name: "disk child findmnt failure is rejected",
+			lsblk: func() map[string]preflightCommandResult {
+				fixture := unusedDiskPreflightFixture()
+				fixture["NAME|"+preflightDeviceMarker] = preflightCommandResult{output: "sdb\nsdb1\n"}
+				return fixture
+			}(),
 			findmnt: map[string]preflightCommandResult{
 				preflightDeviceMarker: {status: 1},
 				"/dev/sdb":            {status: 1},
@@ -221,7 +268,7 @@ func unusedDiskPreflightFixture() map[string]preflightCommandResult {
 		"TYPE|" + preflightDeviceMarker:       {output: "disk\n"},
 		"PKNAME|" + preflightDeviceMarker:     {},
 		"MOUNTPOINT|" + preflightDeviceMarker: {output: "\n"},
-		"NAME|" + preflightDeviceMarker:       {output: "sdb\nsdb1\n"},
+		"NAME|" + preflightDeviceMarker:       {output: "sdb\n"},
 	}
 }
 
@@ -337,7 +384,7 @@ func preflightFixtureMocks(devicePath string, fixture preflightRuntimeFixture) s
   esac
 }
 `)
-	script.WriteString("wipefs() { return 0; }\n")
+	fmt.Fprintf(&script, "wipefs() { printf '%%s' %s; return %s; }\n", shellLiteral(fixture.wipefs.output), strconv.Itoa(fixture.wipefs.status))
 	script.WriteString("head() { IFS= read -r first || :; printf '%s\\n' \"$first\"; return 0; }\n")
 	return script.String()
 }

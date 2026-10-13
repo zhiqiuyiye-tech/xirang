@@ -1,21 +1,32 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
 	"xirang/control_panel/internal/db"
+	"xirang/control_panel/internal/k8s"
 	"xirang/control_panel/internal/tasks"
 	"xirang/control_panel/internal/workers"
 )
 
+// AcceleratorAllocationSource supplies display-only device allocation snapshots.
+type AcceleratorAllocationSource interface {
+	Snapshot(context.Context) ([]k8s.NodeAcceleratorAllocation, error)
+}
+
 type workerHandlers struct {
-	ws     *workers.Service
-	store  *db.Store
-	eng    *tasks.Engine
-	client kubernetes.Interface
+	ws               *workers.Service
+	store            *db.Store
+	eng              *tasks.Engine
+	client           kubernetes.Interface
+	allocations      AcceleratorAllocationSource
+	acceleratorMu    sync.Mutex
+	acceleratorCache map[int64]*workerAcceleratorCacheEntry
 }
 
 func (h *workerHandlers) list(c *gin.Context) {

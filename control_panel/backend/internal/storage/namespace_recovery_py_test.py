@@ -16,6 +16,16 @@ if spec:
 
 ROOT = "1 0 0:1 / / rw - rootfs rootfs rw\n"
 TARGET = "10 1 253:0 / /data02/test rw - xfs /dev/mapper/vg-lv rw\n"
+# Real worker-3-10 evidence: nsfs roots are namespace handles, not paths.
+NSFS = """1411 30 0:4 net:[4026568827] /run/netns/cni-6b70c1b1-4cd2-3b08-7304-b1b67ed158a3 rw shared:473 - nsfs nsfs rw
+771 30 0:4 net:[4026568809] /run/netns/cni-da91d1e3-3535-4d1b-16c8-eb9ae9f9d3b9 rw shared:419 - nsfs nsfs rw
+1109 30 0:4 net:[4026568650] /run/netns/cni-27f043a1-0249-8a2c-a771-ea172b66d2ae rw shared:395 - nsfs nsfs rw
+1207 30 0:4 net:[4026569044] /run/netns/cni-1a28a774-be2e-7f28-9b10-027953487bd7 rw shared:425 - nsfs nsfs rw
+1357 30 0:4 net:[4026569126] /run/netns/cni-97cbe95e-aa71-54cf-ab6e-77baea725c32 rw shared:449 - nsfs nsfs rw
+1155 30 0:4 net:[4026568584] /run/netns/cni-0b07a6f1-276f-96d2-554a-070402e5aaf0 rw shared:552 - nsfs nsfs rw
+1011 30 0:4 net:[4026547883] /run/netns/cni-d3bda1ef-98f7-6c02-8440-f8641a5777f7 rw shared:365 - nsfs nsfs rw
+"""
+HOST_NSFS = ROOT + "30 1 0:2 / /run rw - tmpfs tmpfs rw\n" + NSFS
 
 
 class ParserTests(unittest.TestCase):
@@ -54,6 +64,110 @@ class ParserTests(unittest.TestCase):
         chosen = r.safe_mounts(mounts, "253:0", ["/data01"])
         self.assertEqual([m["id"] for m in chosen], [10])
         self.assertEqual(chosen[0]["path"], "/data02/test space")
+
+    def test_worker_nsfs_handles_preserved_without_blocking_lv(self):
+        mounts = r.parse_mountinfo(HOST_NSFS + TARGET)
+        handles = [m for m in mounts if m["device"] == "0:4"]
+        self.assertEqual(len(handles), 7)
+        self.assertEqual(handles[0]["root"], "net:[4026568827]")
+        self.assertEqual(handles[0]["optional"], ["shared:473"])
+        self.assertEqual(
+            r.safe_mounts(mounts, "253:0", ["/data01"]), r.parse_mountinfo(TARGET)
+        )
+
+    def test_nsfs_namespace_types(self):
+        for kind in ("net", "mnt", "uts", "ipc", "pid", "user", "cgroup", "time"):
+            with self.subTest(kind=kind):
+                text = "2 1 0:4 %s:[42] /ns rw - nsfs nsfs rw\n" % kind
+                self.assertEqual(r.parse_mountinfo(text)[0]["root"], kind + ":[42]")
+
+    def test_namespace_handles_only_allowed_in_nsfs_root(self):
+        cases = [
+            "2 1 0:4 net:[42] /ns rw - tmpfs tmpfs rw\n",
+            "2 1 0:4 / net:[42] rw - nsfs nsfs rw\n",
+        ]
+        for root in (
+            "net:[0]",
+            "net:[-1]",
+            "net:[abc]",
+            "net:[42]/child",
+            "net:[42]suffix",
+            "unknown:[42]",
+            "relative",
+            "net:[42]\x00",
+            "net:[42]\\999",
+        ):
+            cases.append("2 1 0:4 %s /ns rw - nsfs nsfs rw\n" % root)
+        for text in cases:
+            with self.subTest(text=text), self.assertRaises(r.RecoveryError):
+                r.parse_mountinfo(text)
+
+    def test_ordinary_paths_remain_canonical(self):
+        for value in ("relative", "/x/../y", "/x//y", "/x/", "/x\x00"):
+            for field in (3, 4):
+                fields = TARGET.rstrip("\n").split(" ")
+                fields[field] = value
+                with (
+                    self.subTest(value=value, field=field),
+                    self.assertRaises(r.RecoveryError),
+                ):
+                    r.parse_mountinfo(" ".join(fields) + "\n")
+
+    def test_namespace_handle_never_authorizes_target_mount(self):
+        mounts = r.parse_mountinfo(ROOT + TARGET)
+        mounts[1]["root"] = "net:[42]"
+        with self.assertRaises(r.RecoveryError):
+            r.safe_mounts(mounts, "253:0", [])
+
+    def test_nsfs_records_still_enforce_target_topology(self):
+        for parent, path in ((10, "/elsewhere"), (1, "/data02/test/ns")):
+            text = "2 %d 0:4 net:[42] %s rw - nsfs nsfs rw\n" % (parent, path)
+            with self.subTest(parent=parent), self.assertRaises(r.RecoveryError):
+                r.safe_mounts(r.parse_mountinfo(ROOT + TARGET + text), "253:0", [])
+
+    def test_inspect_with_worker_nsfs_evidence(self):
+        import io
+
+        identity = {"uuid": "u", "major_minor": "253:0"}
+        request = {
+            "operation": "inspect",
+            "lv_dev": "/dev/vg/lv",
+            "reserved": [],
+            "unmount_timeout": 1,
+            "payload": None,
+        }
+        output = io.StringIO()
+        with (
+            patch.object(r.sys, "platform", "linux"),
+            patch.object(r.os, "geteuid", return_value=0, create=True),
+            patch.object(r.sys, "stdin", io.StringIO(json.dumps(request))),
+            patch.object(r.sys, "stdout", output),
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "read_text", return_value=HOST_NSFS + TARGET),
+        ):
+            status = r.main()
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertEqual(
+            json.loads(output.getvalue()), {"ok": True, "result": identity}
+        )
+
+    def test_scan_and_verify_with_worker_nsfs_evidence(self):
+        identity = {"uuid": "u", "major_minor": "253:0"}
+        member = {"pid": 123, "start_time": "100", "cgroup": "0::/test\n"}
+        with (
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "pids", return_value=[123]),
+            patch.object(r, "process_info", return_value=(member, "mnt:[42]", (1, 2))),
+            patch.object(r, "read_text", return_value=HOST_NSFS + TARGET) as evidence,
+            patch.object(r, "open_count", return_value=0),
+        ):
+            snapshot = r.scan("/dev/vg/lv", [])
+            self.assertEqual(len(snapshot["holders"]), 1)
+            self.assertEqual(
+                snapshot["holders"][0]["mounts"], r.parse_mountinfo(TARGET)
+            )
+            evidence.return_value = HOST_NSFS
+            self.assertTrue(r.verify("/dev/vg/lv", [], identity)["released"])
 
     def test_shared_ancestor_above_private_parent_is_safe(self):
         root = ROOT.replace("rw -", "rw shared:1 -")

@@ -28,11 +28,16 @@ type RouterOptions struct {
 	ChallengeRateLimitPerMinute int
 	ChallengeMaxPendingPerIP    int
 	ChallengeMaxPendingGlobal   int
+	AcceleratorAllocations      AcceleratorAllocationSource
 	Collector                   storageCollector
 	StaleAfter                  time.Duration
 }
 
 type RouterOption func(*RouterOptions)
+
+func WithAcceleratorAllocations(source AcceleratorAllocationSource) RouterOption {
+	return func(o *RouterOptions) { o.AcceleratorAllocations = source }
+}
 
 func WithCollector(c storageCollector) RouterOption {
 	return func(o *RouterOptions) { o.Collector = c }
@@ -206,7 +211,7 @@ func NewRouter(tk *auth.Tokens, ws *workers.Service, store *db.Store, eng *tasks
 		authed.POST("/auth/logout", authH.logout)
 		authed.POST("/auth/logout-all", authH.logoutAll)
 
-		h := &workerHandlers{ws: ws, store: store, eng: eng, client: k8sClient}
+		h := &workerHandlers{ws: ws, store: store, eng: eng, client: k8sClient, allocations: options.AcceleratorAllocations}
 		authed.GET("/workers", h.list)
 		authed.GET("/workers/accelerators", h.accelerators)
 		authed.POST("/workers", h.create)

@@ -64,7 +64,7 @@ def read_text(path, dir_fd=None):
         os.close(fd)
 
 
-def decode_path(value):
+def decode_path(value, allow_namespace_handle=False):
     # mountinfo defines exactly these four octal escapes. Unknown escapes must
     # not silently turn into a path the kernel did not report.
     escapes = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
@@ -80,6 +80,13 @@ def decode_path(value):
             output.append(value[i])
             i += 1
     path = "".join(output)
+    # nsfs reports a synthetic namespace handle as the filesystem root (e.g.
+    # net:[4026568827]). Only that field may be non-absolute; mountpoints and
+    # ordinary filesystem roots must still be canonical paths.
+    if allow_namespace_handle and re.fullmatch(
+        r"(?:net|mnt|uts|ipc|pid|user|cgroup|time):\[[1-9][0-9]*\]", path
+    ):
+        return path
     require(
         path.startswith("/")
         and "\x00" not in path
@@ -110,7 +117,9 @@ def parse_mountinfo(text):
                 "id": ident,
                 "parent_id": parent,
                 "device": fields[2],
-                "root": decode_path(fields[3]),
+                "root": decode_path(
+                    fields[3], allow_namespace_handle=fields[sep + 1] == "nsfs"
+                ),
                 "path": decode_path(fields[4]),
                 "optional": fields[6:sep],
             }
@@ -131,6 +140,14 @@ def safe_mounts(records, device, reserved):
         paths.setdefault(record["path"], []).append(record)
     targets = [m for m in records if m["device"] == device]
     for mount in targets:
+        # A namespace handle is metadata for an unrelated nsfs mount, never
+        # an acceptable filesystem root for the logical volume being removed.
+        require(
+            mount["root"].startswith("/")
+            and "\x00" not in mount["root"]
+            and posixpath.normpath(mount["root"]) == mount["root"],
+            "noncanonical target mount root",
+        )
         path = mount["path"]
         require(path != "/", "target is namespace root")
         for root in list(PROTECTED[1:]) + list(reserved):

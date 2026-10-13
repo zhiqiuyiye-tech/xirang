@@ -72,7 +72,7 @@
                 '<div class="form-field"><label for="bootstrap-password">初始化管理员密码</label><input type="password" id="bootstrap-password" autocomplete="current-password" required></div>' +
                 '<button type="button" id="bootstrap-generate" class="btn btn-secondary btn-block">生成并下载私钥文件</button>' +
                 '<p id="bootstrap-file-status" class="muted" role="status">生成文件后，请重新选择刚下载的文件以确认可读取。</p>' +
-                '<div class="form-field"><label for="bootstrap-private-key">重新选择下载的私钥文件</label><input type="file" id="bootstrap-private-key" accept=".pem,application/x-pem-file,text/plain" disabled></div>' +
+                '<div class="form-field"><label for="bootstrap-private-key">重新选择下载的私钥文件</label><input type="file" id="bootstrap-private-key" accept=".pem" disabled></div>' +
                 '<button type="submit" id="login-submit" class="btn btn-primary btn-block btn-lg" disabled>登记密钥并登录</button>' +
                 '</div>';
             setLoginError(message || '', false);
@@ -84,7 +84,7 @@
             controls.innerHTML = '<div class="key-login-panel">' +
                 '<h2 class="login-mode-title">私钥文件登录</h2>' +
                 '<p class="muted">选择管理员共享的 P-256 PKCS#8 PEM 文件。私钥只在浏览器内存中读取和签名。</p>' +
-                '<div class="form-field"><label for="login-private-key">管理员私钥文件</label><input type="file" id="login-private-key" accept=".pem,application/x-pem-file,text/plain" required></div>' +
+                '<div class="form-field"><label for="login-private-key">管理员私钥文件</label><input type="file" id="login-private-key" accept=".pem" required></div>' +
                 '<div class="muted key-fingerprint">当前密钥指纹：<code id="login-key-fingerprint"></code></div>' +
                 '<button type="submit" id="login-submit" class="btn btn-primary btn-block btn-lg">签名并登录</button>' +
                 '</div>';
@@ -297,9 +297,9 @@
         container.innerHTML = '<div class="card key-rotation-card">' +
             '<h3 class="card-title">轮换共享管理员登录密钥</h3>' +
             '<p class="muted">轮换需要当前私钥签名，并用新私钥完成持有证明。新文件下载后必须重新选择；提交成功后旧私钥和其他 Session 立即失效。</p>' +
-            '<div class="form-field"><label for="rotate-current-file">当前私钥文件</label><input type="file" id="rotate-current-file" accept=".pem,application/x-pem-file,text/plain"></div>' +
+            '<div class="form-field"><label for="rotate-current-file">当前私钥文件</label><input type="file" id="rotate-current-file" accept=".pem"></div>' +
             '<div class="form-field"><label>新私钥文件</label><button type="button" id="rotate-generate" class="btn btn-secondary">生成并下载新密钥文件</button></div>' +
-            '<div class="form-field"><label for="rotate-new-file">重新选择刚下载的新私钥文件</label><input type="file" id="rotate-new-file" accept=".pem,application/x-pem-file,text/plain" disabled></div>' +
+            '<div class="form-field"><label for="rotate-new-file">重新选择刚下载的新私钥文件</label><input type="file" id="rotate-new-file" accept=".pem" disabled></div>' +
             '<div id="rotate-message" class="info-msg" role="status"></div>' +
             '<button type="button" id="rotate-submit" class="btn btn-primary" disabled>用当前和新私钥签名并轮换</button>' +
             '</div>';

@@ -545,7 +545,14 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 				r.Fail(fmt.Sprintf("create step: %v", err))
 				return err
 			}
-			out, stderr, code, err := h.runner.Run(ctx, *w, s.Cmd)
+			command := s.Cmd
+			if strings.HasPrefix(s.Name, "wipefs:") {
+				// Re-run all live-device safety checks in the same remote shell as
+				// signature clearing, so a mount or signature change after the
+				// initial all-device validation cannot be wiped without revalidation.
+				command = PreflightDeviceCmd(d, h.reservedMounts) + "\n" + s.Cmd
+			}
+			out, stderr, code, err := h.runner.Run(ctx, *w, command)
 			if err != nil || code != 0 {
 				sh.Done("failed", out, stderr, fmt.Sprintf("step %s failed code=%d", s.Name, code))
 				r.Fail(fmt.Sprintf("create vg failed at %s: %s", s.Name, stderr))

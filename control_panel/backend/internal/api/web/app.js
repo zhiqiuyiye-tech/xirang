@@ -170,9 +170,9 @@
         return html;
     }
 
-    async function loadWorkerAccelerators(tbody) {
+    async function loadWorkerAccelerators(tbody, refresh) {
         try {
-            var result = await apiJSON('/workers/accelerators');
+            var result = await apiJSON('/workers/accelerators' + (refresh ? '?refresh=1' : ''));
             if (!tbody.isConnected) return;
             if (!result.resp.ok || !Array.isArray(result.data)) throw new Error('卡信息查询失败');
             var byID = {};
@@ -297,7 +297,7 @@
     // WORKERS PAGE
     // ====================================================================
 
-    registerRoute('/workers', async function (content) {
+    registerRoute('/workers', async function (content, hash, refreshAccelerators) {
         content.innerHTML = '<div class="page-header">' +
             '<div>' +
             '<h2 class="page-title">Worker 节点管理</h2>' +
@@ -318,7 +318,7 @@
             '</div>';
 
         document.getElementById('btn-refresh-workers').addEventListener('click', function () {
-            routes['/workers'](content);
+            routes['/workers'](content, null, true);
         });
         document.getElementById('btn-new-worker').addEventListener('click', function () {
             showWorkerForm(content, null);
@@ -355,7 +355,8 @@
                     '</td></tr>';
             }).join('');
 
-            loadWorkerAccelerators(tbody);
+            if (refreshAccelerators) loadWorkerAccelerators(tbody, true);
+            else loadWorkerAccelerators(tbody);
 
             // Wire action buttons
             tbody.querySelectorAll('button[data-action]').forEach(function (btn) {
@@ -1615,7 +1616,7 @@
             '<div style="display:flex;align-items:center;gap:12px;">' +
             '<span id="st-vg-summary" class="muted" style="font-size:12.5px;"></span>' +
             '<button class="btn btn-outline btn-xs" id="btn-refresh-worker-inv" style="display:none;">🔄 刷新此节点</button>' +
-            '<button class="btn btn-primary btn-sm" id="btn-init-vg" disabled>初始化 VG 池 (从未挂载裸盘)</button>' +
+            '<button class="btn btn-primary btn-sm" id="btn-init-vg" disabled>初始化 VG 池 (从未挂载磁盘)</button>' +
             '</div></div>' +
             '<div id="st-disks-container" style="margin-bottom:12px;"></div>' +
             '<div class="table-responsive">' +
@@ -1684,7 +1685,7 @@
                             roleTag = '<span class="badge badge-primary" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>';
                             capLabel = 'VG可用: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
                         } else if (d.role === 'unused') {
-                            roleTag = '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>';
+                            roleTag = '<span class="badge badge-success" style="font-size:11px;">可初始化磁盘</span>';
                             capLabel = '可初始化: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
                         } else {
                             roleTag = '<span class="badge badge-muted" style="font-size:11px;">普通数据盘</span>';
@@ -1957,7 +1958,7 @@
 
                 var vgs = inv.vgs || [];
                 if (vgs.length === 0) {
-                    vgTbody.innerHTML = '<tr><td colspan="3" class="muted">当前节点未初始化任何 VG 卷组。可从未挂载裸盘新建存储池。</td></tr>';
+                    vgTbody.innerHTML = '<tr><td colspan="3" class="muted">当前节点未初始化任何 VG 卷组。可从未挂载磁盘新建存储池。</td></tr>';
                 } else {
                     vgTbody.innerHTML = vgs.map(function (v) {
                         return '<tr><td><strong>' + esc(v.name) + '</strong></td><td><span class="font-mono">' + esc(v.vsize) + '</span></td><td><span class="badge badge-success font-mono">' + esc(v.vfree) + ' (' + (v.free_gb || 0).toFixed(1) + ' GB 可用)</span></td></tr>';
@@ -1984,7 +1985,7 @@
                                     roleTag = '<span class="badge badge-primary" style="font-size:11px;">LVM ' + esc(d.vg_name || '') + '</span>';
                                     capLabel = 'VG可用: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
                                 } else if (d.role === 'unused') {
-                                    roleTag = '<span class="badge badge-success" style="font-size:11px;">未分配裸盘</span>';
+                                    roleTag = '<span class="badge badge-success" style="font-size:11px;">可初始化磁盘</span>';
                                     capLabel = '可初始化: <strong style="color:var(--success);" class="font-mono">' + (d.free_gb || 0).toFixed(1) + ' GB</strong>';
                                 } else {
                                     roleTag = '<span class="badge badge-muted" style="font-size:11px;">普通数据盘</span>';
@@ -2001,9 +2002,9 @@
                 var disks = inv.unused_disks || [];
                 if (disks.length > 0) {
                     btnInit.disabled = false;
-                    summary.textContent = '发现 ' + disks.length + ' 处未挂载可用裸盘/分区可供初始化。';
+                    summary.textContent = '发现 ' + disks.length + ' 处未挂载可用磁盘/分区可供初始化。';
                 } else {
-                    summary.textContent = '未检测到可用未挂载裸盘或分区（系统盘及 /data01 保留盘已自动排除）。';
+                    summary.textContent = '未检测到可用未挂载磁盘或分区（系统盘及 /data01 保留盘已自动排除）。';
                 }
 
                 var lvs = inv.lvs || [];
@@ -2174,12 +2175,12 @@
     }
 
     async function showInitVGForm(content, wid, disks, onDone) {
-        if (!disks || disks.length === 0) { alert('该节点没有可用未挂载裸盘用于创建 VG 存储池。'); return; }
+        if (!disks || disks.length === 0) { alert('该节点没有可用未挂载磁盘用于创建 VG 存储池。'); return; }
         function vgFor(disk, prefix) { return prefix + '_' + disk.split('/').pop(); }
         function renderDiskRows(prefix) {
             return disks.map(function (d) {
                 return '<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;margin:6px 0;cursor:pointer;">' +
-                    '<input type="checkbox" data-disk="' + esc(d.name) + '" checked style="width:auto;"> ' +
+                    '<input type="checkbox" data-disk="' + esc(d.name) + '" style="width:auto;"> ' +
                     '<span class="font-mono" style="font-weight:600;">' + esc(d.name) + '</span> ' +
                     '<span class="badge badge-muted">' + (d.size_gb || 0).toFixed(1) + ' GB</span> ' +
                     '<span class="muted" style="font-size:12px;">&rarr; 卷组名 <strong>' + esc(vgFor(d.name, prefix)) + '</strong></span>' +
@@ -2191,9 +2192,9 @@
             '<span>初始化 VG 存储池</span>' +
             '<span class="badge badge-primary">独立卷组模式</span>' +
             '</h3>' +
-            '<p class="muted mb-2" style="font-size:12.5px;">系统将为选中的每块盘独立建立单盘 VG（命名为 <code>前缀_盘符</code>），避免跨不同扇区格式磁盘合并带来的兼容性问题。<b>操作将格式化目标磁盘，请确认无有用数据。</b></p>' +
+            '<p class="muted mb-2" style="font-size:12.5px;">系统将为选中的每块盘独立建立单盘 VG（命名为 <code>前缀_盘符</code>），避免跨不同扇区格式磁盘合并带来的兼容性问题。<b>初始化会清除所选磁盘/分区的现有文件系统及其中全部数据，且不可恢复。未挂载不代表没有数据，请先备份并逐项勾选确认。</b></p>' +
             '<div class="form-field"><label>VG 命名统一前缀</label><input type="text" id="vg-name-input" value="vg_data"></div>' +
-            '<div class="form-field"><label>待初始化未挂载裸盘列表</label><div id="vg-disk-list">' + renderDiskRows('vg_data') + '</div></div>' +
+            '<div class="form-field"><label>待初始化未挂载磁盘列表</label><div id="vg-disk-list">' + renderDiskRows('vg_data') + '</div></div>' +
             '<div class="row mt-2" style="justify-content: flex-end;">' +
             '<button type="button" class="btn btn-outline" id="vg-cancel">取消</button>' +
             '<button type="button" class="btn btn-primary" id="vg-create-btn">确认格式化并初始化</button>' +

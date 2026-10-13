@@ -31,6 +31,8 @@ func (h *workerHandlers) accelerators(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.pruneAcceleratorCache(nodes)
+	refresh := c.Query("refresh") == "1"
 	out := make([]workerAcceleratorInfo, len(nodes))
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, 4)
@@ -45,13 +47,17 @@ func (h *workerHandlers) accelerators(c *gin.Context) {
 				out[i] = workerAcceleratorInfo{WorkerID: node.ID, AcceleratorInfo: workers.AcceleratorInfo{Status: "unknown", Devices: []workers.AcceleratorModel{}, Error: "设备采集已取消"}, AllocationStatus: "unknown"}
 				return
 			}
-			out[i] = workerAcceleratorInfo{WorkerID: node.ID, AcceleratorInfo: h.ws.DiscoverAccelerators(c.Request.Context(), node), AllocationStatus: "unknown"}
+			out[i] = workerAcceleratorInfo{WorkerID: node.ID, AcceleratorInfo: h.cachedAccelerators(c.Request.Context(), node, refresh), AllocationStatus: "unknown"}
 		}(i, node)
 	}
 	var allocations []k8s.NodeAcceleratorAllocation
 	if h.client != nil && len(nodes) > 0 {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		allocations, err = k8s.ListNodeAcceleratorAllocations(ctx, h.client)
+		if h.allocations != nil {
+			allocations, err = h.allocations.Snapshot(ctx)
+		} else {
+			allocations, err = k8s.ListNodeAcceleratorAllocations(ctx, h.client)
+		}
 		cancel()
 	}
 	wg.Wait()

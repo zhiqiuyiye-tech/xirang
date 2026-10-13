@@ -106,6 +106,15 @@ async function loadBootstrapLogin() {
   };
 }
 
+test('private-key pickers use extension-only filters to avoid Windows MIME expansion', () => {
+  const pickers = [...source.matchAll(/<input type="file"[^>]*>/g)].map(([input]) => input);
+  assert.equal(pickers.length, 4);
+  for (const picker of pickers) {
+    assert.match(picker, /accept="\.pem"/);
+    assert.doesNotMatch(picker, /text\/plain|application\/x-pem-file/);
+  }
+});
+
 test('does not generate or download a bootstrap key when the password is empty', async () => {
   const login = await loadBootstrapLogin();
 

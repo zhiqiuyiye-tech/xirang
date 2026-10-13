@@ -136,8 +136,14 @@ func main() {
 		}
 	})
 
+	var acceleratorAllocations api.AcceleratorAllocationSource
+	if k8sClient != nil {
+		acceleratorAllocations = k8s.NewAcceleratorAllocationCache(appCtx, k8sClient)
+	}
+
 	gin.SetMode(gin.ReleaseMode)
 	r, err := api.NewRouter(tk, ws, store, eng, k8sClient, sshm,
+		api.WithAcceleratorAllocations(acceleratorAllocations),
 		api.WithCollector(inventoryCollector),
 		api.WithStaleAfter(cfg.StorageStaleAfter),
 		api.WithRateLimiter(limiter),
