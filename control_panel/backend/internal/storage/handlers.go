@@ -92,6 +92,8 @@ func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Sto
 		}
 	}
 	recovery := NewNamespaceRecovery(runner, cfg.reservedMounts, cfg.unmountTimeout)
+	recovery.forDeletion = true
+	resizeRecovery := NewNamespaceRecovery(runner, cfg.reservedMounts, cfg.unmountTimeout)
 	deletion := &deleteLVHandler{
 		runner: runner, store: store, reservedMounts: cfg.reservedMounts,
 		podGuardChecker: cfg.podGuardChecker, cleanupAuthorizer: cfg.cleanupAuthorizer,
@@ -106,7 +108,7 @@ func RegisterStorageHandlers(eng *tasks.Engine, runner ssh.Runner, store *db.Sto
 	eng.Register("storage_create_vg", &createVGHandler{runner: runner, store: store, reservedMounts: cfg.reservedMounts})
 	eng.Register("storage_resize_lv", &resizeLVHandler{
 		runner: runner, store: store, reservedMounts: cfg.reservedMounts,
-		podGuardChecker: cfg.podGuardChecker, recovery: recovery,
+		podGuardChecker: cfg.podGuardChecker, recovery: resizeRecovery,
 	})
 	eng.Register("storage_delete_lv", deletion)
 }
@@ -831,25 +833,9 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail(err.Error())
 		return err
 	}
-	if h.podGuardChecker == nil {
-		err := fmt.Errorf("Kubernetes pod usage checker is unavailable; retaining logical volume")
-		r.Fail(err.Error())
-		return err
-	}
-	if p.MaintenanceConfirmed {
-		if !h.sharedHostMaintenance {
-			err := fmt.Errorf("shared host maintenance is disabled; SHARED_HOST_MAINTENANCE_ENABLED=true and per-task confirmation are both required")
-			r.Fail(err.Error())
-			return err
-		}
-		step, err := r.Step("confirm_host_maintenance")
-		if err != nil {
-			r.Fail(err.Error())
-			return err
-		}
-		step.Done("succeeded", "", "", fmt.Sprintf("administrator attested complete affected maintenance scope for worker %d LV /dev/%s/%s; process-visible checks only, not complete automated kernel namespace proof", p.WorkerID, p.VGName, p.LVName))
-		ctx = withSharedHostMaintenance(ctx)
-	}
+	// Deletion follows the operator-confirmed handbook. Kubernetes references
+	// and the retired maintenance parameter do not authorize or block it.
+	// Physical identity, protected mounts and ordinary unmount checks remain.
 	w, err := h.store.GetWorker(ctx, p.WorkerID)
 	if err != nil {
 		r.Fail(err.Error())
@@ -886,60 +872,16 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		st.Done("succeeded", out, stderr, "not mounted")
 	}
 
-	// Verify every live export alias before any worker mutation.
-	if err := h.checkPodUsage(ctx, r, w.Host, mountPoints, "check_pod_usage"); err != nil {
-		return err
-	}
-
-	inspection, err := h.inspectDeletionDevice(ctx, r, *w, lvDev)
+	identity, err := h.inspectDevice(ctx, r, *w, lvDev, "verify_lv_identity")
 	if err != nil {
 		return err
 	}
-	identity := inspection.Device
-	var hostPlan SharedHostUnmountPlan
-	if inspection.RequiresHostAuthorization {
-		budget := h.cleanupTimeout
-		if budget <= 0 {
-			budget = time.Minute
-		}
-		sharedCtx, cancel := context.WithTimeout(ctx, budget)
-		defer cancel()
-		ctx = sharedCtx
-		hostPlan, err = h.authorizeHostUnmount(ctx, r, *w, lvDev, identity, mountPoints, nil, "authorize_host_unmount")
-		if err != nil {
-			return err
-		}
-	}
 
-	// Shared host unmounts never use the unchecked shell umount step. The RPC
-	// revalidates the complete authorized propagation snapshot immediately
-	// before an ordinary syscall; private targets retain the original flow.
-	hostScopeChecked := false
+	// Handbook order: revoke exports, ordinarily unmount the host, release
+	// exact-device namespace copies, verify zero opens, remove LV, clean fstab.
 	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoints: mountPoints}) {
-		if inspection.RequiresHostAuthorization && !hostScopeChecked {
-			fresh, err := h.authorizeHostUnmount(ctx, r, *w, lvDev, identity, mountPoints, &hostPlan, "recheck_host_scope_before_teardown")
-			if err != nil {
-				return err
-			}
-			hostPlan = fresh
-			if err := h.checkPodUsage(ctx, r, w.Host, mountPoints, "verify_pod_usage_before_host_teardown"); err != nil {
-				return err
-			}
-			hostScopeChecked = true
-		}
-		if s.Name == "umount" && inspection.RequiresHostAuthorization {
-			if err := h.unmountAuthorizedHost(ctx, r, *w, lvDev, mountPoints, hostPlan); err != nil {
-				return err
-			}
-			continue
-		}
 		if s.Name == "lvremove" {
-			if !inspection.RequiresHostAuthorization {
-				if err := h.releaseResidualMounts(ctx, r, *w, lvDev, mountPoints, identity, false); err != nil {
-					return err
-				}
-			}
-			if err := h.checkPodUsage(ctx, r, w.Host, mountPoints, "verify_pod_usage"); err != nil {
+			if err := h.releaseResidualMounts(ctx, r, *w, lvDev, mountPoints, identity, false); err != nil {
 				return err
 			}
 			current, err := h.inspectDevice(ctx, r, *w, lvDev, "verify_lv_identity_before_remove")
@@ -950,11 +892,6 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 				err := fmt.Errorf("logical volume identity changed during teardown; retaining volume")
 				r.Fail(err.Error())
 				return err
-			}
-			if inspection.RequiresHostAuthorization {
-				if err := h.verifySharedReleased(ctx, r, *w, lvDev, identity, "verify_shared_device_released_before_remove"); err != nil {
-					return err
-				}
 			}
 		}
 		sh, err := r.Step(s.Name)

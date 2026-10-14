@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -74,95 +73,28 @@ func TestSharedHostUnmountInvalidEvidenceNeverRuns(t *testing.T) {
 	}
 }
 
-func sharedDeleteRunner(t *testing.T) *scriptRunner {
-	t.Helper()
-	sr := newScriptRunner()
-	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"}, scriptResult{})
-	sr.add("cp-storage-namespace-delete_inspect", scriptResult{stdout: `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"requires_host_authorization":true}}`})
-	sr.add("cp-storage-namespace-host_plan", scriptResult{stdout: sharedPlanJSON(t, sharedHostTestPlan())})
-	sr.add("cp-storage-namespace-host_unmount", scriptResult{stdout: `{"ok":true,"result":{"unmounted":true,"device":{"uuid":"u","major_minor":"253:0"}}}`})
-	sr.add("cp-storage-namespace-host_verify", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"u","major_minor":"253:0"}}}`})
-	return sr
-}
-
-func TestSharedHostDeleteAuthorizesBeforeMutationAndRechecksBeforeUnmount(t *testing.T) {
-	sr := sharedDeleteRunner(t)
-	calls := 0
-	authorize := func(_ context.Context, _, export string, holders []NamespaceHolder) error {
-		calls++
-		if export != "/data02/share" || len(holders) != 1 || holders[0].PID == 1 {
-			return fmt.Errorf("incorrect foreign holder authorization scope")
-		}
-		if calls == 1 && sr.counts["cp-storage-namespace-host_unmount"] != 0 {
-			return fmt.Errorf("mutated before authorization")
-		}
-		return nil
-	}
-	store, id := submitRecoveryDelete(t, sr, WithHostUnmountAuthorizer(authorize))
+func TestSharedMountMetadataUsesOrdinaryDeleteUnmount(t *testing.T) {
+	sr := residualBeforeRemoveRunner(t)
+	authorizerCalls := 0
+	store, id := submitDeleteTask(t, sr, "storage_delete_lv", WithHostUnmountAuthorizer(func(context.Context, string, string, []NamespaceHolder) error {
+		authorizerCalls++
+		return errors.New("unexpected special host authorization")
+	}))
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	if calls != 3 || sr.counts["cp-storage-namespace-host_unmount"] != 1 {
-		t.Fatalf("authorization=%d unmount=%d", calls, sr.counts["cp-storage-namespace-host_unmount"])
+	if authorizerCalls != 0 {
+		t.Fatalf("shared mount metadata invoked special host authorization %d times", authorizerCalls)
 	}
-	for _, cmd := range sr.calls {
-		if strings.Contains(cmd, "umount /data02/share") || strings.Contains(cmd, "--make-private") || strings.Contains(cmd, "--make-rprivate") {
-			t.Fatal("shared deletion bypassed the verified RPC or changed propagation")
+	commands := strings.Join(sr.calls, "\n")
+	for _, marker := range []string{"cp-storage-namespace-host_plan", "cp-storage-namespace-host_unmount", "cp-storage-namespace-host_verify"} {
+		if strings.Contains(commands, marker) {
+			t.Fatalf("delete selected obsolete special host path %q: %v", marker, sr.calls)
 		}
 	}
-}
-
-func TestSharedHostDeleteStopsBeforeMutationOnUnknownHolders(t *testing.T) {
-	for _, authorize := range []NamespaceCleanupAuthorizer{nil, func(context.Context, string, string, []NamespaceHolder) error { return fmt.Errorf("unknown holder") }} {
-		sr := sharedDeleteRunner(t)
-		store, id := submitRecoveryDelete(t, sr, WithHostUnmountAuthorizer(authorize))
-		waitFor(t, store, id, "failed", 2*time.Second)
-		for _, cmd := range sr.calls {
-			if strings.Contains(cmd, "sed -i") || strings.Contains(cmd, "exportfs -arv") || strings.Contains(cmd, "lvremove -f /dev/vg_data/lv_1") {
-				t.Fatal("unknown holders must stop before exports, unmount, and lvremove")
-			}
-		}
-		if sr.counts["cp-storage-namespace-host_unmount"] != 0 {
-			t.Fatal("unknown holder was unmounted")
-		}
+	unmount := strings.Index(commands, "umount /data02/share")
+	verify := strings.Index(commands, "logical volume is still mounted at:")
+	scan := strings.Index(commands, "# cp-storage-namespace-scan_delete")
+	if unmount < 0 || verify <= unmount || scan <= verify {
+		t.Fatalf("shared mount metadata must still use ordinary host unmount and verification: %v", sr.calls)
 	}
-}
-
-func TestSharedHostDeleteStopsWhenPlanOrAuthorizationChanges(t *testing.T) {
-	for _, change := range []string{"proof", "authorization", "pod", "timeout", "open_count"} {
-		t.Run(change, func(t *testing.T) {
-			sr := sharedDeleteRunner(t)
-			original := sharedHostTestPlan()
-			changed := sharedHostTestPlan()
-			changed.Proof = strings.Repeat("b", 64)
-			if change == "proof" {
-				sr.add("cp-storage-namespace-host_plan", scriptResult{stdout: sharedPlanJSON(t, original)}, scriptResult{stdout: sharedPlanJSON(t, changed)})
-			}
-			if change == "open_count" {
-				sr.add("cp-storage-namespace-host_verify", scriptResult{stdout: `{"ok":false,"error":"Open Count remains nonzero","state_unknown":false}`, exitCode: 1})
-			}
-			if change == "timeout" {
-				sr.add("cp-storage-namespace-host_unmount", scriptResult{exitCode: 124})
-			}
-			calls := 0
-			authorize := func(context.Context, string, string, []NamespaceHolder) error {
-				calls++
-				if change == "authorization" && calls > 1 {
-					return fmt.Errorf("authorization changed")
-				}
-				return nil
-			}
-			guards := 0
-			guard := func(context.Context, string, string) (bool, []string, error) {
-				guards++
-				return change == "pod" && guards > 1, []string{"new/business"}, nil
-			}
-			store, id := submitRecoveryDelete(t, sr, WithHostUnmountAuthorizer(authorize), WithPodGuardChecker(guard))
-			waitFor(t, store, id, "failed", 2*time.Second)
-			if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 0 {
-				t.Fatal("unsafe lvremove after changed evidence")
-			}
-			if change != "timeout" && change != "open_count" && sr.counts["cp-storage-namespace-host_unmount"] != 0 {
-				t.Fatal("unmounted after changed evidence")
-			}
-		})
-	}
+	assertNoUnsafeDeleteEscalation(t, sr)
 }

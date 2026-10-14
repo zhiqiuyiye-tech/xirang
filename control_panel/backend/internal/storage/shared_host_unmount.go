@@ -216,29 +216,14 @@ func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Re
 	}
 	step.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "process-visible residual mounts inspected before first lvremove")
 	if len(snapshot.Holders) > 0 {
-		authStep, err := r.Step("authorize_namespace_cleanup_before_remove")
+		authStep, err := r.Step("resolve_device_holders_before_remove")
 		if err != nil {
 			r.Fail(err.Error())
 			return err
 		}
-		exportPath := ""
-		if len(paths) > 0 {
-			exportPath = paths[len(paths)-1]
-		}
-		if h.cleanupAuthorizer == nil {
-			err = errors.New("residual LV holders remain and namespace cleanup is disabled; retaining volume")
-		} else {
-			err = h.cleanupAuthorizer(ctx, w.Host, exportPath, snapshot.Holders)
-		}
-		if err != nil {
-			authStep.Done("failed", summarizeNamespaceHolders(snapshot.Holders), "", err.Error())
-			r.Fail(err.Error())
-			return err
-		}
-		authStep.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "all residual container members explicitly authorized")
-		if err := h.checkPodUsage(ctx, r, w.Host, paths, "verify_pod_usage_before_residual_cleanup"); err != nil {
-			return err
-		}
+		// The authenticated delete request selects this exact LV. Resolve
+		// holders from kernel device evidence, not Pod/PVC configuration.
+		authStep.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "exact-device namespace holders resolved for the requested LV")
 		cleanupStep, err := r.Step("cleanup_namespace_mounts_before_remove")
 		if err != nil {
 			r.Fail(err.Error())

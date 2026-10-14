@@ -24,24 +24,21 @@ the one-time browser key enrollment after the pod is Ready.
 
 ## NFS namespace recovery
 
-`config.namespaceCleanupAllowlist` accepts exact `namespace/daemonset/container`
-triples; its default empty list disables automatic namespace cleanup.
+Deletion and reclaim follow the operator handbook: revoke the target exports,
+ordinary host unmount, exact-device namespace residual cleanup, identity and
+Open Count=0 verification, LV removal, then fstab cleanup. The backend does not
+scan Kubernetes Pod/PVC references or require maintenance-mode switches or a
+workload allowlist for this flow. Operators must first stop business use and
+confirm the target volume's data can be permanently discarded.
+
 `config.namespaceCleanupTimeout` defaults to `60s`, and
 `config.namespaceUnmountTimeout` to `10s`. A worker requires Python 3, GNU
-`timeout`, and privileged access for the trusted ordinary-unmount executor.
-The chart grants only `get` on DaemonSets for owner-UID verification, without
-adding Pod deletion permissions. See [the operator guide](../../docs/nfs-namespace-recovery.md)
-before enabling recovery, including isolated Linux validation and handling
-uncertain-executor markers.
-
-Linux 5.10 maintenance recovery is separately gated by
-`config.sharedHostMaintenanceEnabled` (default `false`) and explicit
-`maintenance_confirmed: true` on each delete/reclaim task. Enabling the server
-flag alone never downgrades strict mode. Maintenance relies on an operator's
-controlled-window attestation and process-visible evidence, not complete kernel
-namespace enumeration. All visible foreign holders still require the exact
-workload allowlist; business use and busy devices remain blockers. Keep this
-flag off until isolated Linux validation and an approved maintenance window.
+`timeout`, LVM/device-mapper and ordinary mount/export tools, and privileged
+access for the trusted executor. Linux 5.10 does not require newer namespace
+enumeration ioctls. Old maintenance/allowlist values remain accepted only for
+configuration compatibility, not as deletion prerequisites. Resize retains its
+own workload checks. See [the operator guide](../../docs/nfs-namespace-recovery.md)
+for physical protections, uncertainty markers, and isolated Linux validation.
 
 ## Prerequisites
 
@@ -76,10 +73,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.15.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.16.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.15`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.16`.
 
 ## Install
 

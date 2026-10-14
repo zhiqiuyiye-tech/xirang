@@ -478,31 +478,39 @@ func (s *scriptRunner) add(sub string, results ...scriptResult) {
 
 func (s *scriptRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (string, string, int, error) {
 	s.calls = append(s.calls, cmd)
-	for sub, results := range s.scripts {
-		if strings.Contains(cmd, sub) {
-			idx := s.counts[sub]
-			if idx >= len(results) {
-				idx = len(results) - 1
-			}
-			s.counts[sub]++
-			r := results[idx]
-			return r.stdout, r.stderr, r.exitCode, r.runErr
+	matched := ""
+	for sub := range s.scripts {
+		if strings.Contains(cmd, sub) && len(sub) > len(matched) {
+			matched = sub
 		}
+	}
+	if matched != "" {
+		results := s.scripts[matched]
+		if len(results) == 0 {
+			return "", "", 0, nil
+		}
+		idx := s.counts[matched]
+		if idx >= len(results) {
+			idx = len(results) - 1
+		}
+		s.counts[matched]++
+		r := results[idx]
+		return r.stdout, r.stderr, r.exitCode, r.runErr
 	}
 	if strings.Contains(cmd, "$(id -u)") {
 		return "root\n", "", 0, nil
 	}
 	if strings.Contains(cmd, "cp-storage-namespace-scan") {
-		return `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"holders":[]}}`, "", 0, nil
+		return `{"ok":true,"result":{"device":{"uuid":"stable-uuid","major_minor":"253:0"},"holders":[]}}`, "", 0, nil
 	}
-	if strings.Contains(cmd, "cp-storage-namespace-delete_inspect") {
-		return `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"requires_host_authorization":false}}`, "", 0, nil
+	if strings.Contains(cmd, "cp-storage-namespace-cleanup") {
+		return `{"ok":true,"result":{"cleaned":true}}`, "", 0, nil
 	}
 	if strings.Contains(cmd, "cp-storage-namespace-verify") {
-		return `{"ok":true,"result":{"released":true,"device":{"uuid":"u","major_minor":"253:0"}}}`, "", 0, nil
+		return `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`, "", 0, nil
 	}
 	if strings.Contains(cmd, "cp-storage-namespace-inspect") {
-		return `{"ok":true,"result":{"uuid":"u","major_minor":"253:0"}}`, "", 0, nil
+		return `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`, "", 0, nil
 	}
 	if strings.Contains(cmd, "cp-storage-preflight") {
 		return "SAFE\n", "", 0, nil
@@ -850,7 +858,17 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
 		scriptResult{stdout: "/data02/share\n/data02/share/sub\n"},
 		scriptResult{stdout: ""})
-	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(noPodUsers))
+	snapshot := namespaceTestSnapshot()
+	snapshot.Device.UUID = "stable-uuid"
+	snapshot.Holders[0].Mounts[0].Path = "/data02/share"
+	sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, snapshot)})
+	sr.add("cp-storage-namespace-cleanup_delete", scriptResult{stdout: `{"ok":true,"result":{"cleaned":true}}`})
+	sr.add("cp-storage-namespace-verify_delete", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`})
+	sr.add("cp-storage-namespace-inspect_lv",
+		scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`},
+		scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`},
+	)
+	RegisterStorageHandlers(eng, sr, store)
 	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
 		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
 	})
@@ -865,18 +883,28 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 	commands := strings.Join(sr.calls, "\n")
 	subMount := strings.Index(commands, "umount /data02/share/sub")
 	parentMount := strings.Index(commands, "umount /data02/share\n")
-	userCheck := strings.Index(commands, "fuser -vm /data02/share/sub")
-	verifyUnmounted := strings.LastIndex(commands, "findmnt -rn -o TARGET --source /dev/vg_data/lv_1")
-	lvremove := strings.Index(commands, "lvremove -f /dev/vg_data/lv_1")
+	ordered := []int{
+		strings.Index(commands, "sed -i '\\#^/data02/share #d' /etc/exports"),
+		strings.Index(commands, "exportfs -arv"),
+		subMount,
+		parentMount,
+		strings.Index(commands, "logical volume is still mounted at:"),
+		strings.Index(commands, "# cp-storage-namespace-scan_delete"),
+		strings.Index(commands, "# cp-storage-namespace-cleanup_delete"),
+		strings.Index(commands, "# cp-storage-namespace-verify_delete"),
+		strings.LastIndex(commands, "# cp-storage-namespace-inspect_lv"),
+		strings.Index(commands, "lvremove -f /dev/vg_data/lv_1"),
+		strings.Index(commands, "sed -i '\\#^/dev/vg_data/lv_1 #d' /etc/fstab"),
+	}
 	if subMount < 0 || parentMount < 0 || subMount > parentMount {
-		t.Fatalf("all mount targets must be unmounted deepest-first: %v", sr.calls)
+		t.Fatalf("all mount targets must be ordinarily unmounted deepest-first: %v", sr.calls)
 	}
-	if userCheck < 0 || userCheck > subMount {
-		t.Fatalf("mount users should be diagnosed before unmount: %v", sr.calls)
+	for i, position := range ordered {
+		if position < 0 || (i > 0 && position <= ordered[i-1]) {
+			t.Fatalf("deletion did not follow the verified reclaim order: %v", sr.calls)
+		}
 	}
-	if verifyUnmounted <= parentMount || lvremove <= verifyUnmounted {
-		t.Fatalf("LV removal must follow unmount verification: %v", sr.calls)
-	}
+	assertNoUnsafeDeleteEscalation(t, sr)
 }
 
 func TestDeleteLVHandlerDoesNotRemoveStillMountedLV(t *testing.T) {
@@ -943,49 +971,12 @@ func TestDeleteLVHandlerExplainsInUseLVAfterUnmount(t *testing.T) {
 	}
 }
 
-func TestDeleteLVHandler_BlockedByActivePod(t *testing.T) {
-	store, _ := db.Open(filepath.Join(t.TempDir(), "t.db"))
-	defer store.Close()
-	eng := tasks.NewEngine(store)
-	sr := newScriptRunner()
-	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"})
-
-	podChecker := func(ctx context.Context, workerHost, exportPath string) (bool, []string, error) {
-		return true, []string{"default/promtail-f8vmv (hostPath)", "prod/notebook-1 (pvc: nb-data)"}, nil
-	}
-
-	RegisterStorageHandlers(eng, sr, store, WithPodGuardChecker(podChecker))
-	wid, _ := store.CreateWorker(context.Background(), db.WorkerNode{
-		Name: "w", Host: "127.0.0.1", Port: 22, Username: "root", AuthMode: "password",
-	})
-	id, err := eng.Submit(context.Background(), "storage_delete_lv", "storage", wid, map[string]any{
-		"worker_id": wid, "vg_name": "vg_data", "lv_name": "lv_1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, store, id, "failed", 2*time.Second)
-	got, err := store.GetTask(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Error == nil || !strings.Contains(*got.Error, "cannot delete: volume is in use by pods") {
-		t.Fatalf("error=%v, want blocked by pods message", got.Error)
-	}
-	// Verify no umount or lvremove ran
-	for _, call := range sr.calls {
-		if strings.Contains(call, "umount") || strings.Contains(call, "lvremove") {
-			t.Fatalf("destructive command ran despite active pod blocker: %v", sr.calls)
-		}
-	}
-}
-
 func TestDeleteLVHandler_CleansNamespaceMountsAndRetriesLvremove(t *testing.T) {
 	sr := recoveryScriptRunner(t)
-	store, id := submitRecoveryDelete(t, sr, WithNamespaceCleanup(allowTestHolders, time.Minute, time.Second))
+	store, id := submitRecoveryDelete(t, sr)
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-cleanup"] != 1 || sr.counts["cp-storage-namespace-verify"] != 2 {
-		t.Fatalf("unexpected recovery attempts: %v", sr.counts)
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-scan_delete"] != 2 || sr.counts["cp-storage-namespace-cleanup_delete"] != 1 || sr.counts["cp-storage-namespace-verify_delete"] != 2 {
+		t.Fatalf("unexpected bounded recovery attempts: %v", sr.counts)
 	}
 	steps, err := store.ListSteps(context.Background(), id)
 	if err != nil {
@@ -1001,6 +992,18 @@ func TestDeleteLVHandler_CleansNamespaceMountsAndRetriesLvremove(t *testing.T) {
 		}
 	}
 	if !firstFailed || !retrySucceeded {
-		t.Fatalf("original failure or successful retry lost: %+v", steps)
+		t.Fatalf("original failure or single successful retry lost: %+v", steps)
+	}
+	assertNoUnsafeDeleteEscalation(t, sr)
+}
+
+func assertNoUnsafeDeleteEscalation(t *testing.T, sr *scriptRunner) {
+	t.Helper()
+	for _, command := range sr.calls {
+		for _, forbidden := range []string{"umount -f ", "umount --force", "umount -l ", "umount --lazy", "fuser -k", "kill -", "pkill ", "killall "} {
+			if strings.Contains(command, forbidden) {
+				t.Fatalf("deletion must not force unmount or kill a process (%q): %v", forbidden, sr.calls)
+			}
+		}
 	}
 }

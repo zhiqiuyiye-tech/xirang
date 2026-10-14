@@ -453,8 +453,8 @@ type DeleteLVReq struct {
 
 // DeleteLVSteps builds the teardown sequence. If mounted, it removes exports
 // for every mount target, refreshes exports, and unmounts deepest paths first.
-// It always cleans the fstab entry and verifies there are no remaining mounts
-// before attempting lvremove.
+// Verify the host has no remaining mount before lvremove. Fstab cleanup
+// follows successful removal, matching the operator handbook sequence.
 func DeleteLVSteps(r DeleteLVReq) []Step {
 	lvDev := fmt.Sprintf("/dev/%s/%s", r.VGName, r.LVName)
 	mountPoints := r.MountPoints
@@ -475,9 +475,9 @@ func DeleteLVSteps(r DeleteLVReq) []Step {
 		}
 	}
 	steps = append(steps,
-		Step{"remove_fstab_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab`, lvDev)},
 		Step{"verify_unmounted", fmt.Sprintf(`remaining=$(findmnt -rn -o TARGET --source %s 2>/dev/null); status=$?; if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then echo "could not verify logical volume mount state (findmnt status=$status)" >&2; exit 1; fi; if [ -n "$remaining" ]; then echo "logical volume is still mounted at: $remaining" >&2; exit 1; fi`, lvDev)},
 		Step{"lvremove", fmt.Sprintf("lvremove -f %s", lvDev)},
+		Step{"remove_fstab_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab`, lvDev)},
 	)
 	return steps
 }

@@ -97,27 +97,13 @@ func (h *deleteLVHandler) recoverNamespaceAndRemove(ctx context.Context, r *task
 		return err
 	}
 	sh.Done("succeeded", diagnostic, "", "")
-	authStep, err := r.Step("authorize_namespace_cleanup")
+	authStep, err := r.Step("resolve_namespace_holders_for_retry")
 	if err != nil {
 		return err
 	}
-	exportPath := ""
-	if len(paths) > 0 {
-		exportPath = paths[len(paths)-1]
-	}
-	if h.cleanupAuthorizer == nil {
-		err = fmt.Errorf("namespace cleanup is disabled without an explicit workload allowlist; check open file handles and other mount namespaces, release consumers, then retry")
-	} else {
-		err = h.cleanupAuthorizer(recoveryCtx, w.Host, exportPath, snapshot.Holders)
-	}
-	if err != nil {
-		authStep.Done("failed", diagnostic, "", err.Error())
-		return err
-	}
-	authStep.Done("succeeded", diagnostic, "", "all namespace holders explicitly authorized")
-	if err = h.checkPodUsage(recoveryCtx, r, w.Host, paths, "verify_pod_usage_before_cleanup"); err != nil {
-		return err
-	}
+	// Resolve the actual holders of the selected device. The handbook
+	// workflow deliberately does not use Kubernetes or a workload allowlist.
+	authStep.Done("succeeded", diagnostic, "", "exact-device namespace holders resolved for the requested LV")
 	cleanStep, err := r.Step("cleanup_namespace_mounts")
 	if err != nil {
 		return err
@@ -143,10 +129,7 @@ func (h *deleteLVHandler) recoverNamespaceAndRemove(ctx context.Context, r *task
 		return fmt.Errorf("device release verification failed; no deletion retry: %w", err)
 	}
 	verifyStep.Done("succeeded", "", "", "same LV, no residual mounts, Open Count=0")
-	if err = h.checkPodUsage(recoveryCtx, r, w.Host, paths, "verify_pod_usage_before_retry"); err != nil {
-		return err
-	}
-	// Revalidate the stable LV identity after the last Kubernetes request.
+	// Revalidate the stable LV identity immediately before the retry.
 	current, err := h.inspectDevice(recoveryCtx, r, w, dev, "verify_lv_identity_before_retry")
 	if err != nil {
 		return err

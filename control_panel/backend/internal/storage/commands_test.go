@@ -230,7 +230,7 @@ func TestResizeLVSteps_Shrink(t *testing.T) {
 
 func TestDeleteLVSteps_Mounted(t *testing.T) {
 	steps := DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_200g", MountPoint: "/data02/nb"})
-	// exports + exportfs + user check + umount + fstab + verification + lvremove
+	// exports + exportfs + user check + umount + verification + lvremove + fstab
 	if len(steps) != 7 {
 		t.Fatalf("expected 7 steps for mounted LV, got %d", len(steps))
 	}
@@ -243,28 +243,22 @@ func TestDeleteLVSteps_Mounted(t *testing.T) {
 	if steps[3].Name != "umount" || steps[3].Cmd != "umount /data02/nb" {
 		t.Fatalf("umount step wrong: %+v", steps[3])
 	}
-	if steps[5].Name != "verify_unmounted" || !contains(steps[5].Cmd, "findmnt") {
-		t.Fatalf("unmount verification step wrong: %+v", steps[5])
+	if steps[4].Name != "verify_unmounted" || !contains(steps[4].Cmd, "findmnt") {
+		t.Fatalf("unmount verification step wrong: %+v", steps[4])
 	}
-	if steps[6].Cmd != "lvremove -f /dev/vg_data/lv_200g" {
-		t.Fatalf("lvremove wrong: %s", steps[6].Cmd)
+	if steps[5].Cmd != "lvremove -f /dev/vg_data/lv_200g" || steps[6].Name != "remove_fstab_line" {
+		t.Fatalf("LV removal must precede fstab cleanup: %+v", steps[5:])
 	}
 }
 
 func TestDeleteLVSteps_Unmounted(t *testing.T) {
 	steps := DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_200g", MountPoint: ""})
-	// fstab + verification + lvremove (no exports/exportfs/umount)
+	// verification + lvremove + fstab (no exports/exportfs/umount)
 	if len(steps) != 3 {
 		t.Fatalf("expected 3 steps for unmounted LV, got %d", len(steps))
 	}
-	if steps[0].Name != "remove_fstab_line" {
-		t.Fatalf("first step should be remove_fstab_line: %+v", steps[0])
-	}
-	if steps[1].Name != "verify_unmounted" {
-		t.Fatalf("second step should verify unmounted state: %+v", steps[1])
-	}
-	if steps[2].Cmd != "lvremove -f /dev/vg_data/lv_200g" {
-		t.Fatalf("lvremove wrong: %s", steps[2].Cmd)
+	if steps[0].Name != "verify_unmounted" || steps[1].Cmd != "lvremove -f /dev/vg_data/lv_200g" || steps[2].Name != "remove_fstab_line" {
+		t.Fatalf("unmounted handbook order must verify, remove, then clean fstab: %+v", steps)
 	}
 }
 
@@ -288,8 +282,8 @@ func TestDeleteStepsNeverForceOrLazyUnmount(t *testing.T) {
 
 func TestUnmountVerificationChecksFindmntExitCode(t *testing.T) {
 	steps := DeleteLVSteps(DeleteLVReq{VGName: "vg_data", LVName: "lv_1"})
-	if !contains(steps[1].Cmd, `status=$?`) || !contains(steps[1].Cmd, `"$status" -ne 1`) {
-		t.Fatalf("findmnt failure is not checked: %s", steps[1].Cmd)
+	if !contains(steps[0].Cmd, `status=$?`) || !contains(steps[0].Cmd, `"$status" -ne 1`) {
+		t.Fatalf("findmnt failure is not checked: %s", steps[0].Cmd)
 	}
 }
 

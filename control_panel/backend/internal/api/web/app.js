@@ -2255,75 +2255,27 @@
         });
     }
 
-    var activeStorageMaintenanceModal = null;
+    var storageDeleteRequestPending = false;
+    var storageReclaimRequestPending = false;
 
-    function showStorageMaintenanceOption(content, operationLabel, onContinue) {
-        if (activeStorageMaintenanceModal) {
-            activeStorageMaintenanceModal.resolved = true;
-            activeStorageMaintenanceModal.remove();
-            activeStorageMaintenanceModal = null;
-        }
-        var html = '<div class="modal-overlay" id="storage-maintenance-modal">' +
-            '<div class="modal" style="max-width:720px;">' +
-            '<h3 class="modal-title"><span>' + esc(operationLabel) + '前维护恢复选项</span><span class="badge badge-warning">仅本次操作</span></h3>' +
-            '<div class="card" style="margin-bottom:12px;">' +
-            '<div class="section-title">Linux 5.10 维护恢复注意事项</div>' +
-            '<ul style="padding-left:20px;line-height:1.7;">' +
-            '<li>仅在受控维护窗口操作；操作人员必须确认没有并发的相关挂载、卸载或 LVM 操作。</li>' +
-            '<li>Linux 5.10 的 <code>/proc</code> 扫描范围不能证明完整的内核 mount namespace 状态。</li>' +
-            '<li>未知的可见持有者或业务用途仍会阻止操作；此选项不会绕过业务使用检查，且仅允许服务端预先配置的持有者白名单中的对象。</li>' +
-            '<li>服务端必须显式配置 <code>SHARED_HOST_MAINTENANCE_ENABLED=true</code>（默认关闭）。配置未知时仍显示此选项；服务端未启用或不允许时，会在变更前拒绝请求。</li>' +
-            '<li>内核 ioctl 能力不支持时不会自动重试或静默切换流程；只有本次明确勾选且服务端允许，才请求维护恢复。</li>' +
-            '</ul>' +
-            '</div>' +
-            '<label style="display:flex;align-items:flex-start;gap:8px;padding:10px 12px;border:1px solid var(--warning-border);border-radius:6px;background:var(--warning-bg);cursor:pointer;">' +
-            '<input type="checkbox" id="storage-maintenance-confirmed" style="width:auto;margin-top:3px;flex:none;">' +
-            '<span>我已人工核实并授权本次操作的完整受影响维护范围，包括命名空间引用以及 <code>/proc</code> 无法发现的引用；我确认本次处于受控维护窗口，且没有并发的相关挂载、卸载或 LVM 操作，并授权仅针对本次请求启用维护恢复。</span>' +
-            '</label>' +
-            '<div class="row mt-2" style="justify-content:flex-end;">' +
-            '<button type="button" class="btn btn-outline" id="storage-maintenance-cancel">取消</button>' +
-            '<button type="button" class="btn btn-danger" id="storage-maintenance-submit">继续' + esc(operationLabel) + '</button>' +
-            '</div>' +
-            '</div></div>';
-        content.insertAdjacentHTML('beforeend', html);
-
-        var modal = content.querySelector('#storage-maintenance-modal');
-        if (!modal) return;
-        var checkbox = modal.querySelector('#storage-maintenance-confirmed');
-        var resolved = false;
-        modal.resolved = false;
-        activeStorageMaintenanceModal = modal;
-        function closeModal() {
-            if (resolved) return;
-            resolved = true;
-            modal.resolved = true;
-            modal.remove();
-            if (activeStorageMaintenanceModal === modal) activeStorageMaintenanceModal = null;
-        }
-        modal.querySelector('#storage-maintenance-cancel').addEventListener('click', closeModal);
-        modal.querySelector('#storage-maintenance-submit').addEventListener('click', async function () {
-            if (resolved || modal.resolved) return;
-            resolved = true;
-            modal.resolved = true;
-            var maintenanceConfirmed = !!(checkbox && checkbox.checked === true);
-            modal.remove();
-            if (activeStorageMaintenanceModal === modal) activeStorageMaintenanceModal = null;
-            return onContinue(maintenanceConfirmed);
-        });
+    function storageDestructionWarning() {
+        return '\n\n警告：此操作会不可逆地删除目标逻辑卷中的全部数据。请先停止业务使用，并确认数据可以永久丢弃。\n' +
+            '请按《NFS创建流程》第 8 节回收步骤依序完成：清理 /etc/exports 并刷新 exportfs → 在宿主机上执行普通卸载（umount）→ 精确清理设备在已核实持有者命名空间中的残留挂载 → 确认 OpenCount=0（dmsetup Open=0）→ 执行 lvremove → 清理 /etc/fstab。\n' +
+            '后端不会检查 Kubernetes Pod/PVC 引用。';
     }
 
     async function doDeleteLV(content, wid, lv) {
+        if (storageDeleteRequestPending) return;
         var detail = 'LV ' + lv.vg + '/' + lv.name + ' (' + (lv.size || 0).toFixed(1) + ' GB' + (lv.mp ? ', 挂载于 ' + lv.mp : ', 未挂载') + ')';
-        if (!confirm('确认删除 ' + detail + '？\n系统将自动先卸载并清理 /etc/exports、/etc/fstab, 再执行 lvremove 释放空间。\n该操作不可撤销！')) return;
-        showStorageMaintenanceOption(content, '删除', async function (maintenanceConfirmed) {
+        if (!confirm('确认删除 ' + detail + '？' + storageDestructionWarning())) return;
+        storageDeleteRequestPending = true;
+        try {
             var body = { worker_id: wid, vg_name: lv.vg, lv_name: lv.name };
-            if (maintenanceConfirmed) body.maintenance_confirmed = true;
-            try {
-                var r = await apiJSON('/storage/lv/delete', { method: 'POST', body: JSON.stringify(body) });
-                if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
-                window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
-            } catch (err) { alert('错误: ' + err.message); }
-        });
+            var r = await apiJSON('/storage/lv/delete', { method: 'POST', body: JSON.stringify(body) });
+            if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
+            window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
+        } catch (err) { alert('错误: ' + err.message); }
+        finally { storageDeleteRequestPending = false; }
     }
 
     // ====================================================================
@@ -2520,18 +2472,18 @@
         var reclaimBtn = document.getElementById('btn-reclaim-from-task');
         if (reclaimBtn) {
             reclaimBtn.addEventListener('click', async function () {
+                if (storageReclaimRequestPending) return;
                 var p = currentTaskRegistration || {};
                 var volume = p.vg_name && p.lv_name ? p.vg_name + '/' + p.lv_name : '任务 #' + task.id;
-                if (!confirm('确认回收 NFS 共享 ' + volume + '？\n系统将清理该共享并释放对应虚拟盘空间。\n该操作不可撤销！')) return;
-                showStorageMaintenanceOption(document.getElementById('content'), '回收', async function (maintenanceConfirmed) {
+                if (!confirm('确认回收 NFS 共享 ' + volume + '？' + storageDestructionWarning())) return;
+                storageReclaimRequestPending = true;
+                try {
                     var body = { task_id: task.id };
-                    if (maintenanceConfirmed) body.maintenance_confirmed = true;
-                    try {
-                        var r = await apiJSON('/storage/reclaim', { method: 'POST', body: JSON.stringify(body) });
-                        if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
-                        window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
-                    } catch (err) { alert('错误: ' + err.message); }
-                });
+                    var r = await apiJSON('/storage/reclaim', { method: 'POST', body: JSON.stringify(body) });
+                    if (!r.resp.ok) { alert('错误: ' + (r.data && r.data.error)); return; }
+                    window.location.hash = '#/tasks/' + (r.data && r.data.task_id);
+                } catch (err) { alert('错误: ' + err.message); }
+                finally { storageReclaimRequestPending = false; }
             });
         }
     }

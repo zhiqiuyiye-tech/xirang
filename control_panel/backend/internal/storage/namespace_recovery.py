@@ -754,13 +754,22 @@ def pids():
     return sorted(found)
 
 
-def scan(lv_dev, reserved):
+def scan(lv_dev, reserved, require_local=True):
     device = inspect_device(lv_dev)
     groups = {}
     # Every process is read. Namespace de-duplication never drops other cgroup
     # members: the parent authorizes the complete namespace membership set.
     for pid in pids():
         try:
+            if not require_local:
+                # Handbook lookup is device-based. Unrelated processes (and
+                # their private/chroot roots) are not consumers of this LV.
+                evidence = read_text("/proc/%d/mountinfo" % pid)
+                fields = [line.split(" ") for line in evidence.splitlines()]
+                if not any(
+                    len(row) > 2 and row[2] == device["major_minor"] for row in fields
+                ):
+                    continue
             member, ns, root = process_info(pid)
             mounts = parse_mountinfo(read_text("/proc/%d/mountinfo" % pid))
             member2, ns2, root2 = process_info(pid)
@@ -777,7 +786,7 @@ def scan(lv_dev, reserved):
         group["members"].append(member)
         # Validate each root view immediately; retain only matching mounts,
         # rather than one complete mount table per namespace member.
-        targets = safe_mounts(mounts, device["major_minor"], reserved)
+        targets = safe_mounts(mounts, device["major_minor"], reserved, require_local)
         group["views"].append((member, root, targets if targets else None))
     holders = []
     for ns in sorted(groups):
@@ -928,6 +937,7 @@ def child_unmount(
     preflight,
     parent_pid,
     host_request=None,
+    require_local=True,
 ):
     try:
         # Only our helper child receives a parent-death signal. This never
@@ -965,7 +975,7 @@ def child_unmount(
                 records,
                 holder["mounts"][0]["device"],
                 reserved,
-                require_local=host_request is None,
+                require_local=require_local and host_request is None,
             )
             == holder["mounts"],
             "namespace mount evidence changed",
@@ -981,7 +991,7 @@ def child_unmount(
                     records,
                     mount["device"],
                     reserved,
-                    require_local=host_request is None,
+                    require_local=require_local and host_request is None,
                 )
                 require(mount in approved, "approved mount changed before unmount")
                 validate_mount_path(root_fd, proc_fd, mount)
@@ -995,13 +1005,27 @@ def child_unmount(
 
 
 def spawn_unmount(
-    libc, pinned, holder, reserved, timeout, preflight=False, host_request=None
+    libc,
+    pinned,
+    holder,
+    reserved,
+    timeout,
+    preflight=False,
+    host_request=None,
+    require_local=True,
 ):
     parent_pid = os.getpid()
     pid = os.fork()
     if pid == 0:
         child_unmount(
-            libc, *pinned, holder, reserved, preflight, parent_pid, host_request
+            libc,
+            *pinned,
+            holder,
+            reserved,
+            preflight,
+            parent_pid,
+            host_request,
+            require_local,
         )
     deadline = time.monotonic() + timeout
     while True:
@@ -1136,7 +1160,7 @@ def unmount_shared_host(lv_dev, reserved, snapshot, timeout):
             remove_marker()
 
 
-def cleanup(lv_dev, reserved, snapshot, timeout):
+def cleanup(lv_dev, reserved, snapshot, timeout, require_local=True):
     marker_fd = create_marker()
     pinned = []
     uncertain = False
@@ -1145,7 +1169,7 @@ def cleanup(lv_dev, reserved, snapshot, timeout):
             snapshot["device"] == inspect_device(lv_dev),
             "LV identity changed before cleanup",
         )
-        fresh = scan(lv_dev, reserved)
+        fresh = scan(lv_dev, reserved, require_local=require_local)
         require(
             fresh == snapshot and bool(snapshot["holders"]),
             "authorized snapshot changed before cleanup",
@@ -1193,33 +1217,50 @@ def cleanup(lv_dev, reserved, snapshot, timeout):
                 raise
         # Check every target in its actual root context without any unmount.
         for holder, fds in zip(snapshot["holders"], pinned):
-            spawn_unmount(libc, fds, holder, reserved, timeout, preflight=True)
-        require(scan(lv_dev, reserved) == snapshot, "snapshot changed after preflight")
+            spawn_unmount(
+                libc,
+                fds,
+                holder,
+                reserved,
+                timeout,
+                preflight=True,
+                require_local=require_local,
+            )
+        require(
+            scan(lv_dev, reserved, require_local=require_local) == snapshot,
+            "snapshot changed after preflight",
+        )
         for holder, fds in zip(snapshot["holders"], pinned):
             check_holder_process(holder)
             # Re-scan complete members, including newly created unknown members.
-            actual = []
-            for pid in pids():
-                try:
-                    member, namespace, root = process_info(pid)
-                except FileNotFoundError:
-                    require(
-                        can_skip_missing_process(pid),
-                        "incomplete live process evidence",
-                    )
-                    continue
-                if namespace == holder["namespace"]:
-                    require(
-                        root == (holder["root_dev"], holder["root_ino"]),
-                        "member root changed",
-                    )
-                    actual.append(member)
-            check_members(holder["members"], actual)
+            if require_local:
+                actual = []
+                for pid in pids():
+                    try:
+                        member, namespace, root = process_info(pid)
+                    except FileNotFoundError:
+                        require(
+                            can_skip_missing_process(pid),
+                            "incomplete live process evidence",
+                        )
+                        continue
+                    if namespace == holder["namespace"]:
+                        require(
+                            root == (holder["root_dev"], holder["root_ino"]),
+                            "member root changed",
+                        )
+                        actual.append(member)
+                check_members(holder["members"], actual)
+            # Handbook permission is for the selected device, not a Pod
+            # membership list. Pinned PID/namespace/root/mount evidence is
+            # still checked before the ordinary unmount in either path.
             require(
                 inspect_device(lv_dev) == snapshot["device"],
                 "LV identity changed before unmount",
             )
-            spawn_unmount(libc, fds, holder, reserved, timeout)
+            spawn_unmount(
+                libc, fds, holder, reserved, timeout, require_local=require_local
+            )
         return {"cleaned": True}
     except RecoveryError as exc:
         uncertain = exc.state_unknown
@@ -1269,13 +1310,13 @@ def open_count(identity):
     return int(fields[2])
 
 
-def verify(lv_dev, reserved, identity):
+def verify(lv_dev, reserved, identity, require_local=True):
     for attempt in range(3):
         require(
             inspect_device(lv_dev) == identity,
             "LV identity changed before verification",
         )
-        snapshot = scan(lv_dev, reserved)
+        snapshot = scan(lv_dev, reserved, require_local=require_local)
         require(
             snapshot["device"] == identity and not snapshot["holders"],
             "residual target namespace mounts remain",
@@ -1368,7 +1409,17 @@ def main():
             type(timeout) in (int, float) and 0 < timeout <= 10,
             "invalid unmount timeout",
         )
-        if operation == "delete_inspect":
+        if operation == "inspect_lv":
+            result = inspect_device(lv_dev)
+        elif operation == "scan_delete":
+            result = scan(lv_dev, reserved, require_local=False)
+        elif operation == "cleanup_delete":
+            result = cleanup(
+                lv_dev, reserved, req["payload"], timeout, require_local=False
+            )
+        elif operation == "verify_delete":
+            result = verify(lv_dev, reserved, req["payload"], require_local=False)
+        elif operation == "delete_inspect":
             device = inspect_device(lv_dev)
             mounts = parse_mountinfo(read_text("/proc/self/mountinfo"))
             targets = safe_mounts(mounts, device["major_minor"], reserved, False)
@@ -1438,7 +1489,7 @@ def main():
         response = {
             "ok": False,
             "error": "host recovery probe or evidence failed",
-            "state_unknown": operation in ("cleanup", "host_unmount"),
+            "state_unknown": operation in ("cleanup", "cleanup_delete", "host_unmount"),
         }
     print(json.dumps(response, separators=(",", ":")), flush=True)
     return 1

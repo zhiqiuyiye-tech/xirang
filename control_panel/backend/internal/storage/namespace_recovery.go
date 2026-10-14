@@ -59,6 +59,7 @@ type NamespaceMount struct {
 type NamespaceRecovery struct {
 	runner         ssh.Runner
 	reserved       []string
+	forDeletion    bool // Handbook deletion; resize keeps its original checks.
 	unmountTimeout time.Duration
 }
 
@@ -83,7 +84,11 @@ func validRecoveryIdentity(id DeviceIdentity) bool {
 
 func (n *NamespaceRecovery) Inspect(ctx context.Context, w db.WorkerNode, lvDev string) (DeviceIdentity, error) {
 	var id DeviceIdentity
-	err := n.call(ctx, w, lvDev, "inspect", nil, &id)
+	operation := "inspect"
+	if n.forDeletion {
+		operation = "inspect_lv"
+	}
+	err := n.call(ctx, w, lvDev, operation, nil, &id)
 	if err == nil && !validRecoveryIdentity(id) {
 		err = errors.New("invalid logical volume identity")
 	}
@@ -91,7 +96,11 @@ func (n *NamespaceRecovery) Inspect(ctx context.Context, w db.WorkerNode, lvDev 
 }
 func (n *NamespaceRecovery) Scan(ctx context.Context, w db.WorkerNode, lvDev string) (NamespaceSnapshot, error) {
 	var snapshot NamespaceSnapshot
-	err := n.call(ctx, w, lvDev, "scan", nil, &snapshot)
+	operation := "scan"
+	if n.forDeletion {
+		operation = "scan_delete"
+	}
+	err := n.call(ctx, w, lvDev, operation, nil, &snapshot)
 	if err == nil {
 		err = validateRecoverySnapshot(snapshot, false)
 	}
@@ -104,7 +113,11 @@ func (n *NamespaceRecovery) Cleanup(ctx context.Context, w db.WorkerNode, lvDev 
 	var result struct {
 		Cleaned bool `json:"cleaned"`
 	}
-	if err := n.call(ctx, w, lvDev, "cleanup", snapshot, &result); err != nil {
+	operation := "cleanup"
+	if n.forDeletion {
+		operation = "cleanup_delete"
+	}
+	if err := n.call(ctx, w, lvDev, operation, snapshot, &result); err != nil {
 		return err
 	}
 	if !result.Cleaned {
@@ -113,7 +126,11 @@ func (n *NamespaceRecovery) Cleanup(ctx context.Context, w db.WorkerNode, lvDev 
 	return nil
 }
 func (n *NamespaceRecovery) VerifyReleased(ctx context.Context, w db.WorkerNode, lvDev string, identity DeviceIdentity) error {
-	return n.verifyReleased(ctx, w, lvDev, identity, "verify")
+	operation := "verify"
+	if n.forDeletion {
+		operation = "verify_delete"
+	}
+	return n.verifyReleased(ctx, w, lvDev, identity, operation)
 }
 
 // VerifySharedReleased uses the task-bound recovery mode. Strict tasks retain
@@ -208,7 +225,7 @@ func (n *NamespaceRecovery) call(ctx context.Context, w db.WorkerNode, dev, oper
 		"command -v python3 >/dev/null && command -v timeout >/dev/null && timeout --version | grep -q 'GNU coreutils' || { echo 'namespace recovery requires host Python3 and GNU timeout' >&2; exit 127; }; exec timeout --signal=TERM --kill-after=2s "+fmt.Sprintf("%.3fs", budget.Seconds())+" python3 -I -c "+recoveryQuote(namespaceRecoveryHelper))
 	out, _, code, runErr := n.runner.RunWithStdin(ctx, w, command, bytes.NewReader(input))
 	unknown := func(err error) error {
-		if operation == "cleanup" || operation == "host_unmount" {
+		if operation == "cleanup" || operation == "cleanup_delete" || operation == "host_unmount" {
 			return fmt.Errorf("%w: %v", ErrNamespaceStateUnknown, err)
 		}
 		return err

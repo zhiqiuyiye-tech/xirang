@@ -85,23 +85,12 @@ func main() {
 			return k8s.CheckNFSPodUsage(ctx, k8sClient, workerHost, exportPath, cfg.NonNFSCSIDrivers...)
 		}
 	}
-	var namespaceAuthorizer storage.NamespaceCleanupAuthorizer
-	var hostUnmountAuthorizer storage.NamespaceCleanupAuthorizer
-	if len(cfg.NamespaceCleanupAllowlist) > 0 && k8sClient != nil {
-		namespaceAuthorizer = func(ctx context.Context, workerHost, exportPath string, holders []storage.NamespaceHolder) error {
-			return k8s.AuthorizeNamespaceCleanup(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist, cfg.NonNFSCSIDrivers...)
-		}
-		hostUnmountAuthorizer = func(ctx context.Context, workerHost, exportPath string, holders []storage.NamespaceHolder) error {
-			return k8s.AuthorizeHostUnmount(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist, cfg.NonNFSCSIDrivers...)
-		}
-	}
 	storage.RegisterStorageHandlers(
 		eng, sshm, store,
 		storage.WithReservedMounts(cfg.ReservedMountPoints...),
 		storage.WithPodGuardChecker(podChecker),
-		storage.WithNamespaceCleanup(namespaceAuthorizer, cfg.NamespaceCleanupTimeout, cfg.NamespaceUnmountTimeout),
-		storage.WithSharedHostMaintenance(cfg.SharedHostMaintenance),
-		storage.WithHostUnmountAuthorizer(hostUnmountAuthorizer),
+		// Pod checker remains for resize only; handbook deletion has no K8s gate.
+		storage.WithNamespaceCleanup(nil, cfg.NamespaceCleanupTimeout, cfg.NamespaceUnmountTimeout),
 	)
 
 	appCtx, appCancel := context.WithCancel(context.Background())
