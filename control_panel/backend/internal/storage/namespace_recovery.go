@@ -113,6 +113,17 @@ func (n *NamespaceRecovery) Cleanup(ctx context.Context, w db.WorkerNode, lvDev 
 	return nil
 }
 func (n *NamespaceRecovery) VerifyReleased(ctx context.Context, w db.WorkerNode, lvDev string, identity DeviceIdentity) error {
+	return n.verifyReleased(ctx, w, lvDev, identity, "verify")
+}
+
+// VerifySharedReleased uses the task-bound recovery mode. Strict tasks retain
+// kernel inventory proof; only explicitly attested maintenance tasks use the
+// process-visible scope. Kernel errors never cause an automatic downgrade.
+func (n *NamespaceRecovery) VerifySharedReleased(ctx context.Context, w db.WorkerNode, lvDev string, identity DeviceIdentity) error {
+	return n.verifyReleased(ctx, w, lvDev, identity, "host_verify")
+}
+
+func (n *NamespaceRecovery) verifyReleased(ctx context.Context, w db.WorkerNode, lvDev string, identity DeviceIdentity, operation string) error {
 	if !validRecoveryIdentity(identity) {
 		return errors.New("invalid expected device identity")
 	}
@@ -120,7 +131,11 @@ func (n *NamespaceRecovery) VerifyReleased(ctx context.Context, w db.WorkerNode,
 		Released bool           `json:"released"`
 		Device   DeviceIdentity `json:"device"`
 	}
-	if err := n.call(ctx, w, lvDev, "verify", identity, &result); err != nil {
+	var payload any = identity
+	if operation == "host_verify" {
+		payload = map[string]any{"device": identity, "mode": hostUnmountMode(ctx)}
+	}
+	if err := n.call(ctx, w, lvDev, operation, payload, &result); err != nil {
 		return err
 	}
 	if !result.Released || result.Device != identity {
@@ -193,7 +208,7 @@ func (n *NamespaceRecovery) call(ctx context.Context, w db.WorkerNode, dev, oper
 		"command -v python3 >/dev/null && command -v timeout >/dev/null && timeout --version | grep -q 'GNU coreutils' || { echo 'namespace recovery requires host Python3 and GNU timeout' >&2; exit 127; }; exec timeout --signal=TERM --kill-after=2s "+fmt.Sprintf("%.3fs", budget.Seconds())+" python3 -I -c "+recoveryQuote(namespaceRecoveryHelper))
 	out, _, code, runErr := n.runner.RunWithStdin(ctx, w, command, bytes.NewReader(input))
 	unknown := func(err error) error {
-		if operation == "cleanup" {
+		if operation == "cleanup" || operation == "host_unmount" {
 			return fmt.Errorf("%w: %v", ErrNamespaceStateUnknown, err)
 		}
 		return err

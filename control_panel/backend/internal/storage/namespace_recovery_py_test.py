@@ -169,6 +169,68 @@ class ParserTests(unittest.TestCase):
             evidence.return_value = HOST_NSFS
             self.assertTrue(r.verify("/dev/vg/lv", [], identity)["released"])
 
+    def test_shared_leaf_under_private_parent_can_be_ordinary_unmounted(self):
+        text = ROOT + TARGET.replace("rw -", "rw shared:578 -")
+        self.assertEqual(
+            r.safe_mounts(r.parse_mountinfo(text), "253:0", []),
+            r.parse_mountinfo(text)[1:],
+        )
+        # The same leaf under a shared direct parent still cannot be cleaned
+        # inside a container without cross-namespace propagation authorization.
+        shared_root = ROOT.replace("rw -", "rw shared:1 -")
+        shared_leaf = TARGET.replace("rw -", "rw shared:578 -")
+        with self.assertRaises(r.RecoveryError):
+            r.safe_mounts(r.parse_mountinfo(shared_root + shared_leaf), "253:0", [])
+
+    def test_shared_leaf_classification_preserves_resize_inspection_policy(self):
+        import io
+
+        text = ROOT + TARGET.replace("rw -", "rw shared:578 -")
+        identity = {"uuid": "u", "major_minor": "253:0"}
+        for operation in ("inspect", "delete_inspect"):
+            request = {
+                "operation": operation,
+                "lv_dev": "/dev/vg/lv",
+                "reserved": [],
+                "unmount_timeout": 1,
+                "payload": None,
+            }
+            output = io.StringIO()
+            with (
+                self.subTest(operation=operation),
+                patch.object(r.sys, "platform", "linux"),
+                patch.object(r.os, "geteuid", return_value=0, create=True),
+                patch.object(r.sys, "stdin", io.StringIO(json.dumps(request))),
+                patch.object(r.sys, "stdout", output),
+                patch.object(r, "inspect_device", return_value=identity),
+                patch.object(r, "read_text", return_value=text),
+            ):
+                status = r.main()
+            result = json.loads(output.getvalue())
+            if operation == "inspect":
+                self.assertEqual(status, 1)
+            else:
+                self.assertEqual(status, 0)
+                self.assertFalse(result["result"]["requires_host_authorization"])
+
+    def test_receive_only_slave_parent_does_not_propagate_leaf_unmount_outward(self):
+        # HostToContainer log mounts may be slaves: receive host events, never
+        # send this local leaf removal to the master or another peer group.
+        text = (
+            ROOT
+            + "2 1 8:3 /data02 /host-data rw master:1 - ext4 /dev/sda3 rw\n"
+            + "10 2 253:0 / /host-data/test rw shared:578 - ext4 /dev/dm-0 rw\n"
+        )
+        self.assertEqual(len(r.safe_mounts(r.parse_mountinfo(text), "253:0", [])), 1)
+        with self.assertRaises(r.RecoveryError):
+            r.safe_mounts(
+                r.parse_mountinfo(
+                    text.replace("rw master:1 -", "rw shared:7 master:1 -")
+                ),
+                "253:0",
+                [],
+            )
+
     def test_shared_ancestor_above_private_parent_is_safe(self):
         root = ROOT.replace("rw -", "rw shared:1 -")
         parent = "2 1 8:1 / /data02 rw - xfs /dev/sdb1 rw\n"

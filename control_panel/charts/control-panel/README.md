@@ -34,6 +34,15 @@ adding Pod deletion permissions. See [the operator guide](../../docs/nfs-namespa
 before enabling recovery, including isolated Linux validation and handling
 uncertain-executor markers.
 
+Linux 5.10 maintenance recovery is separately gated by
+`config.sharedHostMaintenanceEnabled` (default `false`) and explicit
+`maintenance_confirmed: true` on each delete/reclaim task. Enabling the server
+flag alone never downgrades strict mode. Maintenance relies on an operator's
+controlled-window attestation and process-visible evidence, not complete kernel
+namespace enumeration. All visible foreign holders still require the exact
+workload allowlist; business use and busy devices remain blockers. Keep this
+flag off until isolated Linux validation and an approved maintenance window.
+
 ## Prerequisites
 
 1. **Private registry image pushed** (the master must be able to pull it):
@@ -67,10 +76,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.14.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.15.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.14`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.15`.
 
 ## Install
 

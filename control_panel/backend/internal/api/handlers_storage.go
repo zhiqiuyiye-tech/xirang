@@ -64,6 +64,9 @@ func (h *storageHandlers) reclaim(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if !validateMaintenanceConfirmation(c, req) {
+		return
+	}
 	wid := normalizeWorkerID(req)
 	if value, exists := req["task_id"]; exists && value != nil {
 		provisionID, parseErr := parseWorkerID(value)
@@ -463,6 +466,9 @@ func (h *storageHandlers) deleteLV(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if !validateMaintenanceConfirmation(c, req) {
+		return
+	}
 	wid := normalizeWorkerID(req)
 	taskID, err := h.eng.Submit(c, "storage_delete_lv", "storage", wid, req)
 	if err != nil {
@@ -471,6 +477,18 @@ func (h *storageHandlers) deleteLV(c *gin.Context) {
 	}
 	h.audit(c, "storage.delete_lv", strconv.FormatInt(wid, 10), "submitted", req, map[string]any{"task_id": taskID})
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID})
+}
+
+// Confirmation is per submitted task. Never coerce strings/numbers into an
+// administrator's acknowledgment of the reduced maintenance-mode guarantee.
+func validateMaintenanceConfirmation(c *gin.Context, req map[string]any) bool {
+	if value, present := req["maintenance_confirmed"]; present {
+		if _, valid := value.(bool); !valid {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "maintenance_confirmed must be a JSON boolean"})
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeWorkerID ensures submitted task params contain a numeric worker_id,

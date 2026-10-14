@@ -66,6 +66,9 @@ spec:
             - name: WORKER_ACCELERATOR_TIMEOUT
               value: "45s"
             # Empty allowlist keeps automatic container namespace cleanup disabled.
+            # Default off; explicit confirmation is also required on each task.
+            - name: SHARED_HOST_MAINTENANCE_ENABLED
+              value: "false"
             - name: NAMESPACE_CLEANUP_ALLOWLIST
               value: ""
             - name: NAMESPACE_CLEANUP_TIMEOUT

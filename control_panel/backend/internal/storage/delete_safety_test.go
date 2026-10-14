@@ -101,7 +101,10 @@ func TestReclaimHandlerStillReclaimsUnusedMountedNFS(t *testing.T) {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
 		scriptResult{stdout: "/data02/share\n"}, scriptResult{stdout: ""})
 	identity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
-	sr.add("cp-storage-namespace-inspect", identity, identity)
+	sr.add("cp-storage-namespace-delete_inspect", scriptResult{stdout: `{"ok":true,"result":{"device":{"uuid":"stable-uuid","major_minor":"253:0"},"requires_host_authorization":false}}`})
+	sr.add("cp-storage-namespace-inspect", identity)
+	sr.add("cp-storage-namespace-scan", scriptResult{stdout: `{"ok":true,"result":{"device":{"uuid":"stable-uuid","major_minor":"253:0"},"holders":[]}}`})
+	sr.add("cp-storage-namespace-verify", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`})
 	var podPaths []string
 	checker := func(_ context.Context, _, exportPath string) (bool, []string, error) {
 		podPaths = append(podPaths, exportPath)
@@ -124,8 +127,8 @@ func TestReclaimHandlerStillReclaimsUnusedMountedNFS(t *testing.T) {
 	if len(podPaths) != 2 || podPaths[0] != "/data02/share" || podPaths[1] != "/data02/share" {
 		t.Fatalf("Pod guard paths=%v, want two checks of /data02/share", podPaths)
 	}
-	if sr.counts["cp-storage-namespace-inspect"] != 2 {
-		t.Fatalf("LV identity inspect count=%d, want initial and pre-removal inspections", sr.counts["cp-storage-namespace-inspect"])
+	if sr.counts["cp-storage-namespace-inspect"] != 1 || sr.counts["cp-storage-namespace-delete_inspect"] != 1 {
+		t.Fatalf("LV identity inspections must include deletion planning and pre-removal verification")
 	}
 	if sr.counts["findmnt -rn -o TARGET --source /dev/vg_data/lv_1"] != 2 {
 		t.Fatalf("live mount lookup count=%d, want detection and unmounted verification", sr.counts["findmnt -rn -o TARGET --source /dev/vg_data/lv_1"])
@@ -133,7 +136,7 @@ func TestReclaimHandlerStillReclaimsUnusedMountedNFS(t *testing.T) {
 
 	commands := strings.Join(sr.calls, "\n")
 	findmnt := strings.Index(commands, "findmnt -rn -o TARGET --source /dev/vg_data/lv_1")
-	firstIdentity := strings.Index(commands, "# cp-storage-namespace-inspect")
+	firstIdentity := strings.Index(commands, "# cp-storage-namespace-delete_inspect")
 	removeExport := strings.Index(commands, "sed -i '\\#^/data02/share #d' /etc/exports")
 	exportfs := strings.Index(commands, "exportfs -arv")
 	unmount := strings.Index(commands, "umount /data02/share")

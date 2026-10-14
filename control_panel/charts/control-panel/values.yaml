@@ -73,6 +73,8 @@ config:
   # Total SSH + device-tool query budget, including slow session startup.
   workerAcceleratorTimeout: "45s"
   # Explicit namespace/DaemonSet/container triples. Empty disables namespace cleanup.
+  # Default off; each maintenance task also requires explicit confirmation.
+  sharedHostMaintenanceEnabled: false
   namespaceCleanupAllowlist: []
   namespaceCleanupTimeout: "60s"
   namespaceUnmountTimeout: "10s"

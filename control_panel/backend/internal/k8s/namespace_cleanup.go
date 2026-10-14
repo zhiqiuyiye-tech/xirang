@@ -27,6 +27,18 @@ var (
 // before ordinary unmount. Every member of every supplied namespace must be
 // identified and permitted; the default empty allowlist always denies cleanup.
 func AuthorizeNamespaceCleanup(ctx context.Context, client kubernetes.Interface, workerHost string, exportPath string, holders []storage.NamespaceHolder, allowlist []string, nonNFSDrivers ...string) error {
+	return authorizeNamespaceHolders(ctx, client, workerHost, exportPath, holders, allowlist, false, nonNFSDrivers...)
+}
+
+// AuthorizeHostUnmount permits propagation metadata only for a host unmount
+// whose complete peer/slave scope is separately verified by the remote helper.
+// Workload, node, cgroup, runtime ID, inherited-path and business-use checks are
+// identical to private namespace cleanup. This is not container unmount permission.
+func AuthorizeHostUnmount(ctx context.Context, client kubernetes.Interface, workerHost string, exportPath string, holders []storage.NamespaceHolder, allowlist []string, nonNFSDrivers ...string) error {
+	return authorizeNamespaceHolders(ctx, client, workerHost, exportPath, holders, allowlist, true, nonNFSDrivers...)
+}
+
+func authorizeNamespaceHolders(ctx context.Context, client kubernetes.Interface, workerHost string, exportPath string, holders []storage.NamespaceHolder, allowlist []string, hostPropagation bool, nonNFSDrivers ...string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -141,7 +153,7 @@ func AuthorizeNamespaceCleanup(ctx context.Context, client kubernetes.Interface,
 			if ds.UID != owner.UID || ds.DeletionTimestamp != nil {
 				return fmt.Errorf("holder DaemonSet identity changed or is terminating")
 			}
-			if err := verifyParentHostPath(*fresh, container, target, holder.Mounts); err != nil {
+			if err := verifyParentHostPathMode(*fresh, container, target, holder.Mounts, hostPropagation); err != nil {
 				return fmt.Errorf("%s: %w", entry, err)
 			}
 		}
@@ -275,6 +287,12 @@ func cleanupContainer(pod corev1.Pod, identity cleanupCgroupIdentity) (corev1.Co
 	return corev1.Container{}, fmt.Errorf("holder full runtime container ID does not match a regular Pod container")
 }
 func verifyParentHostPath(pod corev1.Pod, container corev1.Container, target string, mounts []storage.NamespaceMount) error {
+	return verifyParentHostPathMode(pod, container, target, mounts, false)
+}
+
+var hostPropagationTag = regexp.MustCompile(`^(shared|master|propagate_from):[1-9][0-9]*$`)
+
+func verifyParentHostPathMode(pod corev1.Pod, container corev1.Container, target string, mounts []storage.NamespaceMount, hostPropagation bool) error {
 	var inheritedTargets []string
 	for _, vm := range container.VolumeMounts {
 		for _, vol := range pod.Spec.Volumes {
@@ -306,7 +324,9 @@ func verifyParentHostPath(pod corev1.Pod, container corev1.Container, target str
 				return fmt.Errorf("invalid or root-replacing container parent mount path")
 			}
 			if vm.MountPropagation != nil && *vm.MountPropagation != corev1.MountPropagationNone {
-				return fmt.Errorf("parent hostPath propagation is not private")
+				if !hostPropagation || (*vm.MountPropagation != corev1.MountPropagationHostToContainer && *vm.MountPropagation != corev1.MountPropagationBidirectional) {
+					return fmt.Errorf("parent hostPath propagation is not private or recognized")
+				}
 			}
 			relative := strings.TrimPrefix(strings.TrimPrefix(target, effective), "/")
 			inherited := path.Join(containerPath, relative)
@@ -335,9 +355,16 @@ func verifyParentHostPath(pod corev1.Pod, container corev1.Container, target str
 			return fmt.Errorf("invalid inherited filesystem root")
 		}
 		for _, optional := range mount.Optional {
-			if strings.HasPrefix(optional, "shared:") || strings.HasPrefix(optional, "master:") || strings.HasPrefix(optional, "propagate_from:") {
-				return fmt.Errorf("inherited mount has unsafe propagation")
+			if hostPropagation {
+				if optional != "unbindable" && !hostPropagationTag.MatchString(optional) {
+					return fmt.Errorf("inherited mount has unknown propagation")
+				}
+			} else if len(mount.Optional) != 1 || !strings.HasPrefix(optional, "shared:") || !hostPropagationTag.MatchString(optional) {
+				return fmt.Errorf("inherited mount has unsafe or unknown propagation")
 			}
+			// A leaf's own shared tag does not propagate removal of the leaf.
+			// The declared hostPath parent must remain private; the trusted
+			// executor revalidates its real parent and topology before umount.
 		}
 		matched := false
 		for _, inherited := range inheritedTargets {

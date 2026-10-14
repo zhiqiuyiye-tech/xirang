@@ -5,6 +5,8 @@ Unknown/unsafe evidence is fatal; no force/lazy unmount or business process kill
 """
 
 import ctypes
+import errno
+import hashlib
 import json
 import os
 import posixpath
@@ -132,7 +134,7 @@ def within(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def safe_mounts(records, device, reserved):
+def safe_mounts(records, device, reserved, require_local=True):
     require(DEVICE_PATTERN.fullmatch(device), "invalid target device")
     by_id = {m["id"]: m for m in records}
     paths = {}
@@ -176,10 +178,20 @@ def safe_mounts(records, device, reserved):
         # private parent isolates the event even if more distant ancestors are
         # shared. Keep structural checks for the whole ancestry below.
         require(mount["parent_id"] in by_id, "unknown mount parent")
-        require(
-            not mount["optional"] and not by_id[mount["parent_id"]]["optional"],
-            "target/direct-parent propagation not proven private",
-        )
+        if require_local:
+            # This is a leaf (no child mounts). An unmount event propagates
+            # outward only through the DIRECT parent mount. A private parent
+            # or a receive-only slave parent (master without shared) isolates
+            # this unmount locally: events do NOT propagate to the master.
+            leaf_tags = propagation_tags(mount)
+            parent_tags = propagation_tags(by_id[mount["parent_id"]])
+            require(
+                set(leaf_tags) <= {"shared"} and "shared" not in parent_tags,
+                "target/direct-parent propagation not proven local",
+            )
+        else:
+            propagation_tags(mount)
+            propagation_tags(by_id[mount["parent_id"]])
         current = mount
         visited = set()
         while True:
@@ -196,6 +208,365 @@ def safe_mounts(records, device, reserved):
             )
             current = parent
     return sorted(targets, key=lambda m: m["id"])
+
+
+def propagation_tags(mount):
+    tags = {}
+    for field in mount["optional"]:
+        if field == "unbindable":
+            require(not tags, "inconsistent unbindable propagation")
+            tags[field] = True
+            continue
+        match = re.fullmatch(r"(shared|master|propagate_from):([1-9][0-9]*)", field)
+        require(match is not None, "unknown or invalid mount propagation")
+        key, value = match.groups()
+        require(key not in tags and "unbindable" not in tags, "duplicate propagation")
+        tags[key] = int(value)
+    require(
+        "propagate_from" not in tags or "master" in tags,
+        "propagate_from without master",
+    )
+    require(
+        "shared" not in tags or tags["shared"] != tags.get("master"),
+        "cyclic mount propagation",
+    )
+    return tags
+
+
+def shared_unmount_plan_from_views(
+    device, host_ns, views, paths, reserved, mode="strict"
+):
+    """Prove the possible recipients of ONE host leaf unmount.
+
+    The parent peer/slave graph, not the target's shared ID alone, controls
+    umount propagation. Resolve the mountpoint in the parent's filesystem,
+    accounting for subdirectory bind roots in recipient namespaces. All other
+    LV holders (including private copies) are returned for explicit permission.
+    """
+    require(
+        isinstance(mode, str) and mode in ("strict", "maintenance"),
+        "invalid host recovery mode",
+    )
+    require(host_ns in views, "host namespace evidence missing")
+    host_view = views[host_ns]
+    host_mounts = host_view["mounts"]
+    targets = safe_mounts(host_mounts, device["major_minor"], reserved, False)
+    require(
+        len(targets) == 1 and paths == [targets[0]["path"]],
+        "shared host unmount requires one unchanged host LV mount",
+    )
+    target = targets[0]
+    parent = next(m for m in host_mounts if m["id"] == target["parent_id"])
+    source_tags = propagation_tags(parent)
+    coordinate = posixpath.join(
+        parent["root"], posixpath.relpath(target["path"], parent["path"])
+    )
+    require(
+        coordinate.startswith("/") and posixpath.normpath(coordinate) == coordinate,
+        "noncanonical shared parent filesystem coordinate",
+    )
+    mounts = []
+    for ns, item in sorted(views.items()):
+        for mount in item["mounts"]:
+            mounts.append((ns, mount, propagation_tags(mount)))
+    # Follow peer groups and downstream slave+shared groups to a fixed point.
+    reachable = {source_tags["shared"]} if "shared" in source_tags else set()
+    changed = True
+    while changed:
+        changed = False
+        for _, _, tags in mounts:
+            if (
+                tags.get("master") in reachable
+                or tags.get("propagate_from") in reachable
+            ):
+                group = tags.get("shared")
+                if group is not None and group not in reachable:
+                    reachable.add(group)
+                    changed = True
+    # Reject cyclic peer/slave metadata instead of assuming a direction.
+    edges = {}
+    for _, _, tags in mounts:
+        if "shared" in tags and "master" in tags:
+            edges.setdefault(tags["master"], set()).add(tags["shared"])
+    colors = {}
+    for group in reachable:
+        pending = [(group, False, 0)]
+        while pending:
+            current, exiting, depth = pending.pop()
+            if exiting:
+                colors[current] = 2
+                continue
+            if colors.get(current) == 2:
+                continue
+            require(colors.get(current) != 1, "cyclic mount propagation")
+            require(depth < 256, "propagation depth exceeds limit")
+            colors[current] = 1
+            pending.append((current, True, depth))
+            pending.extend(
+                (child, False, depth + 1) for child in edges.get(current, ())
+            )
+    for ns, receiver, tags in mounts:
+        if not any(
+            tags.get(key) in reachable for key in ("shared", "master", "propagate_from")
+        ):
+            continue
+        require(
+            receiver["device"] == parent["device"], "propagation parent device mismatch"
+        )
+        require(
+            receiver["root"].startswith("/")
+            and posixpath.normpath(receiver["root"]) == receiver["root"],
+            "inaccessible propagation parent root",
+        )
+        if not within(coordinate, receiver["root"]):
+            continue
+        require(coordinate != receiver["root"], "propagation intersects receiver root")
+        recipient_path = posixpath.join(
+            receiver["path"], posixpath.relpath(coordinate, receiver["root"])
+        )
+        candidates = [m for m in views[ns]["mounts"] if m["path"] == recipient_path]
+        require(len(candidates) <= 1, "stacked propagation recipient")
+        if not candidates:
+            continue
+        recipient = candidates[0]
+        require(
+            recipient["parent_id"] == receiver["id"]
+            and recipient["device"] == device["major_minor"]
+            and recipient["root"] == target["root"],
+            "shared unmount would affect another device or ambiguous mount",
+        )
+    host_member = next((m for m in host_view["members"] if m["pid"] == 1), None)
+    require(host_member is not None, "initial host process evidence missing")
+
+    def holder(ns, item, chosen, member=None):
+        members = sorted(item["members"], key=lambda m: m["pid"])
+        representative = member or members[0]
+        return dict(
+            representative,
+            namespace=ns,
+            root_dev=item["root"][0],
+            root_ino=item["root"][1],
+            mounts=chosen,
+            members=[member] if member is not None else members,
+        )
+
+    host = holder(host_ns, host_view, targets, host_member)
+    holders = []
+    evidence = []
+    for ns, item in sorted(views.items()):
+        chosen = safe_mounts(item["mounts"], device["major_minor"], reserved, False)
+        if ns != host_ns and chosen:
+            holders.append(holder(ns, item, chosen))
+        evidence.append(
+            {
+                "namespace": ns,
+                "root": item["root"],
+                "mounts": sorted(item["mounts"], key=lambda m: m["id"]),
+            }
+        )
+    result = {"mode": mode, "device": device, "host": host, "holders": holders}
+    # Include non-target mounts too: an overmount or newly created recipient
+    # namespace must invalidate the authorization, even on another device.
+    proof = json.dumps(
+        dict(result, views=evidence), sort_keys=True, separators=(",", ":")
+    )
+    result["proof"] = hashlib.sha256(proof.encode("utf-8")).hexdigest()
+    return result
+
+
+def collect_mount_views():
+    views = {}
+    references = set()
+    retained_mounts = 0
+    fd_count = 0
+    for pid in pids():
+        try:
+            member, namespace, root = process_info(pid)
+            mounts = parse_mountinfo(read_text("/proc/%d/mountinfo" % pid))
+            # A pinned mount namespace without any task cannot be authorized
+            # from Pod/process evidence. Detect namespace FDs and nsfs binds.
+            for mount in mounts:
+                if re.fullmatch(r"mnt:\[[1-9][0-9]*\]", mount["root"]):
+                    references.add(mount["root"])
+            base = "/proc/%d/fd" % pid
+            for name in os.listdir(base):
+                fd_count += 1
+                require(fd_count <= 262144, "namespace FD scan exceeds limit")
+                try:
+                    link = os.readlink(base + "/" + name)
+                except FileNotFoundError:
+                    continue  # A descriptor may close while its task is live.
+                if re.fullmatch(r"mnt:\[[1-9][0-9]*\]", link):
+                    references.add(link)
+            require(
+                (member, namespace, root) == process_info(pid),
+                "process changed during shared mount scan",
+            )
+        except FileNotFoundError:
+            require(can_skip_missing_process(pid), "incomplete live process evidence")
+            continue
+        except PermissionError as exc:
+            raise RecoveryError(
+                "permission denied reading shared mount evidence"
+            ) from exc
+        item = views.get(namespace)
+        if item is None:
+            retained_mounts += len(mounts)
+            require(retained_mounts <= MAX_MOUNTS, "shared mount scan exceeds limit")
+            views[namespace] = {"root": root, "mounts": mounts, "members": [member]}
+            require(len(views) <= 4096, "namespace scale exceeds limit")
+        else:
+            require(
+                item["root"] == root and item["mounts"] == mounts,
+                "namespace has inconsistent or inaccessible root/mount views",
+            )
+            item["members"].append(member)
+    require(
+        references <= set(views), "pinned mount namespace has no identifiable members"
+    )
+    return views
+
+
+def kernel_mount_inventory():
+    """Enumerate nsfs kernel objects, including namespaces without tasks.
+
+    Linux 6.12 introduced NS_MNT_GET_{INFO,NEXT,PREV}. /proc enumeration alone
+    cannot see a namespace retained only by queued SCM_RIGHTS or another pin.
+    Never fall back to a partial process inventory for a shared unmount.
+    """
+    require(
+        os.uname().machine in ("x86_64", "aarch64"),
+        "shared unmount kernel inventory supports only x86_64/aarch64",
+    )
+    # PROC_USER_INIT_INO is the Linux reserved initial user namespace inode, not
+    # a workload-specific namespace ID. It prevents capability-filtered walks
+    # in a child user namespace from masquerading as a complete host inventory.
+    require(
+        os.readlink("/proc/self/ns/user") == "user:[4026531837]",
+        "complete mount namespace inventory requires the initial user namespace",
+    )
+    caps = re.search(
+        r"^CapEff:\s*([0-9a-fA-F]+)$", read_text("/proc/self/status"), re.MULTILINE
+    )
+    require(
+        caps is not None and int(caps.group(1), 16) & (1 << 21),
+        "host CAP_SYS_ADMIN is required",
+    )
+
+    class MountNSInfo(ctypes.Structure):
+        _fields_ = [
+            ("size", ctypes.c_uint32),
+            ("nr_mounts", ctypes.c_uint32),
+            ("mnt_ns_id", ctypes.c_uint64),
+        ]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.ioctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)
+    libc.ioctl.restype = ctypes.c_int
+    # Linux generic _IOR(0xb7, command, struct mnt_ns_info), size 16.
+    info_command, next_command, prev_command = 0x8010B70A, 0x8010B70B, 0x8010B70C
+    initial = os.open("/proc/self/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+    inventory = {}
+
+    def remember(fd, info):
+        namespace = "mnt:[%d]" % os.fstat(fd).st_ino
+        require(
+            namespace not in inventory and info.mnt_ns_id > 0,
+            "inconsistent kernel namespace inventory",
+        )
+        require(
+            0 < info.nr_mounts <= MAX_MOUNTS,
+            "kernel namespace mount count exceeds limit",
+        )
+        inventory[namespace] = {"id": info.mnt_ns_id, "mounts": info.nr_mounts}
+        require(len(inventory) <= 4096, "kernel namespace scale exceeds limit")
+
+    try:
+        info = MountNSInfo(size=ctypes.sizeof(MountNSInfo))
+        require(
+            libc.ioctl(initial, info_command, ctypes.byref(info)) == 0,
+            "shared host unmount requires kernel NS_MNT_GET_INFO/NEXT/PREV (Linux 6.12+ or a compatible backport); retaining volume",
+        )
+        remember(initial, info)
+        for command in (next_command, prev_command):
+            current = initial
+            try:
+                while True:
+                    info = MountNSInfo(size=ctypes.sizeof(MountNSInfo))
+                    child = libc.ioctl(current, command, ctypes.byref(info))
+                    if child < 0:
+                        require(
+                            ctypes.get_errno() == errno.ENOENT,
+                            "complete kernel namespace enumeration failed",
+                        )
+                        break
+                    if current != initial:
+                        os.close(current)
+                    current = child
+                    remember(current, info)
+            finally:
+                if current != initial:
+                    os.close(current)
+        return inventory
+    finally:
+        os.close(initial)
+
+
+def complete_mount_views():
+    inventory = kernel_mount_inventory()
+    views = collect_mount_views()
+    require(
+        inventory == kernel_mount_inventory() and set(inventory) == set(views),
+        "kernel mount namespaces changed or have no identifiable task/root evidence",
+    )
+    require(
+        all(
+            inventory[ns]["mounts"] == len(item["mounts"]) for ns, item in views.items()
+        ),
+        "kernel mount count exposes incomplete process mount views",
+    )
+    return views, inventory
+
+
+def host_mode_views(mode):
+    require(
+        isinstance(mode, str) and mode in ("strict", "maintenance"),
+        "invalid host recovery mode",
+    )
+    if mode == "strict":
+        return complete_mount_views()
+    # Explicit administrator attestation only. Never enter this branch because
+    # kernel enumeration failed, and never label this as complete kernel proof.
+    return collect_mount_views(), None
+
+
+def shared_host_plan(lv_dev, reserved, expected, paths, mode="strict"):
+    require(
+        isinstance(mode, str) and mode in ("strict", "maintenance"),
+        "invalid host recovery mode",
+    )
+    device = inspect_device(lv_dev)
+    require(device == expected, "LV identity changed before shared host scan")
+    host_ns = os.readlink("/proc/self/ns/mnt")
+    _, init_ns, init_root = process_info(1)
+    own_root = os.stat("/")
+    require(
+        host_ns == init_ns and (own_root.st_dev, own_root.st_ino) == init_root,
+        "shared host unmount requires the initial host namespace/root",
+    )
+    views, inventory = host_mode_views(mode)
+    result = shared_unmount_plan_from_views(
+        device, host_ns, views, paths, reserved, mode
+    )
+    if inventory is not None:
+        kernel_proof = json.dumps(inventory, sort_keys=True, separators=(",", ":"))
+        result["proof"] = hashlib.sha256(
+            (result["proof"] + kernel_proof).encode("utf-8")
+        ).hexdigest()
+    require(
+        inspect_device(lv_dev) == device, "LV identity changed during shared host scan"
+    )
+    return result
 
 
 def parse_starttime(text):
@@ -548,7 +919,15 @@ def validate_mount_path(root_fd, proc_fd, mount):
 
 
 def child_unmount(
-    libc, ns_fd, root_fd, proc_fd, holder, reserved, preflight, parent_pid
+    libc,
+    ns_fd,
+    root_fd,
+    proc_fd,
+    holder,
+    reserved,
+    preflight,
+    parent_pid,
+    host_request=None,
 ):
     try:
         # Only our helper child receives a parent-death signal. This never
@@ -567,9 +946,27 @@ def child_unmount(
             == (holder["root_dev"], holder["root_ino"]),
             "pinned root changed",
         )
+        if host_request is not None:
+            lv_dev, snapshot = host_request
+            require(
+                shared_host_plan(
+                    lv_dev,
+                    reserved,
+                    snapshot["device"],
+                    [m["path"] for m in snapshot["host"]["mounts"]],
+                    mode=snapshot["mode"],
+                )
+                == snapshot,
+                "authorized shared propagation evidence changed in helper",
+            )
         records = parse_mountinfo(read_text("self/mountinfo", dir_fd=proc_fd))
         require(
-            safe_mounts(records, holder["mounts"][0]["device"], reserved)
+            safe_mounts(
+                records,
+                holder["mounts"][0]["device"],
+                reserved,
+                require_local=host_request is None,
+            )
             == holder["mounts"],
             "namespace mount evidence changed",
         )
@@ -580,7 +977,12 @@ def child_unmount(
                 # Re-read immediately before each ordinary unmount. The kernel
                 # still cannot make a path-based umount atomic with remounts.
                 records = parse_mountinfo(read_text("self/mountinfo", dir_fd=proc_fd))
-                approved = safe_mounts(records, mount["device"], reserved)
+                approved = safe_mounts(
+                    records,
+                    mount["device"],
+                    reserved,
+                    require_local=host_request is None,
+                )
                 require(mount in approved, "approved mount changed before unmount")
                 validate_mount_path(root_fd, proc_fd, mount)
                 libc_check(
@@ -592,11 +994,15 @@ def child_unmount(
         os._exit(1)
 
 
-def spawn_unmount(libc, pinned, holder, reserved, timeout, preflight=False):
+def spawn_unmount(
+    libc, pinned, holder, reserved, timeout, preflight=False, host_request=None
+):
     parent_pid = os.getpid()
     pid = os.fork()
     if pid == 0:
-        child_unmount(libc, *pinned, holder, reserved, preflight, parent_pid)
+        child_unmount(
+            libc, *pinned, holder, reserved, preflight, parent_pid, host_request
+        )
     deadline = time.monotonic() + timeout
     while True:
         found, status = os.waitpid(pid, os.WNOHANG)
@@ -624,6 +1030,110 @@ def spawn_unmount(libc, pinned, holder, reserved, timeout, preflight=False):
                 True,
             )
         time.sleep(0.02)
+
+
+def pin_holder(holder):
+    check_holder_process(holder)
+    fds = []
+    try:
+        fds.append(
+            os.open("/proc/%d/ns/mnt" % holder["pid"], os.O_RDONLY | os.O_CLOEXEC)
+        )
+        fds.append(
+            os.open(
+                "/proc/%d/root" % holder["pid"],
+                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+        )
+        fds.append(os.open("/proc", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+        namespace = int(re.fullmatch(r"mnt:\[([0-9]+)\]", holder["namespace"]).group(1))
+        root = os.fstat(fds[1])
+        require(
+            os.fstat(fds[0]).st_ino == namespace
+            and (root.st_dev, root.st_ino) == (holder["root_dev"], holder["root_ino"]),
+            "pinned host namespace/root mismatch",
+        )
+        check_holder_process(holder)
+        return tuple(fds)
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
+
+
+def unmount_shared_host(lv_dev, reserved, snapshot, timeout):
+    marker_fd = create_marker()
+    pinned = ()
+    uncertain = False
+    mutation_started = False
+    try:
+        paths = [m["path"] for m in snapshot["host"]["mounts"]]
+        require(
+            shared_host_plan(
+                lv_dev, reserved, snapshot["device"], paths, mode=snapshot["mode"]
+            )
+            == snapshot,
+            "authorized shared propagation evidence changed before host unmount",
+        )
+        libc = load_host_libc()
+        pinned = pin_holder(snapshot["host"])
+        request = (lv_dev, snapshot)
+        spawn_unmount(
+            libc,
+            pinned,
+            snapshot["host"],
+            reserved,
+            timeout,
+            preflight=True,
+            host_request=request,
+        )
+        require(
+            shared_host_plan(
+                lv_dev, reserved, snapshot["device"], paths, mode=snapshot["mode"]
+            )
+            == snapshot,
+            "authorized shared propagation evidence changed after host preflight",
+        )
+        mutation_started = True
+        spawn_unmount(
+            libc,
+            pinned,
+            snapshot["host"],
+            reserved,
+            timeout,
+            host_request=request,
+        )
+        require(
+            inspect_device(lv_dev) == snapshot["device"],
+            "LV identity changed after unmount",
+        )
+        mounts = parse_mountinfo(read_text("/proc/self/mountinfo"))
+        require(
+            not any(
+                m["device"] == snapshot["device"]["major_minor"] or m["path"] in paths
+                for m in mounts
+            ),
+            "host LV mount or replacement mount remains after ordinary unmount",
+        )
+        return {"unmounted": True, "device": snapshot["device"]}
+    except RecoveryError as exc:
+        uncertain = exc.state_unknown or mutation_started
+        if uncertain and not exc.state_unknown:
+            raise RecoveryError(
+                str(exc) + "; reconcile shared unmount state", True
+            ) from exc
+        raise
+    except BaseException as exc:
+        uncertain = True
+        raise RecoveryError(
+            "host unmount failed without confirmed remote state", True
+        ) from exc
+    finally:
+        for fd in pinned:
+            os.close(fd)
+        os.close(marker_fd)
+        if not uncertain:
+            remove_marker()
 
 
 def cleanup(lv_dev, reserved, snapshot, timeout):
@@ -782,6 +1292,37 @@ def verify(lv_dev, reserved, identity):
     raise RecoveryError("device Open Count remains nonzero after 3 checks")
 
 
+def verify_shared_release(lv_dev, reserved, identity, mode="strict"):
+    require(
+        isinstance(mode, str) and mode in ("strict", "maintenance"),
+        "invalid host recovery mode",
+    )
+    for attempt in range(3):
+        require(
+            inspect_device(lv_dev) == identity,
+            "LV identity changed before shared release verification",
+        )
+        views, _ = host_mode_views(mode)
+        require(
+            not any(
+                mount["device"] == identity["major_minor"]
+                for item in views.values()
+                for mount in item["mounts"]
+            ),
+            "residual target mounts remain in the selected host recovery scope",
+        )
+        count = open_count(identity)
+        require(
+            inspect_device(lv_dev) == identity,
+            "LV identity changed during shared release verification",
+        )
+        if count == 0:
+            return {"released": True, "device": identity}
+        if attempt < 2:
+            time.sleep(1)
+    raise RecoveryError("device Open Count remains nonzero after shared unmount")
+
+
 def no_duplicate_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -827,12 +1368,56 @@ def main():
             type(timeout) in (int, float) and 0 < timeout <= 10,
             "invalid unmount timeout",
         )
-        if operation == "inspect":
+        if operation == "delete_inspect":
+            device = inspect_device(lv_dev)
+            mounts = parse_mountinfo(read_text("/proc/self/mountinfo"))
+            targets = safe_mounts(mounts, device["major_minor"], reserved, False)
+            by_id = {m["id"]: m for m in mounts}
+            result = {
+                "device": device,
+                "requires_host_authorization": any(
+                    by_id[m["parent_id"]]["optional"]
+                    or set(propagation_tags(m)) - {"shared"}
+                    for m in targets
+                ),
+            }
+        elif operation == "host_plan":
+            payload = req["payload"]
+            require(
+                isinstance(payload, dict)
+                and set(payload) == {"device", "paths", "mode"},
+                "invalid host plan request",
+            )
+            result = shared_host_plan(
+                lv_dev,
+                reserved,
+                payload["device"],
+                payload["paths"],
+                mode=payload["mode"],
+            )
+        elif operation == "host_verify":
+            payload = req["payload"]
+            require(
+                isinstance(payload, dict) and set(payload) == {"device", "mode"},
+                "invalid host verify request",
+            )
+            result = verify_shared_release(
+                lv_dev, reserved, payload["device"], mode=payload["mode"]
+            )
+        elif operation == "host_unmount":
+            result = unmount_shared_host(lv_dev, reserved, req["payload"], timeout)
+        elif operation == "inspect":
             result = inspect_device(lv_dev)
-            safe_mounts(
+            targets = safe_mounts(
                 parse_mountinfo(read_text("/proc/self/mountinfo")),
                 result["major_minor"],
                 reserved,
+            )
+            # Preserve the original, more conservative inspection policy used
+            # by resize. Shared-leaf cleanup permission is deletion-specific.
+            require(
+                all(not mount["optional"] for mount in targets),
+                "target/direct-parent propagation not proven private",
             )
         elif operation == "scan":
             result = scan(lv_dev, reserved)
@@ -853,7 +1438,7 @@ def main():
         response = {
             "ok": False,
             "error": "host recovery probe or evidence failed",
-            "state_unknown": operation == "cleanup",
+            "state_unknown": operation in ("cleanup", "host_unmount"),
         }
     print(json.dumps(response, separators=(",", ":")), flush=True)
     return 1

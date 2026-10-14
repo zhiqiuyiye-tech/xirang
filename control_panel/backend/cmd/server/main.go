@@ -86,9 +86,13 @@ func main() {
 		}
 	}
 	var namespaceAuthorizer storage.NamespaceCleanupAuthorizer
+	var hostUnmountAuthorizer storage.NamespaceCleanupAuthorizer
 	if len(cfg.NamespaceCleanupAllowlist) > 0 && k8sClient != nil {
 		namespaceAuthorizer = func(ctx context.Context, workerHost, exportPath string, holders []storage.NamespaceHolder) error {
 			return k8s.AuthorizeNamespaceCleanup(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist, cfg.NonNFSCSIDrivers...)
+		}
+		hostUnmountAuthorizer = func(ctx context.Context, workerHost, exportPath string, holders []storage.NamespaceHolder) error {
+			return k8s.AuthorizeHostUnmount(ctx, k8sClient, workerHost, exportPath, holders, cfg.NamespaceCleanupAllowlist, cfg.NonNFSCSIDrivers...)
 		}
 	}
 	storage.RegisterStorageHandlers(
@@ -96,6 +100,8 @@ func main() {
 		storage.WithReservedMounts(cfg.ReservedMountPoints...),
 		storage.WithPodGuardChecker(podChecker),
 		storage.WithNamespaceCleanup(namespaceAuthorizer, cfg.NamespaceCleanupTimeout, cfg.NamespaceUnmountTimeout),
+		storage.WithSharedHostMaintenance(cfg.SharedHostMaintenance),
+		storage.WithHostUnmountAuthorizer(hostUnmountAuthorizer),
 	)
 
 	appCtx, appCancel := context.WithCancel(context.Background())

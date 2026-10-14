@@ -45,6 +45,10 @@ func safeAuditDetails(raw map[string]any) map[string]any {
 			case string, float64, bool:
 				out[key] = value
 			}
+		case "maintenance_confirmed":
+			if confirmed, valid := value.(bool); valid {
+				out[key] = confirmed
+			}
 		case "before", "after":
 			if nested, ok := value.(map[string]any); ok {
 				out[key] = safeAuditDetails(nested)

@@ -50,6 +50,7 @@ type Config struct {
 	StorageStaleAfter           time.Duration
 	ReservedMountPoints         []string
 	NonNFSCSIDrivers            []string
+	SharedHostMaintenance       bool
 	NamespaceCleanupAllowlist   []string
 	NamespaceCleanupTimeout     time.Duration
 	NamespaceUnmountTimeout     time.Duration
@@ -190,6 +191,14 @@ func Load() (Config, error) {
 		}
 	}
 
+	switch strings.TrimSpace(envOr("SHARED_HOST_MAINTENANCE_ENABLED", "false")) {
+	case "false":
+		c.SharedHostMaintenance = false
+	case "true":
+		c.SharedHostMaintenance = true
+	default:
+		return c, fmt.Errorf("SHARED_HOST_MAINTENANCE_ENABLED must be true or false")
+	}
 	c.NamespaceCleanupAllowlist, err = cleanupAllowlist(os.Getenv("NAMESPACE_CLEANUP_ALLOWLIST"))
 	if err != nil {
 		return c, err

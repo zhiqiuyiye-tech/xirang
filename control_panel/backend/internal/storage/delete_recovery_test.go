@@ -25,7 +25,11 @@ func recoveryScriptRunner(t *testing.T) *scriptRunner {
 	}
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"}, scriptResult{stdout: ""})
 	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{stderr: "Logical volume vg_data/lv_1 contains a filesystem in use.", exitCode: 5}, scriptResult{stdout: "removed"})
-	sr.add("cp-storage-namespace-scan", scriptResult{stdout: string(data)})
+	// The first scan verifies a clean pre-removal view; a later holder appears
+	// only when the scripted first lvremove reports a filesystem-in-use race.
+	sr.add("cp-storage-namespace-scan",
+		scriptResult{stdout: `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"holders":[]}}`},
+		scriptResult{stdout: string(data)})
 	sr.add("cp-storage-namespace-cleanup", scriptResult{stdout: `{"ok":true,"result":{"cleaned":true}}`})
 	sr.add("cp-storage-namespace-verify", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"u","major_minor":"253:0"}}` + `}`})
 	return sr
@@ -71,7 +75,15 @@ func TestDeleteLVRecoveryStopsOnFailedSafetyChecks(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			sr := recoveryScriptRunner(t)
 			if tc.command != "" {
-				sr.add(tc.command, scriptResult{stdout: tc.out, exitCode: tc.code})
+				failure := scriptResult{stdout: tc.out, exitCode: tc.code}
+				switch tc.command {
+				case "cp-storage-namespace-scan":
+					sr.add(tc.command, scriptResult{stdout: `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"holders":[]}}`}, failure)
+				case "cp-storage-namespace-verify":
+					sr.add(tc.command, scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"u","major_minor":"253:0"}}}`}, failure)
+				default:
+					sr.add(tc.command, failure)
+				}
 			}
 			store, id := submitRecoveryDelete(t, sr, WithNamespaceCleanup(tc.authorizer, time.Minute, time.Second))
 			waitFor(t, store, id, "failed", 2*time.Second)

@@ -495,6 +495,12 @@ func (s *scriptRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (stri
 	if strings.Contains(cmd, "cp-storage-namespace-scan") {
 		return `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"holders":[]}}`, "", 0, nil
 	}
+	if strings.Contains(cmd, "cp-storage-namespace-delete_inspect") {
+		return `{"ok":true,"result":{"device":{"uuid":"u","major_minor":"253:0"},"requires_host_authorization":false}}`, "", 0, nil
+	}
+	if strings.Contains(cmd, "cp-storage-namespace-verify") {
+		return `{"ok":true,"result":{"released":true,"device":{"uuid":"u","major_minor":"253:0"}}}`, "", 0, nil
+	}
 	if strings.Contains(cmd, "cp-storage-namespace-inspect") {
 		return `{"ok":true,"result":{"uuid":"u","major_minor":"253:0"}}`, "", 0, nil
 	}
@@ -978,7 +984,7 @@ func TestDeleteLVHandler_CleansNamespaceMountsAndRetriesLvremove(t *testing.T) {
 	sr := recoveryScriptRunner(t)
 	store, id := submitRecoveryDelete(t, sr, WithNamespaceCleanup(allowTestHolders, time.Minute, time.Second))
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-cleanup"] != 1 || sr.counts["cp-storage-namespace-verify"] != 1 {
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-cleanup"] != 1 || sr.counts["cp-storage-namespace-verify"] != 2 {
 		t.Fatalf("unexpected recovery attempts: %v", sr.counts)
 	}
 	steps, err := store.ListSteps(context.Background(), id)
