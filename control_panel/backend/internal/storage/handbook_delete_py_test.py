@@ -49,6 +49,7 @@ class HandbookTests(unittest.TestCase):
         with (
             patch.object(r, "inspect_device", return_value=IDENTITY),
             patch.object(r, "pids", return_value=[123]),
+            patch.object(r, "task_view", return_value=("mnt:[42]", 8, 1)),
             patch.object(r, "process_info", return_value=(member, "mnt:[42]", (8, 1))),
             patch.object(r, "read_text", return_value=TABLE),
             patch.object(r, "kernel_mount_inventory") as kernel,
@@ -71,6 +72,9 @@ class HandbookTests(unittest.TestCase):
             patch.object(r, "inspect_device", return_value=IDENTITY),
             patch.object(r, "pids", return_value=[2, 123]),
             patch.object(
+                r, "task_view", side_effect=lambda pid: ("mnt:[%d]" % pid, 8, 1)
+            ),
+            patch.object(
                 r, "process_info", return_value=(member, "mnt:[42]", (8, 1))
             ) as info,
             patch.object(r, "read_text", side_effect=evidence),
@@ -78,6 +82,86 @@ class HandbookTests(unittest.TestCase):
             snapshot = r.scan("/dev/vg/lv", [], require_local=False)
         self.assertEqual(len(snapshot["holders"]), 1)
         self.assertTrue(all(call.args == (123,) for call in info.call_args_list))
+
+    def test_deletion_scan_reads_one_mountinfo_per_task_view(self):
+        reads = []
+
+        def evidence(path):
+            reads.append(path)
+            return "1 0 8:3 / / rw - ext4 /dev/sda3 rw\n"
+
+        with (
+            patch.object(r, "inspect_device", return_value=IDENTITY),
+            patch.object(r, "pids", return_value=[11, 12, 13]),
+            patch.object(r, "task_view", return_value=("mnt:[9]", 8, 1)),
+            patch.object(r, "read_text", side_effect=evidence),
+        ):
+            snapshot = r.scan("/dev/vg/lv", [], require_local=False)
+        self.assertEqual(snapshot["holders"], [])
+        self.assertEqual(reads, ["/proc/11/mountinfo"])
+
+    def test_deletion_scan_still_reports_holders_of_other_views(self):
+        member = {"pid": 123, "start_time": "100", "cgroup": "0::/owner\n"}
+        reads = []
+
+        def evidence(path):
+            reads.append(path)
+            if path == "/proc/123/mountinfo":
+                return TABLE
+            return "1 0 8:3 / / rw - ext4 /dev/sda3 rw\n"
+
+        with (
+            patch.object(r, "inspect_device", return_value=IDENTITY),
+            patch.object(r, "pids", return_value=[11, 12, 123]),
+            patch.object(
+                r,
+                "task_view",
+                side_effect=lambda pid: ("mnt:[9]", 8, 1)
+                if pid < 100
+                else ("mnt:[42]", 8, 1),
+            ),
+            patch.object(r, "process_info", return_value=(member, "mnt:[42]", (8, 1))),
+            patch.object(r, "read_text", side_effect=evidence),
+        ):
+            snapshot = r.scan("/dev/vg/lv", [], require_local=False)
+        self.assertEqual([m["id"] for m in snapshot["holders"][0]["mounts"]], [10])
+        self.assertEqual(reads.count("/proc/11/mountinfo"), 1)
+        self.assertNotIn("/proc/12/mountinfo", reads)
+
+    def test_deletion_scan_refuses_a_task_that_moves_during_the_view_read(self):
+        with (
+            patch.object(r, "inspect_device", return_value=IDENTITY),
+            patch.object(r, "pids", return_value=[11]),
+            patch.object(
+                r, "task_view", side_effect=[("mnt:[9]", 8, 1), ("mnt:[10]", 8, 1)]
+            ),
+            patch.object(
+                r, "read_text", return_value="1 0 8:3 / / rw - ext4 /dev/sda3 rw\n"
+            ),
+            self.assertRaises(r.RecoveryError),
+        ):
+            r.scan("/dev/vg/lv", [], require_local=False)
+
+    def test_task_scale_bound_follows_the_kernel_pid_space(self):
+        entries = {
+            "/proc": ["self", "1", "2"],
+            "/proc/1/task": ["1", "11"],
+            "/proc/2/task": ["2"],
+        }
+        with (
+            patch.object(r, "read_text", return_value="4194304\n"),
+            patch.object(r.os, "listdir", side_effect=entries.__getitem__),
+        ):
+            self.assertEqual(r.pids(), [1, 2, 11])
+
+    def test_task_scale_bound_still_refuses_exhausted_pid_space(self):
+        entries = {"/proc": ["1"], "/proc/1/task": ["1", "2", "3"]}
+        with (
+            patch.object(r, "read_text", return_value="2\n"),
+            patch.object(r.os, "listdir", side_effect=entries.__getitem__),
+            self.assertRaises(r.RecoveryError),
+        ):
+            r.pids()
 
     def test_handbook_still_rejects_protected_stacked_and_child_mounts(self):
         for text in (

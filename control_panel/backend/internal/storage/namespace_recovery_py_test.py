@@ -390,7 +390,10 @@ class ParserTests(unittest.TestCase):
         def listdir(path):
             return {"/proc": ["123", "self"], "/proc/123/task": ["123", "124"]}[path]
 
-        with patch.object(r.os, "listdir", side_effect=listdir):
+        with (
+            patch.object(r, "read_text", return_value="4194304\n"),
+            patch.object(r.os, "listdir", side_effect=listdir),
+        ):
             self.assertEqual(r.pids(), [123, 124])
 
     def test_lvm_unknown_target_attributes_rejected(self):

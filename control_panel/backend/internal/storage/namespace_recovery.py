@@ -19,7 +19,6 @@ import time
 
 MARKER = "/run/control-panel-storage-recovery.uncertain"
 MAX_BYTES = 8 * 1024 * 1024
-MAX_PROCESSES = 32768
 MAX_MOUNTS = 65536
 PROTECTED = (
     "/",
@@ -736,7 +735,40 @@ def inspect_device(lv_dev):
     return identity
 
 
+def max_tasks():
+    """Live tasks are bounded by this PID namespace's own PID/TID space.
+
+    A fixed constant refuses a busy worker whose thread count happens to
+    exceed it, although every one of those tasks is still enumerable.
+    """
+    limit = read_text("/proc/sys/kernel/pid_max").strip()
+    require(limit.isdigit() and int(limit) > 0, "invalid kernel pid_max")
+    return int(limit)
+
+
+def task_view(pid):
+    """The mount namespace and task root that fix one task's mountinfo.
+
+    Mount paths are reported relative to the reading task's root and the
+    mount table belongs to the namespace, so this pair determines the whole
+    output of that task's mountinfo.
+    """
+    base = "/proc/%d/" % pid
+    namespace = os.readlink(base + "ns/mnt")
+    require(re.fullmatch(r"mnt:\[[1-9][0-9]*\]", namespace), "invalid mount namespace")
+    root = os.stat(base + "root")
+    return (namespace, root.st_dev, root.st_ino)
+
+
+def has_device_mount(pid, device):
+    fields = [
+        line.split(" ") for line in read_text("/proc/%d/mountinfo" % pid).splitlines()
+    ]
+    return any(len(row) > 2 and row[2] == device for row in fields)
+
+
 def pids():
+    limit = max_tasks()
     found = set()
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -750,13 +782,18 @@ def pids():
             require(not os.path.exists(base), "live process task evidence missing")
             continue
         found.update(int(tid) for tid in tasks if tid.isdigit())
-        require(len(found) <= MAX_PROCESSES, "process/thread scale exceeds limit")
+        require(
+            len(found) <= limit,
+            "process/thread scale exceeds limit: %d live tasks, pid_max %d"
+            % (len(found), limit),
+        )
     return sorted(found)
 
 
 def scan(lv_dev, reserved, require_local=True):
     device = inspect_device(lv_dev)
     groups = {}
+    views = {}
     # Every process is read. Namespace de-duplication never drops other cgroup
     # members: the parent authorizes the complete namespace membership set.
     for pid in pids():
@@ -764,11 +801,17 @@ def scan(lv_dev, reserved, require_local=True):
             if not require_local:
                 # Handbook lookup is device-based. Unrelated processes (and
                 # their private/chroot roots) are not consumers of this LV.
-                evidence = read_text("/proc/%d/mountinfo" % pid)
-                fields = [line.split(" ") for line in evidence.splitlines()]
-                if not any(
-                    len(row) > 2 and row[2] == device["major_minor"] for row in fields
-                ):
+                # One mountinfo read answers that for every task sharing the
+                # same view; reading it once per thread would scale the scan
+                # with the host's thread count instead of its namespaces. A
+                # task that moves between two views mid-read is fatal, so a
+                # cached verdict never describes an unread view.
+                view = task_view(pid)
+                if view not in views:
+                    cached = has_device_mount(pid, device["major_minor"])
+                    require(task_view(pid) == view, "task view changed during scan")
+                    views[view] = cached
+                if not views[view]:
                     continue
             member, ns, root = process_info(pid)
             mounts = parse_mountinfo(read_text("/proc/%d/mountinfo" % pid))
