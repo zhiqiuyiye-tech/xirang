@@ -862,8 +862,7 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 	snapshot.Device.UUID = "stable-uuid"
 	snapshot.Holders[0].Mounts[0].Path = "/data02/share"
 	sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, snapshot)})
-	sr.add("cp-storage-namespace-cleanup_delete", scriptResult{stdout: `{"ok":true,"result":{"cleaned":true}}`})
-	sr.add("cp-storage-namespace-verify_delete", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`})
+	sr.add("nsenter -t 123 -m umount '/data02/share'", scriptResult{})
 	sr.add("cp-storage-namespace-inspect_lv",
 		scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`},
 		scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`},
@@ -890,8 +889,7 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 		parentMount,
 		strings.Index(commands, "logical volume is still mounted at:"),
 		strings.Index(commands, "# cp-storage-namespace-scan_delete"),
-		strings.Index(commands, "# cp-storage-namespace-cleanup_delete"),
-		strings.Index(commands, "# cp-storage-namespace-verify_delete"),
+		strings.Index(commands, "# cp-storage-namespace-unmount"),
 		strings.LastIndex(commands, "# cp-storage-namespace-inspect_lv"),
 		strings.Index(commands, "lvremove -f /dev/vg_data/lv_1"),
 		strings.Index(commands, "sed -i '\\#^/dev/vg_data/lv_1 #d' /etc/fstab"),
@@ -975,7 +973,7 @@ func TestDeleteLVHandler_CleansNamespaceMountsAndRetriesLvremove(t *testing.T) {
 	sr := recoveryScriptRunner(t)
 	store, id := submitRecoveryDelete(t, sr)
 	waitFor(t, store, id, "succeeded", 2*time.Second)
-	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-scan_delete"] != 2 || sr.counts["cp-storage-namespace-cleanup_delete"] != 1 || sr.counts["cp-storage-namespace-verify_delete"] != 2 {
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 2 || sr.counts["cp-storage-namespace-scan_delete"] != 2 || sr.counts["nsenter -t 123 -m umount '/data02/share'"] != 1 {
 		t.Fatalf("unexpected bounded recovery attempts: %v", sr.counts)
 	}
 	steps, err := store.ListSteps(context.Background(), id)

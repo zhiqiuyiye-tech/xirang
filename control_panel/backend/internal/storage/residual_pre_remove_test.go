@@ -18,8 +18,7 @@ func residualBeforeRemoveRunner(t *testing.T) *scriptRunner {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"}, scriptResult{stdout: ""})
 	sr.add("cp-storage-namespace-inspect_lv", stableIdentity, stableIdentity)
 	sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, snapshot)})
-	sr.add("cp-storage-namespace-cleanup_delete", scriptResult{stdout: `{"ok":true,"result":{"cleaned":true}}`})
-	sr.add("cp-storage-namespace-verify_delete", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`})
+	sr.add("nsenter -t 123 -m umount '/host-data/share'", scriptResult{})
 	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{stdout: "removed"})
 	return sr
 }
@@ -56,8 +55,7 @@ func TestResidualMountsAreClearedBeforeFirstLvremove(t *testing.T) {
 				"umount /data02/share",
 				"logical volume is still mounted at:",
 				"cp-storage-namespace-scan_delete",
-				"cp-storage-namespace-cleanup_delete",
-				"cp-storage-namespace-verify_delete",
+				"nsenter -t 123 -m umount '/host-data/share'",
 			}
 			for _, command := range orderedBeforeIdentity {
 				index := firstCommand(sr.calls, command)
@@ -90,7 +88,7 @@ func TestResidualFailuresRetainLVBeforeFirstLvremove(t *testing.T) {
 	stableIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
 	changedIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"replacement-uuid","major_minor":"253:0"}}`}
 
-	for _, stage := range []string{"scan", "scan_transport", "identity", "cleanup_busy", "cleanup_timeout", "cleanup_transport", "open_count", "verify_transport", "revalidate_identity"} {
+	for _, stage := range []string{"scan", "scan_transport", "identity", "unmount_busy", "unmount_transport", "revalidate_identity"} {
 		t.Run(stage, func(t *testing.T) {
 			sr := residualBeforeRemoveRunner(t)
 			want := ""
@@ -107,21 +105,12 @@ func TestResidualFailuresRetainLVBeforeFirstLvremove(t *testing.T) {
 				changedSnapshot.Holders[0].Mounts[0].Path = "/host-data/share"
 				sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, changedSnapshot)})
 				want = "identity changed"
-			case "cleanup_busy":
-				sr.add("cp-storage-namespace-cleanup_delete", scriptResult{stdout: `{"ok":false,"error":"ordinary unmount busy","state_unknown":false}`, exitCode: 1})
-				want = "namespace cleanup failed"
-			case "cleanup_timeout":
-				sr.add("cp-storage-namespace-cleanup_delete", scriptResult{exitCode: 124})
-				want = "namespace cleanup failed"
-			case "cleanup_transport":
-				sr.add("cp-storage-namespace-cleanup_delete", scriptResult{runErr: context.Canceled})
-				want = "namespace cleanup failed"
-			case "open_count":
-				sr.add("cp-storage-namespace-verify_delete", scriptResult{stdout: `{"ok":false,"error":"Open Count=1","state_unknown":false}`, exitCode: 1})
-				want = "device release verification failed"
-			case "verify_transport":
-				sr.add("cp-storage-namespace-verify_delete", scriptResult{runErr: context.DeadlineExceeded})
-				want = "device release verification failed"
+			case "unmount_busy":
+				sr.add("nsenter -t 123 -m umount '/host-data/share'", scriptResult{stderr: "target is busy", exitCode: 1})
+				want = "namespace unmount failed"
+			case "unmount_transport":
+				sr.add("nsenter -t 123 -m umount '/host-data/share'", scriptResult{runErr: context.Canceled})
+				want = "namespace unmount failed"
 			case "revalidate_identity":
 				sr.add("cp-storage-namespace-inspect_lv", stableIdentity, changedIdentity)
 				want = "identity changed"

@@ -2260,7 +2260,7 @@
 
     function storageDestructionWarning() {
         return '\n\n警告：此操作会不可逆地删除目标逻辑卷中的全部数据。请先停止业务使用，并确认数据可以永久丢弃。\n' +
-            '请按《NFS创建流程》第 8 节回收步骤依序完成：清理 /etc/exports 并刷新 exportfs → 在宿主机上执行普通卸载（umount）→ 精确清理设备在已核实持有者命名空间中的残留挂载 → 确认 OpenCount=0（dmsetup Open=0）→ 执行 lvremove → 清理 /etc/fstab。\n' +
+            '请按《NFS创建流程》第 8 节回收步骤依序完成：清理 /etc/exports 并刷新 exportfs → 在宿主机上执行普通卸载（umount）→ 对仍未卸载的持有者挂载命名空间执行普通卸载（nsenter）→ 执行 lvremove → 清理 /etc/fstab。\n' +
             '后端不会检查 Kubernetes Pod/PVC 引用。';
     }
 

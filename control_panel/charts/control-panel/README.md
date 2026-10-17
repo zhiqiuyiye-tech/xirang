@@ -25,8 +25,10 @@ the one-time browser key enrollment after the pod is Ready.
 ## NFS namespace recovery
 
 Deletion and reclaim follow the operator handbook: revoke the target exports,
-ordinary host unmount, exact-device namespace residual cleanup, identity and
-Open Count=0 verification, LV removal, then fstab cleanup. The backend does not
+ordinary host unmount, an ordinary `umount` inside each remaining holder's mount
+namespace via `nsenter`, LV removal, then fstab cleanup. There is no process
+identity pinning and no Open Count pre-check: a volume that is still in use is
+reported by `lvremove` itself and retained. The backend does not
 scan Kubernetes Pod/PVC references or require maintenance-mode switches or a
 workload allowlist for this flow. Operators must first stop business use and
 confirm the target volume's data can be permanently discarded.
@@ -73,10 +75,10 @@ Or manually:
 ```bash
 helm package ./control_panel/charts/control-panel --destination /tmp
 helm registry login registry-xirang.jxslpt.cn:30443
-helm push /tmp/control-panel-1.0.17.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
+helm push /tmp/control-panel-1.0.18.tgz oci://registry-xirang.jxslpt.cn:30443/tai-dev
 ```
 
-The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.17`.
+The chart then lives at `oci://registry-xirang.jxslpt.cn:30443/tai-dev/control-panel:1.0.18`.
 
 ## Install
 

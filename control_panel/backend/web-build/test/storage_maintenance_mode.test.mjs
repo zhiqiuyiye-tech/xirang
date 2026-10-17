@@ -95,8 +95,7 @@ function assertHandbookWarning(message) {
   const orderedSteps = [
     '/etc/exports',
     '宿主机上执行普通卸载（umount）',
-    '设备在已核实持有者命名空间中的残留挂载',
-    'OpenCount=0',
+    '持有者挂载命名空间执行普通卸载（nsenter）',
     'lvremove',
     '/etc/fstab',
   ];

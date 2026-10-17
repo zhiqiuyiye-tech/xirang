@@ -40,8 +40,7 @@ func recoveryScriptRunner(t *testing.T) *scriptRunner {
 		scriptResult{stdout: recoverySnapshotJSON(t, empty)},
 		scriptResult{stdout: recoverySnapshotJSON(t, holder)},
 	)
-	sr.add("cp-storage-namespace-cleanup_delete", scriptResult{stdout: `{"ok":true,"result":{"cleaned":true}}`})
-	sr.add("cp-storage-namespace-verify_delete", scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`})
+	sr.add("nsenter -t 123 -m umount '/data02/share'", scriptResult{})
 	sr.add("cp-storage-namespace-inspect_lv", stableIdentity, stableIdentity, stableIdentity)
 	return sr
 }
@@ -62,8 +61,6 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 	replacement := namespaceTestSnapshot()
 	replacement.Device.UUID = "replacement-uuid"
 	replacement.Holders[0].Mounts[0].Path = "/data02/share"
-	cleaned := scriptResult{stdout: `{"ok":true,"result":{"cleaned":true}}`}
-	verified := scriptResult{stdout: `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`}
 
 	for _, tc := range []struct {
 		name  string
@@ -101,50 +98,28 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 			want: "identity changed",
 		},
 		{
-			name: "ordinary cleanup busy",
+			name: "ordinary unmount busy",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
 					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
 					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
 				)
-				sr.add("cp-storage-namespace-cleanup_delete", scriptResult{stdout: `{"ok":false,"error":"ordinary unmount busy","state_unknown":false}`, exitCode: 1})
+				sr.add("nsenter -t 123 -m umount '/data02/share'",
+					scriptResult{stderr: "target is busy", exitCode: 1},
+				)
 			},
-			want: "namespace cleanup failed",
+			want: "namespace unmount failed",
 		},
 		{
-			name: "cleanup timeout",
+			name: "unmount transport error",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
 					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
 					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
 				)
-				sr.add("cp-storage-namespace-cleanup_delete", scriptResult{exitCode: 124})
+				sr.add("nsenter -t 123 -m umount '/data02/share'", scriptResult{runErr: context.Canceled})
 			},
-			want: "namespace cleanup failed",
-		},
-		{
-			name: "cleanup transport error",
-			setup: func(sr *scriptRunner) {
-				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
-				)
-				sr.add("cp-storage-namespace-cleanup_delete", scriptResult{runErr: context.Canceled})
-			},
-			want: "namespace cleanup failed",
-		},
-		{
-			name: "nonzero device open count",
-			setup: func(sr *scriptRunner) {
-				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
-				)
-				sr.add("cp-storage-namespace-verify_delete", verified,
-					scriptResult{stdout: `{"ok":false,"error":"Open Count=1","state_unknown":false}`, exitCode: 1},
-				)
-			},
-			want: "device release verification failed",
+			want: "namespace unmount failed",
 		},
 		{
 			name: "LV UUID changed before retry",
@@ -156,8 +131,6 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 				sr.add("cp-storage-namespace-inspect_lv", stableIdentity, stableIdentity,
 					scriptResult{stdout: `{"ok":true,"result":{"uuid":"replacement-uuid","major_minor":"253:0"}}`},
 				)
-				sr.add("cp-storage-namespace-cleanup_delete", cleaned)
-				sr.add("cp-storage-namespace-verify_delete", verified)
 			},
 			want: "identity changed",
 		},
@@ -190,7 +163,7 @@ func TestDeleteLVDoesNotRetryLVMTransportFailure(t *testing.T) {
 	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 1 {
 		t.Fatalf("LVM transport failure must not trigger a second remove: %v", sr.counts)
 	}
-	if sr.counts["cp-storage-namespace-scan_delete"] != 1 || sr.counts["cp-storage-namespace-cleanup_delete"] != 0 {
+	if sr.counts["cp-storage-namespace-scan_delete"] != 1 || sr.counts["nsenter -t 123 -m umount '/data02/share'"] != 0 {
 		t.Fatalf("transport failure must not enter namespace recovery: %v", sr.counts)
 	}
 	assertNoUnsafeDeleteEscalation(t, sr)

@@ -877,8 +877,9 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return err
 	}
 
-	// Handbook order: revoke exports, ordinarily unmount the host, release
-	// exact-device namespace copies, verify zero opens, remove LV, clean fstab.
+	// Handbook order: revoke exports, ordinarily unmount the host, ordinarily
+	// unmount exact-device copies inside each holder's mount namespace, remove
+	// the LV, clean fstab.
 	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoints: mountPoints}) {
 		if s.Name == "lvremove" {
 			if err := h.releaseResidualMounts(ctx, r, *w, lvDev, mountPoints, identity, false); err != nil {

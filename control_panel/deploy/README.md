@@ -62,11 +62,13 @@ the control panel into a cluster.
 
 ## NFS namespace recovery
 
-NFS LV deletion can perform an explicitly authorized ordinary unmount of a
-lingering log-agent namespace, then verify Open Count=0 and retry once. The
-allowlist is empty by default. Workers additionally need Python 3 and GNU
-`timeout`; verify the Linux behavior in an isolated environment before enabling
-cleanup. See [the recovery operator guide](../docs/nfs-namespace-recovery.md) for
+NFS LV deletion and reclaim scan for the processes still holding the target
+device, run an ordinary `umount` inside each holder's mount namespace via
+`nsenter`, then remove the LV. No allowlist or maintenance-mode switch gates the
+flow, and there is no Open Count pre-check: a volume still in use is reported by
+`lvremove` itself and retained. Workers additionally need Python 3, GNU
+`timeout` and `nsenter`; verify the Linux behavior in an isolated environment
+before relying on cleanup. See [the recovery operator guide](../docs/nfs-namespace-recovery.md) for
 configuration, permissions, conservative refusal cases, and uncertain-executor
 markers. Both deletion endpoints share the same safeguards.
 

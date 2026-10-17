@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -104,31 +103,15 @@ func (h *deleteLVHandler) recoverNamespaceAndRemove(ctx context.Context, r *task
 	// Resolve the actual holders of the selected device. The handbook
 	// workflow deliberately does not use Kubernetes or a workload allowlist.
 	authStep.Done("succeeded", diagnostic, "", "exact-device namespace holders resolved for the requested LV")
-	cleanStep, err := r.Step("cleanup_namespace_mounts")
+	unmountStep, err := r.Step("unmount_namespace_holders")
 	if err != nil {
 		return err
 	}
-	err = h.recovery.Cleanup(recoveryCtx, w, dev, snapshot)
-	if err != nil {
-		if errors.Is(err, ErrNamespaceStateUnknown) {
-			if guarded, ok := h.runner.(*guardedStorageRunner); ok {
-				guarded.BlockWorker(w.ID, err.Error())
-			}
-		}
-		cleanStep.Done("failed", diagnostic, "", err.Error())
-		return fmt.Errorf("namespace cleanup failed; no deletion retry: %w", err)
+	if err = h.unmountNamespaceHolders(recoveryCtx, w, snapshot); err != nil {
+		unmountStep.Done("failed", diagnostic, "", err.Error())
+		return fmt.Errorf("namespace unmount failed; no deletion retry: %w", err)
 	}
-	cleanStep.Done("succeeded", diagnostic, "", "ordinary unmount completed; executor exited and namespace references released")
-	verifyStep, err := r.Step("verify_device_released")
-	if err != nil {
-		return err
-	}
-	err = h.recovery.VerifyReleased(recoveryCtx, w, dev, identity)
-	if err != nil {
-		verifyStep.Done("failed", "", "", err.Error())
-		return fmt.Errorf("device release verification failed; no deletion retry: %w", err)
-	}
-	verifyStep.Done("succeeded", "", "", "same LV, no residual mounts, Open Count=0")
+	unmountStep.Done("succeeded", diagnostic, "", "ordinary unmount executed in each holding mount namespace")
 	// Revalidate the stable LV identity immediately before the retry.
 	current, err := h.inspectDevice(recoveryCtx, r, w, dev, "verify_lv_identity_before_retry")
 	if err != nil {
@@ -170,4 +153,29 @@ func summarizeNamespaceHolders(holders []NamespaceHolder) string {
 	}
 	data, _ := json.Marshal(records)
 	return string(data)
+}
+
+// unmountNamespaceHolders ordinarily unmounts every residual mount of the
+// discovered holders inside each holder's own mount namespace. Every holder is
+// attempted so one failure cannot leave another holder's copy mounted, and the
+// collected failures are reported together.
+func (h *deleteLVHandler) unmountNamespaceHolders(ctx context.Context, w db.WorkerNode, snapshot NamespaceSnapshot) error {
+	failures := []string{}
+	for _, holder := range snapshot.Holders {
+		for _, mount := range holder.Mounts {
+			out, stderr, code, err := h.runner.Run(ctx, w, NamespaceUnmountCmd(holder.PID, mount.Path))
+			if err == nil && code == 0 {
+				continue
+			}
+			reason := strings.TrimSpace(stderr + "\n" + out)
+			if err != nil {
+				reason = fmt.Sprintf("%v: %s", err, reason)
+			}
+			failures = append(failures, fmt.Sprintf("PID %d %s (code=%d): %s", holder.PID, mount.Path, code, reason))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("namespace unmount failed; retain volume: %s", strings.Join(failures, "; "))
+	}
+	return nil
 }

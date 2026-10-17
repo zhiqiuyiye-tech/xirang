@@ -45,7 +45,7 @@ func TestHandbookDeletionHasNoKubernetesOrMaintenancePrerequisites(t *testing.T)
 				t.Fatalf("handbook still invoked Kubernetes: guards=%d auth=%d", guardCalls, authCalls)
 			}
 			previous := -1
-			for _, needle := range []string{"sed -i '\\#^/data02/share #d' /etc/exports", "exportfs -arv", "umount /data02/share", "cp-storage-namespace-scan_delete", "cp-storage-namespace-cleanup_delete", "cp-storage-namespace-verify_delete", "lvremove -f /dev/vg_data/lv_1", "sed -i '\\#^/dev/vg_data/lv_1 #d' /etc/fstab"} {
+			for _, needle := range []string{"sed -i '\\#^/data02/share #d' /etc/exports", "exportfs -arv", "umount /data02/share", "cp-storage-namespace-scan_delete", "nsenter -t 123 -m umount", "lvremove -f /dev/vg_data/lv_1", "sed -i '\\#^/dev/vg_data/lv_1 #d' /etc/fstab"} {
 				index := firstCommand(sr.calls, needle)
 				if index <= previous {
 					t.Fatalf("missing or unordered handbook operation %s: %d <= %d", needle, index, previous)

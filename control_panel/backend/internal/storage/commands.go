@@ -501,3 +501,13 @@ for mi in /proc/[0-9]*/mountinfo; do
   fi
 done`, d)
 }
+
+// NamespaceUnmountCmd ordinarily unmounts one residual mount inside the mount
+// namespace of the process that still holds it, which is the handbook step
+// `nsenter -t <pid> -m umount <path>`. Only the mount namespace is entered, so
+// the host root stays in effect and the reported mount path resolves inside
+// that namespace. The command never forces or lazily unmounts, and it pins no
+// process identity: the caller re-derives the holder from device evidence.
+func NamespaceUnmountCmd(pid int, path string) string {
+	return fmt.Sprintf("# cp-storage-namespace-unmount\nnsenter -t %d -m umount %s", pid, shellLiteral(path))
+}

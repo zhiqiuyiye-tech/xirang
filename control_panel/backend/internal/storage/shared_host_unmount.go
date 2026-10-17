@@ -189,9 +189,10 @@ func (h *deleteLVHandler) releaseSharedDevice(ctx context.Context, r *tasks.Repo
 	return h.releaseResidualMounts(ctx, r, w, dev, paths, identity, true)
 }
 
-// releaseResidualMounts fills the gap between host umount and lvremove: inspect
-// actual holders, authorize them, enter their pinned namespaces/root contexts,
-// ordinarily unmount, and verify identity/absence/Open Count=0 before deletion.
+// releaseResidualMounts fills the gap between host umount and lvremove: the
+// holders of the exact device are discovered from kernel evidence and the
+// residual mount is ordinarily unmounted inside each holder's mount namespace,
+// which is the handbook step before lvremove.
 func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Reporter, w db.WorkerNode, dev string, paths []string, identity DeviceIdentity, sharedHost bool) error {
 	budget := h.cleanupTimeout
 	if budget <= 0 {
@@ -216,48 +217,25 @@ func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Re
 	}
 	step.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "process-visible residual mounts inspected before first lvremove")
 	if len(snapshot.Holders) > 0 {
-		authStep, err := r.Step("resolve_device_holders_before_remove")
+		unmountStep, err := r.Step("unmount_namespace_holders_before_remove")
 		if err != nil {
 			r.Fail(err.Error())
 			return err
 		}
-		// The authenticated delete request selects this exact LV. Resolve
-		// holders from kernel device evidence, not Pod/PVC configuration.
-		authStep.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "exact-device namespace holders resolved for the requested LV")
-		cleanupStep, err := r.Step("cleanup_namespace_mounts_before_remove")
-		if err != nil {
+		// Handbook order: enter each holder's mount namespace and perform an
+		// ordinary unmount there. No workload allowlist, process identity
+		// pinning or open-count check gates this step; lvremove itself refuses
+		// a volume that some namespace still holds.
+		if err := h.unmountNamespaceHolders(ctx, w, snapshot); err != nil {
+			unmountStep.Done("failed", summarizeNamespaceHolders(snapshot.Holders), "", err.Error())
 			r.Fail(err.Error())
 			return err
 		}
-		err = h.recovery.Cleanup(ctx, w, dev, snapshot)
-		if err != nil {
-			if errors.Is(err, ErrNamespaceStateUnknown) {
-				if guarded, ok := h.runner.(*guardedStorageRunner); ok {
-					guarded.BlockWorker(w.ID, err.Error())
-				}
-			}
-			cleanupStep.Done("failed", "", "", err.Error())
-			err = fmt.Errorf("namespace cleanup failed before removal: %w", err)
-			r.Fail(err.Error())
-			return err
-		}
-		cleanupStep.Done("succeeded", "", "", "authorized residual container mounts ordinarily unmounted in verified namespace/root contexts")
+		unmountStep.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "ordinary unmount executed in each holding mount namespace")
 	}
 	if sharedHost {
 		return h.verifySharedReleased(ctx, r, w, dev, identity, "verify_shared_device_released")
 	}
-	verifyStep, err := r.Step("verify_device_released_before_remove")
-	if err != nil {
-		r.Fail(err.Error())
-		return err
-	}
-	if err := h.recovery.VerifyReleased(ctx, w, dev, identity); err != nil {
-		err = fmt.Errorf("device release verification failed before removal: %w", err)
-		verifyStep.Done("failed", "", "", err.Error())
-		r.Fail(err.Error())
-		return err
-	}
-	verifyStep.Done("succeeded", "", "", "same LV; no process-visible residual mounts; Open Count=0")
 	return nil
 }
 
