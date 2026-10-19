@@ -12,9 +12,9 @@ import (
 
 // VGInfo is a volume group on a worker node, with its total and free space.
 type VGInfo struct {
-	Name   string `json:"name"`
-	VSize  string `json:"vsize"`  // e.g. "3.50g"
-	VFree  string `json:"vfree"`  // e.g. "2.30g"
+	Name   string  `json:"name"`
+	VSize  string  `json:"vsize"`   // e.g. "3.50g"
+	VFree  string  `json:"vfree"`   // e.g. "2.30g"
 	FreeGB float64 `json:"free_gb"` // numeric free in GB for UI sizing
 }
 
