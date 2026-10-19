@@ -799,7 +799,7 @@ def has_device_mount(pid, device):
     return any(len(row) > 2 and row[2] == device for row in fields)
 
 
-def pids():
+def pids(tolerant=False):
     limit = max_tasks()
     found = set()
     for name in os.listdir("/proc"):
@@ -811,7 +811,19 @@ def pids():
             # invisible in the top-level /proc listing. Include their TIDs.
             tasks = os.listdir(base + "/task")
         except FileNotFoundError:
+            if tolerant:
+                # A task that vanished between the listing and this read cannot
+                # be a holder.
+                continue
             require(not os.path.exists(base), "live process task evidence missing")
+            continue
+        except OSError:
+            if not tolerant:
+                raise
+            # Unreadable task evidence cannot name a holder either. Skipping it
+            # costs at most one refused removal, which lvremove reports, so a
+            # holder lookup never turns a single unreadable process into a
+            # failure. The strict scan keeps failing closed instead.
             continue
         found.update(int(tid) for tid in tasks if tid.isdigit())
         require(
@@ -908,7 +920,7 @@ def holder_scan(lv_dev, reserved):
     """
     device = inspect_device(lv_dev)
     unmounts = {}
-    for pid in pids():
+    for pid in pids(tolerant=True):
         try:
             namespace = os.readlink("/proc/%d/ns/mnt" % pid)
             records = parse_mountinfo(read_text("/proc/%d/mountinfo" % pid))

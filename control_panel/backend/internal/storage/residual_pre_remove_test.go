@@ -51,9 +51,11 @@ func TestResidualMountsAreClearedBeforeFirstLvremove(t *testing.T) {
 				"sed -i '\\#^/data02/share #d' /etc/exports",
 				"exportfs -arv",
 				"umount /data02/share",
-				"logical volume is still mounted at:",
+				// Handbook 8.2: the holder's own copy is unmounted inside its
+				// mount namespace before the final host unmount check.
 				"cp-storage-namespace-scan_delete",
 				"nsenter -t 123 -m umount '/host-data/share'",
+				"logical volume is still mounted at:",
 			}
 			for _, command := range orderedBeforeIdentity {
 				index := firstCommand(sr.calls, command)
@@ -172,4 +174,77 @@ func TestHolderLookupFailureDoesNotBlockLvremove(t *testing.T) {
 			assertNoUnsafeDeleteEscalation(t, sr)
 		})
 	}
+}
+
+// Handbook 8.2: when the host unmount reports the target busy, a holder still
+// has its own copy, so that copy is ordinarily unmounted inside its mount
+// namespace and the host unmount is retried before the final check.
+func TestBusyHostUnmountFallsBackToNamespaceUnmount(t *testing.T) {
+	sr := residualBeforeRemoveRunner(t)
+	sr.add("umount /data02/share",
+		scriptResult{stderr: "umount: /data02/share: target is busy.", exitCode: 32},
+		scriptResult{},
+	)
+	store, id := submitDeleteTask(t, sr, "storage_delete_lv")
+	waitFor(t, store, id, "succeeded", 2*time.Second)
+
+	if sr.counts["umount /data02/share"] != 2 {
+		t.Fatalf("a busy host unmount must be retried after the holder release: %v", sr.calls)
+	}
+	if sr.counts["nsenter -t 123 -m umount '/host-data/share'"] != 1 {
+		t.Fatalf("the holder's own copy must be released before the retry: %v", sr.calls)
+	}
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 1 {
+		t.Fatalf("deletion must still reach lvremove: %v", sr.calls)
+	}
+	commands := strings.Join(sr.calls, "\n")
+	first := strings.Index(commands, "umount /data02/share")
+	release := strings.Index(commands, "nsenter -t 123 -m umount '/host-data/share'")
+	retry := strings.LastIndex(commands, "umount /data02/share")
+	verify := strings.Index(commands, "logical volume is still mounted at:")
+	if first < 0 || release <= first || retry <= release || verify <= retry {
+		t.Fatalf("order must be host unmount, holder release, retry, final check: %v", sr.calls)
+	}
+	assertNoUnsafeDeleteEscalation(t, sr)
+}
+
+// A host mount that stays busy after the holder was released has a local user
+// that is not the holder, so the volume is retained and that reason is reported
+// instead of the holder.
+func TestStillBusyHostUnmountRetainsVolume(t *testing.T) {
+	sr := residualBeforeRemoveRunner(t)
+	sr.add("umount /data02/share",
+		scriptResult{stderr: "umount: /data02/share: target is busy.", exitCode: 32},
+	)
+	store, id := submitDeleteTask(t, sr, "storage_delete_lv")
+	waitFor(t, store, id, "failed", 2*time.Second)
+	task, err := store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Error == nil || !strings.Contains(*task.Error, "host unmount still failing after releasing holders") {
+		t.Fatalf("error=%v", task.Error)
+	}
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 0 {
+		t.Fatalf("a still-busy host mount must retain the volume: %v", sr.calls)
+	}
+	assertNoUnsafeDeleteEscalation(t, sr)
+}
+
+// A mount that an actor already released between the lookup and the unmount is
+// the state this step exists to produce, so it is not a deletion failure.
+func TestAlreadyReleasedMountsAreNotDeletionFailures(t *testing.T) {
+	sr := residualBeforeRemoveRunner(t)
+	sr.add("umount /data02/share", scriptResult{stderr: "umount: /data02/share: not mounted.", exitCode: 32})
+	sr.add("nsenter -t 123 -m umount '/host-data/share'", scriptResult{stderr: "umount: /host-data/share: not mounted.", exitCode: 32})
+	store, id := submitDeleteTask(t, sr, "storage_delete_lv")
+	waitFor(t, store, id, "succeeded", 2*time.Second)
+
+	if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 1 {
+		t.Fatalf("an already-released mount must not block lvremove: %v", sr.calls)
+	}
+	if sr.counts["umount /data02/share"] != 1 {
+		t.Fatalf("an already-released host mount needs no retry: %v", sr.calls)
+	}
+	assertNoUnsafeDeleteEscalation(t, sr)
 }

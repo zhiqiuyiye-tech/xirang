@@ -885,9 +885,11 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 		strings.Index(commands, "exportfs -arv"),
 		subMount,
 		parentMount,
-		strings.Index(commands, "logical volume is still mounted at:"),
+		// Handbook 8.2: the holder's own copy is unmounted inside its mount
+		// namespace before the final host unmount check.
 		strings.Index(commands, "# cp-storage-namespace-scan_delete"),
 		strings.Index(commands, "# cp-storage-namespace-unmount"),
+		strings.Index(commands, "logical volume is still mounted at:"),
 		strings.LastIndex(commands, "# cp-storage-namespace-inspect_lv"),
 		strings.Index(commands, "lvremove -f /dev/vg_data/lv_1"),
 		strings.Index(commands, "sed -i '\\#^/dev/vg_data/lv_1 #d' /etc/fstab"),

@@ -69,6 +69,46 @@ func isFilesystemInUse(stdout, stderr string) bool {
 	return strings.Contains(strings.ToLower(stdout+"\n"+stderr), "filesystem in use")
 }
 
+// isTargetBusy reports the handbook's own failure case: a host unmount that the
+// kernel refused because something still holds the mount. util-linux says
+// "target is busy" and older versions say "device is busy".
+func isTargetBusy(stdout, stderr string) bool {
+	return strings.Contains(strings.ToLower(stdout+"\n"+stderr), "busy")
+}
+
+// isNotMounted reports an unmount whose path was already released. A holder can
+// exit or release its own copy between the holder lookup and the unmount, and
+// that already satisfies the release step.
+func isNotMounted(stdout, stderr string) bool {
+	return strings.Contains(strings.ToLower(stdout+"\n"+stderr), "not mounted")
+}
+
+// retryBusyUnmounts repeats the host unmounts that reported the target busy.
+// Their holder was released inside its mount namespace in between, which is the
+// handbook order. A retry that still fails names the remaining local user of the
+// mount instead of the holder, so the operator knows to look beyond mounts.
+func (h *deleteLVHandler) retryBusyUnmounts(ctx context.Context, r *tasks.Reporter, w db.WorkerNode, commands []string) error {
+	for _, command := range commands {
+		step, err := r.Step("umount_after_holder_release")
+		if err != nil {
+			r.Fail(err.Error())
+			return err
+		}
+		out, stderr, code, runErr := h.runner.Run(ctx, w, command)
+		if runErr != nil || code != 0 {
+			message := fmt.Sprintf("host unmount still failing after releasing holders (code=%d): %s", code, strings.TrimSpace(stderr+"\n"+out))
+			if runErr != nil {
+				message += "; " + runErr.Error()
+			}
+			step.Done("failed", out, stderr, message)
+			r.Fail(message)
+			return fmt.Errorf("%s", message)
+		}
+		step.Done("succeeded", out, stderr, "")
+	}
+	return nil
+}
+
 func (h *deleteLVHandler) recoverNamespaceAndRemove(ctx context.Context, r *tasks.Reporter, w db.WorkerNode, dev string, paths []string, identity DeviceIdentity, removeCmd string) error {
 	budget := h.cleanupTimeout
 	if budget <= 0 {
@@ -170,6 +210,12 @@ func (h *deleteLVHandler) unmountNamespaceHolders(ctx context.Context, w db.Work
 		for _, path := range holder.Paths {
 			out, stderr, code, err := h.runner.Run(ctx, w, NamespaceUnmountCmd(holder.PID, path))
 			if err == nil && code == 0 {
+				continue
+			}
+			if err == nil && isNotMounted(out, stderr) {
+				// The holder released its own copy between the lookup and this
+				// command. Nothing is mounted there any more, which is the goal,
+				// so this is not a failure.
 				continue
 			}
 			reason := strings.TrimSpace(stderr + "\n" + out)

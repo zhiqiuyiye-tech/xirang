@@ -91,9 +91,9 @@ func TestSharedMountMetadataUsesOrdinaryDeleteUnmount(t *testing.T) {
 		}
 	}
 	unmount := strings.Index(commands, "umount /data02/share")
-	verify := strings.Index(commands, "logical volume is still mounted at:")
 	scan := strings.Index(commands, "# cp-storage-namespace-scan_delete")
-	if unmount < 0 || verify <= unmount || scan <= verify {
+	verify := strings.Index(commands, "logical volume is still mounted at:")
+	if unmount < 0 || scan <= unmount || verify <= scan {
 		t.Fatalf("shared mount metadata must still use ordinary host unmount and verification: %v", sr.calls)
 	}
 	assertNoUnsafeDeleteEscalation(t, sr)

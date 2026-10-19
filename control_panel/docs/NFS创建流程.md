@@ -131,7 +131,7 @@ sudo umount /data02/notebook_a_200g
 sudo umount /data02/notebook_b_500g
 ```
 
-如果宿主机 `umount` 提示 `target is busy`，说明仍有进程在该挂载命名空间中使用这个目录。找到持有者进程的 PID 后，进入它的挂载命名空间再执行一次普通卸载：
+如果宿主机 `umount` 提示 `target is busy`，说明仍有进程在该挂载命名空间中使用这个目录。找到持有者进程的 PID 后，进入它的挂载命名空间再执行一次普通卸载，然后回到宿主机重新执行上面的 `umount`：
 
 ```bash
 sudo nsenter -t 2478731 -m umount /data02/nfs_lv_nb_57fc4e9250ee4cadb6f43dff96c48d54

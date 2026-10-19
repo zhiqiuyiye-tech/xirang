@@ -879,12 +879,25 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 
 	// Handbook order: revoke exports, ordinarily unmount the host, ordinarily
 	// unmount exact-device copies inside each holder's mount namespace, remove
-	// the LV, clean fstab.
+	// the LV, clean fstab. A host unmount that reports the target busy is the
+	// handbook's own case: the holder's copy is unmounted inside its mount
+	// namespace first, and the host unmount is retried before the final check.
+	released := false
+	busyUnmounts := []string{}
 	for _, s := range DeleteLVSteps(DeleteLVReq{VGName: p.VGName, LVName: p.LVName, MountPoints: mountPoints}) {
-		if s.Name == "lvremove" {
+		// Release residual holders before the last chance to observe the host
+		// mount state: before the final unmount check when the LV is mounted on
+		// the host, and before lvremove otherwise.
+		if !released && (s.Name == "verify_unmounted" || s.Name == "lvremove") {
+			released = true
 			if err := h.releaseResidualMounts(ctx, r, *w, lvDev, mountPoints, identity, false); err != nil {
 				return err
 			}
+			if err := h.retryBusyUnmounts(ctx, r, *w, busyUnmounts); err != nil {
+				return err
+			}
+		}
+		if s.Name == "lvremove" {
 			current, err := h.inspectDevice(ctx, r, *w, lvDev, "verify_lv_identity_before_remove")
 			if err != nil {
 				return err
@@ -907,6 +920,19 @@ func (h *deleteLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 				message += "; " + err.Error()
 			}
 			sh.Done("failed", out, stderr, message)
+			// A busy host unmount is what a holder's own copy produces: release
+			// that copy and retry. A path that some other actor already
+			// released needs nothing; the final check below still verifies the
+			// resulting state. Every other unmount failure stops here.
+			if s.Name == "umount" && err == nil {
+				if isNotMounted(out, stderr) {
+					continue
+				}
+				if isTargetBusy(out, stderr) {
+					busyUnmounts = append(busyUnmounts, s.Cmd)
+					continue
+				}
+			}
 			// Only a confirmed LVM filesystem-in-use error permits recovery.
 			// Transport failures never trigger a destructive follow-up command.
 			if s.Name == "lvremove" && err == nil && isFilesystemInUse(out, stderr) {
