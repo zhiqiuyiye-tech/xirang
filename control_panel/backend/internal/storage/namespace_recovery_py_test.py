@@ -332,6 +332,84 @@ class ParserTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(r.RecoveryError):
                 r.parse_mountinfo(text)
 
+    def test_holder_scan_reports_the_lowest_task_id_of_the_namespace(self):
+        identity = {"uuid": "u", "major_minor": "253:0"}
+        with (
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "pids", return_value=[900, 800]),
+            patch.object(r.os, "readlink", return_value="mnt:[42]"),
+            patch.object(r, "read_text", return_value=ROOT + TARGET),
+        ):
+            result = r.holder_scan("/dev/vg/lv", [])
+        self.assertEqual(result["device"], identity)
+        # 800 is the thread group leader of that namespace, so the handbook
+        # unmount is issued against the PID an operator recognizes on the node.
+        self.assertEqual(result["holders"], [{"pid": 800, "paths": ["/data02/test"]}])
+
+        with (
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "pids", return_value=[800]),
+            patch.object(r.os, "readlink", return_value="not-a-namespace"),
+            patch.object(r, "read_text", return_value=ROOT + TARGET),
+        ):
+            self.assertEqual(r.holder_scan("/dev/vg/lv", [])["holders"], [])
+
+    def test_holder_scan_skips_evidence_it_cannot_read(self):
+        identity = {"uuid": "u", "major_minor": "253:0"}
+
+        def read_text(path):
+            if path.endswith("/900/mountinfo"):
+                raise PermissionError("denied")
+            if path.endswith("/600/mountinfo"):
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            if path.endswith("/700/mountinfo"):
+                return "malformed"
+            return ROOT + TARGET
+
+        with (
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "pids", return_value=[600, 700, 800, 900]),
+            patch.object(r.os, "readlink", return_value="mnt:[42]"),
+            patch.object(r, "read_text", side_effect=read_text),
+        ):
+            result = r.holder_scan("/dev/vg/lv", [])
+        # Unreadable or unprovable evidence is not a holder; it must not fail the
+        # lookup, because lvremove refuses a volume any namespace still holds.
+        self.assertEqual(result["holders"], [{"pid": 800, "paths": ["/data02/test"]}])
+
+    def test_holder_scan_excludes_unsafe_mounts_instead_of_failing(self):
+        identity = {"uuid": "u", "major_minor": "253:0"}
+        unsafe = "11 1 253:0 / /data01/test rw - xfs /dev/mapper/vg-lv rw\n"
+        evidence = ROOT + TARGET + unsafe
+        with (
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "pids", return_value=[800]),
+            patch.object(r.os, "readlink", return_value="mnt:[42]"),
+            patch.object(r, "read_text", return_value=evidence),
+        ):
+            result = r.holder_scan("/dev/vg/lv", ["/data01"])
+        # A protected path is never unmounted. It stays out of the list and is
+        # left to lvremove, which is where the refusal now belongs.
+        self.assertEqual(result["holders"], [{"pid": 800, "paths": ["/data02/test"]}])
+
+        # The strict scan keeps failing closed on the same evidence.
+        with (
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "pids", return_value=[800]),
+            patch.object(
+                r,
+                "process_info",
+                return_value=(
+                    {"pid": 800, "start_time": "100", "cgroup": "0::/test\n"},
+                    "mnt:[42]",
+                    (1, 2),
+                ),
+            ),
+            patch.object(r, "read_text", return_value=evidence),
+            self.assertRaises(r.RecoveryError),
+        ):
+            r.scan("/dev/vg/lv", ["/data01"])
+
     def test_stat_comm_parentheses(self):
         text = "123 (name ) with spaces) S " + " ".join(
             ["0"] * 18 + ["987"] + ["0"] * 10

@@ -80,12 +80,12 @@ func (h *deleteLVHandler) recoverNamespaceAndRemove(ctx context.Context, r *task
 	if err != nil {
 		return err
 	}
-	snapshot, err := h.recovery.Scan(recoveryCtx, w, dev)
+	snapshot, err := h.recovery.Holders(recoveryCtx, w, dev)
 	if err != nil {
 		sh.Done("failed", "", "", err.Error())
-		return fmt.Errorf("namespace scan failed; retain volume: %w", err)
+		return fmt.Errorf("namespace holder lookup failed; retain volume: %w", err)
 	}
-	diagnostic := summarizeNamespaceHolders(snapshot.Holders)
+	diagnostic := summarizeHolders(snapshot)
 	if snapshot.Device != identity {
 		err = fmt.Errorf("logical volume identity changed; retain volume")
 	} else if len(snapshot.Holders) == 0 {
@@ -155,15 +155,20 @@ func summarizeNamespaceHolders(holders []NamespaceHolder) string {
 	return string(data)
 }
 
+func summarizeHolders(holders NamespaceHolders) string {
+	data, _ := json.Marshal(holders.Holders)
+	return string(data)
+}
+
 // unmountNamespaceHolders ordinarily unmounts every residual mount of the
 // discovered holders inside each holder's own mount namespace. Every holder is
 // attempted so one failure cannot leave another holder's copy mounted, and the
 // collected failures are reported together.
-func (h *deleteLVHandler) unmountNamespaceHolders(ctx context.Context, w db.WorkerNode, snapshot NamespaceSnapshot) error {
+func (h *deleteLVHandler) unmountNamespaceHolders(ctx context.Context, w db.WorkerNode, holders NamespaceHolders) error {
 	failures := []string{}
-	for _, holder := range snapshot.Holders {
-		for _, mount := range holder.Mounts {
-			out, stderr, code, err := h.runner.Run(ctx, w, NamespaceUnmountCmd(holder.PID, mount.Path))
+	for _, holder := range holders.Holders {
+		for _, path := range holder.Paths {
+			out, stderr, code, err := h.runner.Run(ctx, w, NamespaceUnmountCmd(holder.PID, path))
 			if err == nil && code == 0 {
 				continue
 			}
@@ -171,7 +176,7 @@ func (h *deleteLVHandler) unmountNamespaceHolders(ctx context.Context, w db.Work
 			if err != nil {
 				reason = fmt.Sprintf("%v: %s", err, reason)
 			}
-			failures = append(failures, fmt.Sprintf("PID %d %s (code=%d): %s", holder.PID, mount.Path, code, reason))
+			failures = append(failures, fmt.Sprintf("PID %d %s (code=%d): %s", holder.PID, path, code, reason))
 		}
 	}
 	if len(failures) > 0 {

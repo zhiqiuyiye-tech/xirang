@@ -32,6 +32,22 @@ type NamespaceSnapshot struct {
 	Device  DeviceIdentity    `json:"device"`
 	Holders []NamespaceHolder `json:"holders"`
 }
+
+// NamespaceHolderRef is everything the handbook unmount consumes: the task
+// whose mount namespace is entered, and the paths ordinarily unmounted inside
+// it.
+type NamespaceHolderRef struct {
+	PID   int      `json:"pid"`
+	Paths []string `json:"paths"`
+}
+
+// NamespaceHolders is the holder lookup the handbook delete depends on. It
+// carries only the PID and path pair that unmount needs, so evidence this flow
+// no longer consumes can never refuse a deletion.
+type NamespaceHolders struct {
+	Device  DeviceIdentity       `json:"device"`
+	Holders []NamespaceHolderRef `json:"holders"`
+}
 type NamespaceHolder struct {
 	PID       int                `json:"pid"`
 	Namespace string             `json:"namespace"`
@@ -96,15 +112,43 @@ func (n *NamespaceRecovery) Inspect(ctx context.Context, w db.WorkerNode, lvDev 
 }
 func (n *NamespaceRecovery) Scan(ctx context.Context, w db.WorkerNode, lvDev string) (NamespaceSnapshot, error) {
 	var snapshot NamespaceSnapshot
-	operation := "scan"
-	if n.forDeletion {
-		operation = "scan_delete"
-	}
-	err := n.call(ctx, w, lvDev, operation, nil, &snapshot)
+	err := n.call(ctx, w, lvDev, "scan", nil, &snapshot)
 	if err == nil {
 		err = validateRecoverySnapshot(snapshot, false)
 	}
 	return snapshot, err
+}
+
+// Holders is the handbook lookup: which tasks still hold the target device and
+// which paths to ordinarily unmount inside their mount namespaces. It is
+// deliberately separate from Scan, whose namespace membership evidence deletion
+// no longer consumes.
+func (n *NamespaceRecovery) Holders(ctx context.Context, w db.WorkerNode, lvDev string) (NamespaceHolders, error) {
+	var holders NamespaceHolders
+	err := n.call(ctx, w, lvDev, "scan_delete", nil, &holders)
+	if err == nil {
+		err = validateNamespaceHolders(holders)
+	}
+	return holders, err
+}
+
+func validateNamespaceHolders(h NamespaceHolders) error {
+	if !validRecoveryIdentity(h.Device) || h.Holders == nil || len(h.Holders) > 4096 {
+		return errors.New("invalid namespace holders")
+	}
+	tasks := map[int]bool{}
+	for _, holder := range h.Holders {
+		if holder.PID <= 0 || tasks[holder.PID] || len(holder.Paths) == 0 {
+			return errors.New("invalid namespace holder")
+		}
+		tasks[holder.PID] = true
+		for _, path := range holder.Paths {
+			if !strings.HasPrefix(path, "/") || path == "/" || strings.ContainsRune(path, 0) {
+				return errors.New("invalid namespace holder mount")
+			}
+		}
+	}
+	return nil
 }
 func (n *NamespaceRecovery) Cleanup(ctx context.Context, w db.WorkerNode, lvDev string, snapshot NamespaceSnapshot) error {
 	if err := validateRecoverySnapshot(snapshot, true); err != nil {

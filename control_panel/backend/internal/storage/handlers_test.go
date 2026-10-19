@@ -858,10 +858,8 @@ func TestDeleteLVHandlerUnmountsAllMountTargets(t *testing.T) {
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1",
 		scriptResult{stdout: "/data02/share\n/data02/share/sub\n"},
 		scriptResult{stdout: ""})
-	snapshot := namespaceTestSnapshot()
-	snapshot.Device.UUID = "stable-uuid"
-	snapshot.Holders[0].Mounts[0].Path = "/data02/share"
-	sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, snapshot)})
+	sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: holdersJSON(t, "stable-uuid",
+		NamespaceHolderRef{PID: 123, Paths: []string{"/data02/share"}})})
 	sr.add("nsenter -t 123 -m umount '/data02/share'", scriptResult{})
 	sr.add("cp-storage-namespace-inspect_lv",
 		scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`},

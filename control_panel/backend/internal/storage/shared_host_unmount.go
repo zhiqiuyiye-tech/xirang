@@ -207,7 +207,7 @@ func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Re
 		r.Fail(err.Error())
 		return err
 	}
-	snapshot, scanErr := h.recovery.Scan(ctx, w, dev)
+	snapshot, scanErr := h.recovery.Holders(ctx, w, dev)
 	if scanErr != nil {
 		// The lookup exists only to name the holder for the handbook unmount.
 		// A host whose process evidence cannot be read must not block the
@@ -225,7 +225,7 @@ func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Re
 		r.Fail(err.Error())
 		return err
 	}
-	step.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "process-visible residual mounts inspected before first lvremove")
+	step.Done("succeeded", summarizeHolders(snapshot), "", "process-visible residual mounts inspected before first lvremove")
 	if len(snapshot.Holders) > 0 {
 		unmountStep, err := r.Step("unmount_namespace_holders_before_remove")
 		if err != nil {
@@ -237,11 +237,11 @@ func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Re
 		// pinning or open-count check gates this step; lvremove itself refuses
 		// a volume that some namespace still holds.
 		if err := h.unmountNamespaceHolders(ctx, w, snapshot); err != nil {
-			unmountStep.Done("failed", summarizeNamespaceHolders(snapshot.Holders), "", err.Error())
+			unmountStep.Done("failed", summarizeHolders(snapshot), "", err.Error())
 			r.Fail(err.Error())
 			return err
 		}
-		unmountStep.Done("succeeded", summarizeNamespaceHolders(snapshot.Holders), "", "ordinary unmount executed in each holding mount namespace")
+		unmountStep.Done("succeeded", summarizeHolders(snapshot), "", "ordinary unmount executed in each holding mount namespace")
 	}
 	if sharedHost {
 		return h.verifySharedReleased(ctx, r, w, dev, identity, "verify_shared_device_released")

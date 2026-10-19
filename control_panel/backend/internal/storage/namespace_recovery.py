@@ -134,79 +134,110 @@ def within(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def safe_mounts(records, device, reserved, require_local=True):
-    require(DEVICE_PATTERN.fullmatch(device), "invalid target device")
+def safe_target(records, by_id, paths, mount, reserved, require_local):
+    """Validate one device mount, raising RecoveryError when this flow may not
+    unmount it."""
+    # A namespace handle is metadata for an unrelated nsfs mount, never
+    # an acceptable filesystem root for the logical volume being removed.
+    require(
+        mount["root"].startswith("/")
+        and "\x00" not in mount["root"]
+        and posixpath.normpath(mount["root"]) == mount["root"],
+        "noncanonical target mount root",
+    )
+    path = mount["path"]
+    require(path != "/", "target is namespace root")
+    for root in list(PROTECTED[1:]) + list(reserved):
+        require(
+            not within(path, root) and not within(root, path),
+            "target intersects protected path",
+        )
+    require(len(paths[path]) == 1, "stacked target mounts")
+    # Reject all descendants, including same-device descendants. This
+    # conservative first version never recursively unmounts another mount.
+    for other in records:
+        if other["id"] != mount["id"]:
+            require(not within(other["path"], path), "target has child/stacked mount")
+            cursor = other
+            visited = set()
+            while cursor["parent_id"] in by_id and cursor["id"] not in visited:
+                visited.add(cursor["id"])
+                require(
+                    cursor["parent_id"] != mount["id"],
+                    "target has mount-tree child",
+                )
+                cursor = by_id[cursor["parent_id"]]
+    # An unmount event propagates through the DIRECT parent mount. A
+    # private parent isolates the event even if more distant ancestors are
+    # shared. Keep structural checks for the whole ancestry below.
+    require(mount["parent_id"] in by_id, "unknown mount parent")
+    if require_local:
+        # This is a leaf (no child mounts). An unmount event propagates
+        # outward only through the DIRECT parent mount. A private parent
+        # or a receive-only slave parent (master without shared) isolates
+        # this unmount locally: events do NOT propagate to the master.
+        leaf_tags = propagation_tags(mount)
+        parent_tags = propagation_tags(by_id[mount["parent_id"]])
+        require(
+            set(leaf_tags) <= {"shared"} and "shared" not in parent_tags,
+            "target/direct-parent propagation not proven local",
+        )
+    else:
+        propagation_tags(mount)
+        propagation_tags(by_id[mount["parent_id"]])
+    current = mount
+    visited = set()
+    while True:
+        require(current["id"] not in visited, "cyclic mount parent")
+        visited.add(current["id"])
+        if current["path"] == "/":
+            break
+        require(current["parent_id"] in by_id, "unknown mount parent")
+        parent = by_id[current["parent_id"]]
+        require(
+            len(paths[parent["path"]]) == 1 and within(current["path"], parent["path"]),
+            "ambiguous or inconsistent parent mount",
+        )
+        current = parent
+
+
+def mount_index(records):
     by_id = {m["id"]: m for m in records}
     paths = {}
     for record in records:
         paths.setdefault(record["path"], []).append(record)
+    return by_id, paths
+
+
+def safe_mounts(records, device, reserved, require_local=True):
+    require(DEVICE_PATTERN.fullmatch(device), "invalid target device")
+    by_id, paths = mount_index(records)
     targets = [m for m in records if m["device"] == device]
     for mount in targets:
-        # A namespace handle is metadata for an unrelated nsfs mount, never
-        # an acceptable filesystem root for the logical volume being removed.
-        require(
-            mount["root"].startswith("/")
-            and "\x00" not in mount["root"]
-            and posixpath.normpath(mount["root"]) == mount["root"],
-            "noncanonical target mount root",
-        )
-        path = mount["path"]
-        require(path != "/", "target is namespace root")
-        for root in list(PROTECTED[1:]) + list(reserved):
-            require(
-                not within(path, root) and not within(root, path),
-                "target intersects protected path",
-            )
-        require(len(paths[path]) == 1, "stacked target mounts")
-        # Reject all descendants, including same-device descendants. This
-        # conservative first version never recursively unmounts another mount.
-        for other in records:
-            if other["id"] != mount["id"]:
-                require(
-                    not within(other["path"], path), "target has child/stacked mount"
-                )
-                cursor = other
-                visited = set()
-                while cursor["parent_id"] in by_id and cursor["id"] not in visited:
-                    visited.add(cursor["id"])
-                    require(
-                        cursor["parent_id"] != mount["id"],
-                        "target has mount-tree child",
-                    )
-                    cursor = by_id[cursor["parent_id"]]
-        # An unmount event propagates through the DIRECT parent mount. A
-        # private parent isolates the event even if more distant ancestors are
-        # shared. Keep structural checks for the whole ancestry below.
-        require(mount["parent_id"] in by_id, "unknown mount parent")
-        if require_local:
-            # This is a leaf (no child mounts). An unmount event propagates
-            # outward only through the DIRECT parent mount. A private parent
-            # or a receive-only slave parent (master without shared) isolates
-            # this unmount locally: events do NOT propagate to the master.
-            leaf_tags = propagation_tags(mount)
-            parent_tags = propagation_tags(by_id[mount["parent_id"]])
-            require(
-                set(leaf_tags) <= {"shared"} and "shared" not in parent_tags,
-                "target/direct-parent propagation not proven local",
-            )
-        else:
-            propagation_tags(mount)
-            propagation_tags(by_id[mount["parent_id"]])
-        current = mount
-        visited = set()
-        while True:
-            require(current["id"] not in visited, "cyclic mount parent")
-            visited.add(current["id"])
-            if current["path"] == "/":
-                break
-            require(current["parent_id"] in by_id, "unknown mount parent")
-            parent = by_id[current["parent_id"]]
-            require(
-                len(paths[parent["path"]]) == 1
-                and within(current["path"], parent["path"]),
-                "ambiguous or inconsistent parent mount",
-            )
-            current = parent
+        safe_target(records, by_id, paths, mount, reserved, require_local)
+    return sorted(targets, key=lambda m: m["id"])
+
+
+def usable_mounts(records, device, reserved):
+    """The device mounts a holder lookup may unmount, excluding unsafe ones.
+
+    The handbook unmount needs only a task and a path, so a mount that fails the
+    protection checks is left out of the list instead of failing the whole
+    lookup. Skipping it cannot unmount the wrong thing: a returned mount was
+    proven to be this device at this path. It only costs one refused removal,
+    because lvremove refuses a volume that any namespace still holds.
+    """
+    require(DEVICE_PATTERN.fullmatch(device), "invalid target device")
+    by_id, paths = mount_index(records)
+    targets = []
+    for mount in records:
+        if mount["device"] != device:
+            continue
+        try:
+            safe_target(records, by_id, paths, mount, reserved, False)
+        except RecoveryError:
+            continue
+        targets.append(mount)
     return sorted(targets, key=lambda m: m["id"])
 
 
@@ -864,6 +895,46 @@ def scan(lv_dev, reserved, require_local=True):
     return {"device": device, "holders": holders}
 
 
+def holder_scan(lv_dev, reserved):
+    """Find the tasks that still hold the target device, and where.
+
+    The handbook unmount needs exactly two things: which task to enter and which
+    path to ordinarily unmount inside that task's mount namespace. Evidence that
+    cannot be read, and a mount that fails the protection checks, are therefore
+    skipped instead of failing the lookup. Nothing unsafe follows from skipping:
+    a returned mount was proven to be this device at this path, and lvremove
+    itself refuses a volume that some namespace still holds, so a missed holder
+    costs one refused removal, never a wrong unmount.
+    """
+    device = inspect_device(lv_dev)
+    unmounts = {}
+    for pid in pids():
+        try:
+            namespace = os.readlink("/proc/%d/ns/mnt" % pid)
+            records = parse_mountinfo(read_text("/proc/%d/mountinfo" % pid))
+        except (OSError, RecoveryError, ValueError):
+            # A vanished task, unreadable evidence or a mount table this parser
+            # rejects: none of them prove that this task holds the device.
+            continue
+        if not re.fullmatch(r"mnt:\[[1-9][0-9]*\]", namespace):
+            continue
+        for mount in usable_mounts(records, device["major_minor"], reserved):
+            # One unmount per (namespace, path). The lowest task ID of the
+            # namespace wins, which is the thread group leader of a container
+            # process: the PID an operator recognizes on the node.
+            key = (namespace, mount["path"])
+            unmounts[key] = min(pid, unmounts.get(key, pid))
+    by_pid = {}
+    for (_, path), pid in sorted(unmounts.items()):
+        by_pid.setdefault(pid, []).append(path)
+    return {
+        "device": device,
+        "holders": [
+            {"pid": pid, "paths": sorted(by_pid[pid])} for pid in sorted(by_pid)
+        ],
+    }
+
+
 def check_members(expected, actual):
     require(expected == actual, "namespace membership or process identity changed")
 
@@ -1456,7 +1527,7 @@ def main():
         if operation == "inspect_lv":
             result = inspect_device(lv_dev)
         elif operation == "scan_delete":
-            result = scan(lv_dev, reserved, require_local=False)
+            result = holder_scan(lv_dev, reserved)
         elif operation == "cleanup_delete":
             result = cleanup(
                 lv_dev, reserved, req["payload"], timeout, require_local=False

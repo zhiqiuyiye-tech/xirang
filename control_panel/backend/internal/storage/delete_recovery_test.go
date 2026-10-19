@@ -10,9 +10,17 @@ import (
 	"xirang/control_panel/internal/db"
 )
 
-func recoverySnapshotJSON(t *testing.T, snapshot NamespaceSnapshot) string {
+// holdersJSON builds one holder-lookup response. Every lookup result carries
+// only the PID and paths the handbook unmount consumes.
+func holdersJSON(t *testing.T, deviceUUID string, holders ...NamespaceHolderRef) string {
 	t.Helper()
-	data, err := json.Marshal(map[string]any{"ok": true, "result": snapshot})
+	if holders == nil {
+		holders = []NamespaceHolderRef{}
+	}
+	data, err := json.Marshal(map[string]any{"ok": true, "result": NamespaceHolders{
+		Device:  DeviceIdentity{UUID: deviceUUID, MajorMinor: "253:0"},
+		Holders: holders,
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,12 +30,8 @@ func recoverySnapshotJSON(t *testing.T, snapshot NamespaceSnapshot) string {
 func recoveryScriptRunner(t *testing.T) *scriptRunner {
 	t.Helper()
 	sr := newScriptRunner()
-	empty := namespaceTestSnapshot()
-	empty.Device.UUID = "stable-uuid"
-	empty.Holders = []NamespaceHolder{}
-	holder := namespaceTestSnapshot()
-	holder.Device.UUID = "stable-uuid"
-	holder.Holders[0].Mounts[0].Path = "/data02/share"
+	empty := holdersJSON(t, "stable-uuid")
+	holder := holdersJSON(t, "stable-uuid", NamespaceHolderRef{PID: 123, Paths: []string{"/data02/share"}})
 	stableIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"}, scriptResult{stdout: ""})
 	sr.add("lvremove -f /dev/vg_data/lv_1",
@@ -37,8 +41,8 @@ func recoveryScriptRunner(t *testing.T) *scriptRunner {
 	// The ordinary path confirms no holders before the first lvremove. A later
 	// actual filesystem-in-use result represents a new namespace holder race.
 	sr.add("cp-storage-namespace-scan_delete",
-		scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-		scriptResult{stdout: recoverySnapshotJSON(t, holder)},
+		scriptResult{stdout: empty},
+		scriptResult{stdout: holder},
 	)
 	sr.add("nsenter -t 123 -m umount '/data02/share'", scriptResult{})
 	sr.add("cp-storage-namespace-inspect_lv", stableIdentity, stableIdentity, stableIdentity)
@@ -52,15 +56,9 @@ func submitRecoveryDelete(t *testing.T, sr *scriptRunner, opts ...StorageOption)
 
 func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 	stableIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
-	empty := namespaceTestSnapshot()
-	empty.Device.UUID = "stable-uuid"
-	empty.Holders = []NamespaceHolder{}
-	holder := namespaceTestSnapshot()
-	holder.Device.UUID = "stable-uuid"
-	holder.Holders[0].Mounts[0].Path = "/data02/share"
-	replacement := namespaceTestSnapshot()
-	replacement.Device.UUID = "replacement-uuid"
-	replacement.Holders[0].Mounts[0].Path = "/data02/share"
+	empty := holdersJSON(t, "stable-uuid")
+	holder := holdersJSON(t, "stable-uuid", NamespaceHolderRef{PID: 123, Paths: []string{"/data02/share"}})
+	replacement := holdersJSON(t, "replacement-uuid", NamespaceHolderRef{PID: 123, Paths: []string{"/data02/share"}})
 
 	for _, tc := range []struct {
 		name  string
@@ -71,28 +69,28 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 			name: "fallback scan failure",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
+					scriptResult{stdout: empty},
 					scriptResult{stdout: `{"ok":false,"error":"permission denied","state_unknown":false}`, exitCode: 1},
 				)
 			},
-			want: "namespace scan failed",
+			want: "namespace holder lookup failed",
 		},
 		{
 			name: "fallback scan transport error",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
+					scriptResult{stdout: empty},
 					scriptResult{runErr: context.DeadlineExceeded},
 				)
 			},
-			want: "namespace scan failed",
+			want: "namespace holder lookup failed",
 		},
 		{
 			name: "fallback scan identity changed",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-					scriptResult{stdout: recoverySnapshotJSON(t, replacement)},
+					scriptResult{stdout: empty},
+					scriptResult{stdout: replacement},
 				)
 			},
 			want: "identity changed",
@@ -101,8 +99,8 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 			name: "ordinary unmount busy",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
+					scriptResult{stdout: empty},
+					scriptResult{stdout: holder},
 				)
 				sr.add("nsenter -t 123 -m umount '/data02/share'",
 					scriptResult{stderr: "target is busy", exitCode: 1},
@@ -114,8 +112,8 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 			name: "unmount transport error",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
+					scriptResult{stdout: empty},
+					scriptResult{stdout: holder},
 				)
 				sr.add("nsenter -t 123 -m umount '/data02/share'", scriptResult{runErr: context.Canceled})
 			},
@@ -125,8 +123,8 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 			name: "LV UUID changed before retry",
 			setup: func(sr *scriptRunner) {
 				sr.add("cp-storage-namespace-scan_delete",
-					scriptResult{stdout: recoverySnapshotJSON(t, empty)},
-					scriptResult{stdout: recoverySnapshotJSON(t, holder)},
+					scriptResult{stdout: empty},
+					scriptResult{stdout: holder},
 				)
 				sr.add("cp-storage-namespace-inspect_lv", stableIdentity, stableIdentity,
 					scriptResult{stdout: `{"ok":true,"result":{"uuid":"replacement-uuid","major_minor":"253:0"}}`},

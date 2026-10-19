@@ -10,14 +10,12 @@ import (
 func residualBeforeRemoveRunner(t *testing.T) *scriptRunner {
 	t.Helper()
 	sr := newScriptRunner()
-	snapshot := namespaceTestSnapshot()
-	snapshot.Device.UUID = "stable-uuid"
-	snapshot.Holders[0].Mounts[0].Path = "/host-data/share"
-	snapshot.Holders[0].Mounts[0].Optional = []string{"shared:578"}
 	stableIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
 	sr.add("findmnt -rn -o TARGET --source /dev/vg_data/lv_1", scriptResult{stdout: "/data02/share\n"}, scriptResult{stdout: ""})
 	sr.add("cp-storage-namespace-inspect_lv", stableIdentity, stableIdentity)
-	sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, snapshot)})
+	sr.add("cp-storage-namespace-scan_delete",
+		scriptResult{stdout: holdersJSON(t, "stable-uuid", NamespaceHolderRef{PID: 123, Paths: []string{"/host-data/share"}})},
+	)
 	sr.add("nsenter -t 123 -m umount '/host-data/share'", scriptResult{})
 	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{stdout: "removed"})
 	return sr
@@ -94,10 +92,8 @@ func TestResidualFailuresRetainLVBeforeFirstLvremove(t *testing.T) {
 			want := ""
 			switch stage {
 			case "identity":
-				changedSnapshot := namespaceTestSnapshot()
-				changedSnapshot.Device.UUID = "replacement-uuid"
-				changedSnapshot.Holders[0].Mounts[0].Path = "/host-data/share"
-				sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: recoverySnapshotJSON(t, changedSnapshot)})
+				sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: holdersJSON(t, "replacement-uuid",
+					NamespaceHolderRef{PID: 123, Paths: []string{"/host-data/share"}})})
 				want = "identity changed"
 			case "unmount_busy":
 				sr.add("nsenter -t 123 -m umount '/host-data/share'", scriptResult{stderr: "target is busy", exitCode: 1})
