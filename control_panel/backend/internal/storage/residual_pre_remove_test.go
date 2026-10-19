@@ -88,17 +88,11 @@ func TestResidualFailuresRetainLVBeforeFirstLvremove(t *testing.T) {
 	stableIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`}
 	changedIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"replacement-uuid","major_minor":"253:0"}}`}
 
-	for _, stage := range []string{"scan", "scan_transport", "identity", "unmount_busy", "unmount_transport", "revalidate_identity"} {
+	for _, stage := range []string{"identity", "unmount_busy", "unmount_transport", "revalidate_identity"} {
 		t.Run(stage, func(t *testing.T) {
 			sr := residualBeforeRemoveRunner(t)
 			want := ""
 			switch stage {
-			case "scan":
-				sr.add("cp-storage-namespace-scan_delete", scriptResult{stdout: `{"ok":false,"error":"permission denied","state_unknown":false}`, exitCode: 1})
-				want = "namespace scan failed"
-			case "scan_transport":
-				sr.add("cp-storage-namespace-scan_delete", scriptResult{runErr: context.DeadlineExceeded})
-				want = "namespace scan failed"
 			case "identity":
 				changedSnapshot := namespaceTestSnapshot()
 				changedSnapshot.Device.UUID = "replacement-uuid"
@@ -126,6 +120,58 @@ func TestResidualFailuresRetainLVBeforeFirstLvremove(t *testing.T) {
 			}
 			if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 0 {
 				t.Fatalf("physical safety failure allowed lvremove: %v", sr.calls)
+			}
+			assertNoUnsafeDeleteEscalation(t, sr)
+		})
+	}
+}
+
+// The holder lookup only supplies the PID and mount path that the handbook
+// unmount needs. A host whose evidence cannot be read must not block the
+// handbook order, because lvremove itself refuses an in-use volume.
+func TestHolderLookupFailureDoesNotBlockLvremove(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage scriptResult
+	}{
+		{
+			name:  "evidence rejected",
+			stage: scriptResult{stdout: `{"ok":false,"error":"permission denied reading namespace evidence","state_unknown":false}`, exitCode: 1},
+		},
+		{
+			name:  "transport failure",
+			stage: scriptResult{runErr: context.DeadlineExceeded},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sr := residualBeforeRemoveRunner(t)
+			sr.add("cp-storage-namespace-scan_delete", tc.stage)
+			store, id := submitDeleteTask(t, sr, "storage_delete_lv")
+			waitFor(t, store, id, "succeeded", 2*time.Second)
+
+			if sr.counts["nsenter -t 123 -m umount '/host-data/share'"] != 0 {
+				t.Fatalf("a failed holder lookup must skip the handbook unmount: %v", sr.calls)
+			}
+			if sr.counts["lvremove -f /dev/vg_data/lv_1"] != 1 {
+				t.Fatalf("a failed holder lookup must not block lvremove: %v", sr.calls)
+			}
+			steps, err := store.ListSteps(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lookup := -1
+			for i, step := range steps {
+				if step.Name == "scan_namespace_holders_before_remove" {
+					lookup = i
+				}
+			}
+			if lookup < 0 {
+				t.Fatalf("holder lookup step was not recorded: %+v", steps)
+			}
+			recorded := steps[lookup]
+			if recorded.Status != "failed" || recorded.Error == nil ||
+				!strings.Contains(*recorded.Error, "namespace holder lookup failed") {
+				t.Fatalf("lookup step must record the skipped unmount: %+v", recorded)
 			}
 			assertNoUnsafeDeleteEscalation(t, sr)
 		})

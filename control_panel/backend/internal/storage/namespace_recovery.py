@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 
 MARKER = "/run/control-panel-storage-recovery.uncertain"
 MAX_BYTES = 8 * 1024 * 1024
@@ -1528,10 +1529,16 @@ def main():
         return 0
     except RecoveryError as exc:
         response = {"ok": False, "error": str(exc), "state_unknown": exc.state_unknown}
-    except BaseException:
+    except BaseException as exc:
+        # The operator only sees this string, so it must name the real cause. A
+        # fixed placeholder made every unexpected failure - an OSError on one
+        # /proc entry, a decode failure, a defect - look identical and left
+        # nothing to act on. The response keeps its exact three-key contract.
+        traceback.print_exc()
         response = {
             "ok": False,
-            "error": "host recovery probe or evidence failed",
+            "error": "host recovery probe or evidence failed: %s: %s"
+            % (type(exc).__name__, exc),
             "state_unknown": operation in ("cleanup", "cleanup_delete", "host_unmount"),
         }
     print(json.dumps(response, separators=(",", ":")), flush=True)

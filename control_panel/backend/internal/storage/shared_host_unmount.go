@@ -192,7 +192,9 @@ func (h *deleteLVHandler) releaseSharedDevice(ctx context.Context, r *tasks.Repo
 // releaseResidualMounts fills the gap between host umount and lvremove: the
 // holders of the exact device are discovered from kernel evidence and the
 // residual mount is ordinarily unmounted inside each holder's mount namespace,
-// which is the handbook step before lvremove.
+// which is the handbook step before lvremove. The discovery is best effort -
+// it only supplies the holder PID and path the handbook unmount needs - so a
+// host that cannot be read skips that unmount instead of blocking lvremove.
 func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Reporter, w db.WorkerNode, dev string, paths []string, identity DeviceIdentity, sharedHost bool) error {
 	budget := h.cleanupTimeout
 	if budget <= 0 {
@@ -205,12 +207,20 @@ func (h *deleteLVHandler) releaseResidualMounts(ctx context.Context, r *tasks.Re
 		r.Fail(err.Error())
 		return err
 	}
-	snapshot, err := h.recovery.Scan(ctx, w, dev)
-	if err == nil && snapshot.Device != identity {
-		err = errors.New("LV identity changed after shared host unmount")
+	snapshot, scanErr := h.recovery.Scan(ctx, w, dev)
+	if scanErr != nil {
+		// The lookup exists only to name the holder for the handbook unmount.
+		// A host whose process evidence cannot be read must not block the
+		// handbook order: nothing is destroyed unless lvremove itself allows
+		// it, so record the failure and continue to lvremove.
+		reason := fmt.Errorf("namespace holder lookup failed; handbook unmount skipped, lvremove decides: %w", scanErr)
+		step.Done("failed", "", "", reason.Error())
+		return nil
 	}
-	if err != nil {
-		err = fmt.Errorf("namespace scan failed before removal; retaining volume: %w", err)
+	if snapshot.Device != identity {
+		// The lookup described a different device, so its holders belong to
+		// another volume; unmounting them would modify the wrong namespace.
+		err := errors.New("LV identity changed after host umount; retaining volume")
 		step.Done("failed", "", "", err.Error())
 		r.Fail(err.Error())
 		return err
