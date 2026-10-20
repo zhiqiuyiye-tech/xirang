@@ -237,16 +237,24 @@ func TestDeleteLVSteps_Mounted(t *testing.T) {
 	if steps[0].Name != "remove_exports_line" || !contains(steps[0].Cmd, "/data02/nb") {
 		t.Fatalf("exports step wrong: %+v", steps[0])
 	}
+	// A worker with no exports file and no exportfs has nothing to revoke, and
+	// that must not fail the deletion.
+	if !contains(steps[0].Cmd, "[ -f /etc/exports ]") {
+		t.Fatalf("exports cleanup must tolerate a worker without an exports file: %+v", steps[0])
+	}
+	if steps[1].Name != "exportfs" || !contains(steps[1].Cmd, "command -v exportfs") {
+		t.Fatalf("export refresh must tolerate a worker without exportfs: %+v", steps[1])
+	}
 	if steps[2].Name != "check_mount_users" || !contains(steps[2].Cmd, "fuser -vm /data02/nb") {
 		t.Fatalf("mount-user diagnostic step wrong: %+v", steps[2])
 	}
-	if steps[3].Name != "umount" || steps[3].Cmd != "umount /data02/nb" {
+	if steps[3].Name != "umount" || steps[3].Cmd != "LC_ALL=C umount /data02/nb" {
 		t.Fatalf("umount step wrong: %+v", steps[3])
 	}
 	if steps[4].Name != "verify_unmounted" || !contains(steps[4].Cmd, "findmnt") {
 		t.Fatalf("unmount verification step wrong: %+v", steps[4])
 	}
-	if steps[5].Cmd != "lvremove -f /dev/vg_data/lv_200g" || steps[6].Name != "remove_fstab_line" {
+	if steps[5].Cmd != "LC_ALL=C lvremove -f /dev/vg_data/lv_200g" || steps[6].Name != "remove_fstab_line" {
 		t.Fatalf("LV removal must precede fstab cleanup: %+v", steps[5:])
 	}
 }
@@ -257,7 +265,7 @@ func TestDeleteLVSteps_Unmounted(t *testing.T) {
 	if len(steps) != 3 {
 		t.Fatalf("expected 3 steps for unmounted LV, got %d", len(steps))
 	}
-	if steps[0].Name != "verify_unmounted" || steps[1].Cmd != "lvremove -f /dev/vg_data/lv_200g" || steps[2].Name != "remove_fstab_line" {
+	if steps[0].Name != "verify_unmounted" || steps[1].Cmd != "LC_ALL=C lvremove -f /dev/vg_data/lv_200g" || steps[2].Name != "remove_fstab_line" {
 		t.Fatalf("unmounted handbook order must verify, remove, then clean fstab: %+v", steps)
 	}
 }

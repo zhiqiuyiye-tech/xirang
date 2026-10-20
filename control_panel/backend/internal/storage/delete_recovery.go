@@ -78,9 +78,11 @@ func isTargetBusy(stdout, stderr string) bool {
 
 // isNotMounted reports an unmount whose path was already released. A holder can
 // exit or release its own copy between the holder lookup and the unmount, and
-// that already satisfies the release step.
+// that already satisfies the release step. Commands force LC_ALL=C, so these
+// are util-linux's own C-locale wordings.
 func isNotMounted(stdout, stderr string) bool {
-	return strings.Contains(strings.ToLower(stdout+"\n"+stderr), "not mounted")
+	text := strings.ToLower(stdout + "\n" + stderr)
+	return strings.Contains(text, "not mounted") || strings.Contains(text, "mountpoint not found")
 }
 
 // retryBusyUnmounts repeats the host unmounts that reported the target busy.

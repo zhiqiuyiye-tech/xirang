@@ -464,19 +464,27 @@ func DeleteLVSteps(r DeleteLVReq) []Step {
 	steps := make([]Step, 0, len(mountPoints)*3+4)
 	if len(mountPoints) > 0 {
 		for _, mountPoint := range mountPoints {
-			steps = append(steps, Step{"remove_exports_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/exports`, mountPoint)})
+			// A worker without an exports file has nothing to revoke. A real sed
+			// failure on an existing file is still fatal.
+			steps = append(steps, Step{"remove_exports_line", fmt.Sprintf(`if [ -f /etc/exports ]; then sed -i '\#^%s #d' /etc/exports; fi`, mountPoint)})
 		}
-		steps = append(steps, Step{"exportfs", "exportfs -arv"})
+		// A worker without exportfs has no export to refresh, so the absent tool
+		// is not a deletion failure.
+		steps = append(steps, Step{"exportfs", `if command -v exportfs >/dev/null 2>&1; then exportfs -arv; else echo "exportfs is unavailable; no export was refreshed"; fi`})
 		for _, mountPoint := range mountPoints {
 			steps = append(steps,
 				Step{"check_mount_users", fmt.Sprintf(`if command -v fuser >/dev/null 2>&1; then fuser -vm %s 2>&1 || true; else echo "fuser is unavailable"; fi`, mountPoint)},
-				Step{"umount", fmt.Sprintf("umount %s", mountPoint)},
+				// LC_ALL=C keeps the busy/not-mounted wording this flow matches on
+				// independent of the worker's locale.
+				Step{"umount", fmt.Sprintf("LC_ALL=C umount %s", mountPoint)},
 			)
 		}
 	}
 	steps = append(steps,
 		Step{"verify_unmounted", fmt.Sprintf(`remaining=$(findmnt -rn -o TARGET --source %s 2>/dev/null); status=$?; if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then echo "could not verify logical volume mount state (findmnt status=$status)" >&2; exit 1; fi; if [ -n "$remaining" ]; then echo "logical volume is still mounted at: $remaining" >&2; exit 1; fi`, lvDev)},
-		Step{"lvremove", fmt.Sprintf("lvremove -f %s", lvDev)},
+		// LC_ALL=C keeps the filesystem-in-use wording the retry matches on
+		// independent of the worker's locale.
+		Step{"lvremove", fmt.Sprintf("LC_ALL=C lvremove -f %s", lvDev)},
 		Step{"remove_fstab_line", fmt.Sprintf(`sed -i '\#^%s #d' /etc/fstab`, lvDev)},
 	)
 	return steps
@@ -508,6 +516,8 @@ done`, d)
 // the host root stays in effect and the reported mount path resolves inside
 // that namespace. The command never forces or lazily unmounts, and it pins no
 // process identity: the caller re-derives the holder from device evidence.
+// LC_ALL=C keeps the busy/not-mounted wording the caller matches on independent
+// of the worker's locale.
 func NamespaceUnmountCmd(pid int, path string) string {
-	return fmt.Sprintf("# cp-storage-namespace-unmount\nnsenter -t %d -m umount %s", pid, shellLiteral(path))
+	return fmt.Sprintf("# cp-storage-namespace-unmount\nLC_ALL=C nsenter -t %d -m umount %s", pid, shellLiteral(path))
 }

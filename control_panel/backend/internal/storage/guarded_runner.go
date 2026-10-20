@@ -12,9 +12,12 @@ import (
 
 // The remote marker outlives the executor when termination is unconfirmed.
 // The local quarantine also covers loss of SSH before marker creation is known.
+// Nothing in the current deletion flow creates the marker, so an existing one is
+// residue from the retired host-unmount helper; the message therefore names the
+// file and the exact way out instead of only the condition.
 const recoveryWorkerGate = `# cp-storage-recovery-gate
 if [ -e /run/control-panel-storage-recovery.uncertain ]; then
-  echo "storage recovery state is uncertain; verify the remote executor and mounts before removing /run/control-panel-storage-recovery.uncertain" >&2
+  echo "storage recovery state is uncertain: /run/control-panel-storage-recovery.uncertain exists on this worker, left by an interrupted recovery helper. Confirm that the target mounts and devices are in their expected state, then remove that file and retry. It lives in /run, so a reboot of the worker also clears it." >&2
   exit 75
 fi
 `

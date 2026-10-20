@@ -153,6 +153,29 @@ func TestDeleteLVRecoveryStopsOnPhysicalSafetyFailures(t *testing.T) {
 	}
 }
 
+func TestUnmountFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		busy bool
+		gone bool
+	}{
+		{"umount: /data02/x: target is busy.\n", true, false},
+		{"umount: /data02/x: device is busy\n", true, false},
+		{"umount: /data02/x: not mounted.\n", false, true},
+		{"umount: /data02/x: mountpoint not found\n", false, true},
+		{"umount: /data02/x: must be superuser\n", false, false},
+		{"umount: /data02/x: invalid argument\n", false, false},
+		{"", false, false},
+	} {
+		if got := isTargetBusy("", tc.out); got != tc.busy {
+			t.Fatalf("%q isTargetBusy=%v want %v", tc.out, got, tc.busy)
+		}
+		if got := isNotMounted("", tc.out); got != tc.gone {
+			t.Fatalf("%q isNotMounted=%v want %v", tc.out, got, tc.gone)
+		}
+	}
+}
+
 func TestDeleteLVDoesNotRetryLVMTransportFailure(t *testing.T) {
 	sr := recoveryScriptRunner(t)
 	sr.add("lvremove -f /dev/vg_data/lv_1", scriptResult{runErr: context.DeadlineExceeded})
