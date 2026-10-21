@@ -75,7 +75,7 @@ type NamespaceMount struct {
 type NamespaceRecovery struct {
 	runner         ssh.Runner
 	reserved       []string
-	forDeletion    bool // Handbook deletion; resize keeps its original checks.
+	forDeletion    bool // Selects the deletion variants of the retired cleanup and verify operations.
 	unmountTimeout time.Duration
 }
 
@@ -98,13 +98,17 @@ func validRecoveryIdentity(id DeviceIdentity) bool {
 	return id.UUID != "" && len(id.UUID) <= 128 && recoveryDevice.MatchString(id.MajorMinor)
 }
 
+// Inspect reads one logical volume's pinned identity: its LVM UUID and kernel
+// major:minor, from the same ordinary-active-linear-volume check the handbook
+// deletion flow relies on. It deliberately reads no mount or namespace
+// propagation evidence. Nothing in the resize flow unmounts anything, and
+// demanding that evidence refused every resize on a worker whose mounts the
+// analysis cannot prove local ("target/direct-parent propagation not proven
+// local"), which is not a statement about the volume being resized. The live
+// mount targets are checked separately, by the resize safety probe.
 func (n *NamespaceRecovery) Inspect(ctx context.Context, w db.WorkerNode, lvDev string) (DeviceIdentity, error) {
 	var id DeviceIdentity
-	operation := "inspect"
-	if n.forDeletion {
-		operation = "inspect_lv"
-	}
-	err := n.call(ctx, w, lvDev, operation, nil, &id)
+	err := n.call(ctx, w, lvDev, "inspect_lv", nil, &id)
 	if err == nil && !validRecoveryIdentity(id) {
 		err = errors.New("invalid logical volume identity")
 	}

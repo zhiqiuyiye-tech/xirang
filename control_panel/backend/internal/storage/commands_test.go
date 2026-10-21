@@ -212,12 +212,37 @@ func TestVGNameForDisk(t *testing.T) {
 }
 
 func TestResizeLVSteps_Grow(t *testing.T) {
-	steps := ResizeLVSteps(ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: true, DeltaGB: 50})
-	if len(steps) != 1 {
-		t.Fatalf("expected 1 step, got %d", len(steps))
+	cases := []struct {
+		name string
+		req  ResizeLVReq
+		want string
+	}{
+		{
+			name: "ext4 completes with resize2fs",
+			req:  ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: true, DeltaGB: 50, FSType: "ext4"},
+			want: "lvextend -r -L +50G /dev/vg_data/lv_200g || exit 1\nresize2fs /dev/vg_data/lv_200g",
+		},
+		{
+			name: "mounted xfs completes with xfs_growfs",
+			req:  ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: true, DeltaGB: 50, FSType: "xfs", MountPoint: "/data02/nb"},
+			want: "lvextend -r -L +50G /dev/vg_data/lv_200g || exit 1\nxfs_growfs '/data02/nb'",
+		},
+		{
+			name: "unmounted xfs relies on -r",
+			req:  ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: true, DeltaGB: 50, FSType: "xfs"},
+			want: "lvextend -r -L +50G /dev/vg_data/lv_200g",
+		},
 	}
-	if steps[0].Name != "lvextend" || steps[0].Cmd != "lvextend -r -L +50G /dev/vg_data/lv_200g" {
-		t.Fatalf("grow wrong: %+v", steps[0])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			steps := ResizeLVSteps(tc.req)
+			if len(steps) != 1 {
+				t.Fatalf("expected 1 step, got %d", len(steps))
+			}
+			if steps[0].Name != "lvextend" || steps[0].Cmd != tc.want {
+				t.Fatalf("grow wrong: %+v", steps[0])
+			}
+		})
 	}
 }
 
@@ -225,6 +250,27 @@ func TestResizeLVSteps_Shrink(t *testing.T) {
 	steps := ResizeLVSteps(ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: false, DeltaGB: 10})
 	if steps[0].Name != "lvreduce" || steps[0].Cmd != "lvreduce -y -r -L -10G /dev/vg_data/lv_200g" {
 		t.Fatalf("shrink wrong: %+v", steps[0])
+	}
+}
+
+func TestResizeFilesystemSupported(t *testing.T) {
+	for _, grow := range []bool{true, false} {
+		for _, fsType := range []string{"ext2", "ext3", "ext4"} {
+			if !resizeFilesystemSupported(grow, fsType) {
+				t.Errorf("%s grow=%v must be supported", fsType, grow)
+			}
+		}
+		for _, fsType := range []string{"btrfs", "", "ext4\nxfs", "vfat"} {
+			if resizeFilesystemSupported(grow, fsType) {
+				t.Errorf("%q grow=%v must stay unsupported", fsType, grow)
+			}
+		}
+	}
+	if !resizeFilesystemSupported(true, "xfs") {
+		t.Fatal("xfs grow must be supported")
+	}
+	if resizeFilesystemSupported(false, "xfs") {
+		t.Fatal("xfs shrink must stay unsupported")
 	}
 }
 

@@ -1584,19 +1584,6 @@ def main():
             )
         elif operation == "host_unmount":
             result = unmount_shared_host(lv_dev, reserved, req["payload"], timeout)
-        elif operation == "inspect":
-            result = inspect_device(lv_dev)
-            targets = safe_mounts(
-                parse_mountinfo(read_text("/proc/self/mountinfo")),
-                result["major_minor"],
-                reserved,
-            )
-            # Preserve the original, more conservative inspection policy used
-            # by resize. Shared-leaf cleanup permission is deletion-specific.
-            require(
-                all(not mount["optional"] for mount in targets),
-                "target/direct-parent propagation not proven private",
-            )
         elif operation == "scan":
             result = scan(lv_dev, reserved)
         elif operation == "cleanup":

@@ -28,15 +28,19 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 		t.Skip("awk unavailable for guarded command fixture")
 	}
 	for _, tc := range []struct {
-		name, mounts, fstab, swaps, opens, fs, identity string
-		wantMutation                                    bool
+		name, mounts, fstab, swaps, opens, fs, identity, mountTarget, pinnedFS string
+		grow, shrink                                                           bool
 	}{
-		{name: "unchanged safe ext4", opens: "0", fs: "ext4", identity: "stable-uuid 253 0", wantMutation: true},
-		{name: "mounted after server probe", mounts: "/data02/new\n", opens: "0", fs: "ext4", identity: "stable-uuid 253 0"},
-		{name: "opened after server probe", opens: "1", fs: "ext4", identity: "stable-uuid 253 0"},
+		{name: "unused ext4", opens: "0", fs: "ext4", identity: "stable-uuid 253 0", grow: true, shrink: true},
+		{name: "mounted ext4 online grow", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true},
+		{name: "mounted xfs online grow", mounts: "/data02/live\n", opens: "1", fs: "xfs", identity: "stable-uuid 253 0", mountTarget: "/data02/live", grow: true},
+		{name: "unmounted xfs grow relies on -r", opens: "0", fs: "xfs", identity: "stable-uuid 253 0", grow: true},
+		{name: "xfs mount target moved before resize", mounts: "/data02/moved\n", opens: "1", fs: "xfs", identity: "stable-uuid 253 0", mountTarget: "/data02/live"},
+		{name: "mounted ext4 shrink", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true},
+		{name: "device held open after server probe", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true},
 		{name: "swap after server probe", swaps: "Filename\tType\tSize\tUsed\tPriority\n/dev/mapper/target\tpartition\t1024\t0\t-2\n", opens: "0", fs: "ext4", identity: "stable-uuid 253 0"},
 		{name: "identity replacement after server probe", opens: "0", fs: "ext4", identity: "replacement-uuid 253 1"},
-		{name: "unsupported xfs", opens: "0", fs: "xfs", identity: "stable-uuid 253 0"},
+		{name: "filesystem changed after server probe", opens: "0", fs: "xfs", identity: "stable-uuid 253 0", pinnedFS: "ext4"},
 		{name: "reserved fstab after server probe", fstab: "/dev/mapper/target /custom/protected/volume\n", opens: "0", fs: "ext4", identity: "stable-uuid 253 0"},
 		{name: "ambiguous identity", opens: "0", fs: "ext4", identity: "stable-uuid 253 0\nother-uuid 253 1"},
 	} {
@@ -54,7 +58,27 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				cmd, err := buildGuardedResizeCommand(ResizeLVReq{VGName: "vg_data", LVName: "lv_data", Grow: grow, DeltaGB: 10}, DeviceIdentity{UUID: "stable-uuid", MajorMinor: "253:0"}, []string{"/custom/protected"})
+				pinnedFS := tc.pinnedFS
+				if pinnedFS == "" {
+					pinnedFS = tc.fs
+				}
+				wantMutation := tc.shrink
+				if grow {
+					wantMutation = tc.grow
+				}
+				req := ResizeLVReq{VGName: "vg_data", LVName: "lv_data", Grow: grow, DeltaGB: 10, FSType: pinnedFS}
+				if grow && tc.mountTarget != "" {
+					req.MountPoint = tc.mountTarget
+				}
+				if !resizeFilesystemSupported(grow, pinnedFS) {
+					// An action the handbook does not cover (XFS shrink) must not
+					// produce a mutating command at all.
+					if _, err := buildGuardedResizeCommand(req, DeviceIdentity{UUID: "stable-uuid", MajorMinor: "253:0"}, []string{"/custom/protected"}); err == nil {
+						t.Fatalf("unsupported %s resize built a guarded command", pinnedFS)
+					}
+					return
+				}
+				cmd, err := buildGuardedResizeCommand(req, DeviceIdentity{UUID: "stable-uuid", MajorMinor: "253:0"}, []string{"/custom/protected"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -75,11 +99,26 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 					"dmsetup() { printf '%s' " + shellLiteral(tc.opens) + "; }\n" +
 					"blkid() { printf '%s' " + shellLiteral(tc.fs) + "; }\n" +
 					"lvs() { printf '%s' " + shellLiteral(tc.identity) + "; }\n" +
-					"lvextend() { printf '%s\\n' 'MUTATION-RAN'; }; lvreduce() { printf '%s\\n' 'MUTATION-RAN'; }\n" + cmd
-				output, runErr := exec.Command(shell, "-c", script).CombinedOutput()
+					"lvextend() { printf '%s\\n' 'MUTATION-RAN'; }; lvreduce() { printf '%s\\n' 'MUTATION-RAN'; }\n" +
+					"resize2fs() { printf '%s\\n' 'FS-MUTATION-RAN'; }; xfs_growfs() { printf '%s\\n' 'FS-MUTATION-RAN'; }\n" + cmd
+				command := exec.Command(shell)
+				// The generated script is delivered on stdin. Passing it as a -c
+				// argument mangles its quoting on Windows shells, which would test
+				// the transport instead of the script text.
+				command.Stdin = strings.NewReader(script)
+				output, runErr := command.CombinedOutput()
 				mutated := strings.Contains(string(output), "MUTATION-RAN")
-				if mutated != tc.wantMutation || (tc.wantMutation && runErr != nil) || (!tc.wantMutation && runErr == nil) {
-					t.Fatalf("mutation=%v want=%v err=%v output=%s", mutated, tc.wantMutation, runErr, output)
+				if mutated != wantMutation || (wantMutation && runErr != nil) || (!wantMutation && runErr == nil) {
+					t.Fatalf("mutation=%v want=%v err=%v output=%s", mutated, wantMutation, runErr, output)
+				}
+				if wantMutation {
+					// Grow completes the filesystem explicitly: resize2fs for ext
+					// and xfs_growfs for a mounted XFS; an unmounted XFS has no
+					// completion command of its own.
+					wantFS := grow && (strings.HasPrefix(tc.fs, "ext") || (tc.fs == "xfs" && tc.mountTarget != ""))
+					if got := strings.Contains(string(output), "FS-MUTATION-RAN"); got != wantFS {
+						t.Fatalf("filesystem completion=%v want=%v output=%s", got, wantFS, output)
+					}
 				}
 			})
 		}

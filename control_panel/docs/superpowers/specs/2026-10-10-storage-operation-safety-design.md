@@ -2,7 +2,7 @@
 
 ## Status
 
-This design covers findings 5 and 7 only. The user approved the behavioral boundaries in chat. This document does not authorize implementation; implementation begins after the user reviews this spec and approves it.
+This design covers findings 5 and 7 only. The user approved the behavioral boundaries in chat. This document does not authorize implementation; implementation begins after the user reviews this spec and approves it. The 2026-10-21 amendment at the end of this document revises the resize boundary for grow, on the authority of section 9 of the operator handbook; everything else below still stands.
 
 ## Goal
 
@@ -18,7 +18,8 @@ Prevent resize operations from changing protected or active logical volumes, kee
 
 ### Resize protection (finding 5)
 
-- Both grow and shrink are rejected when the target LV is mounted, active as swap, or has a nonzero device-mapper open count. A mount configured beneath a protected operating-system or reserved path is also protected even when currently unmounted. Online growth is not exempt.
+- Shrink is rejected when the target LV is mounted, active as swap, or has a nonzero device-mapper open count. A mount configured beneath a protected operating-system or reserved path is also protected even when currently unmounted, for grow and shrink alike.
+- Grow follows section 9 of the operator handbook and runs online on a mounted volume. An LV that is active as swap or that is configured to mount beneath a protected or reserved path is still refused; the device-mapper open count and the Kubernetes Pod guard no longer gate grow. See the 2026-10-21 amendment at the end of this document.
 - The handler obtains live read-only evidence immediately before any resize command. It resolves the requested VG/LV to a stable device identity and checks current mount targets, `/etc/fstab` references, system/reserved paths, swap use, and device-mapper open state. When an NFS export path can be resolved, the existing Kubernetes Pod guard also checks that path for consumers.
 - Any missing, malformed, ambiguous, or failed safety probe rejects the resize before a mutating command runs.
 - The target LV identity is revalidated immediately before mutation so a replaced device path is not acted on.
@@ -64,8 +65,51 @@ Prevent resize operations from changing protected or active logical volumes, kee
 
 ## Acceptance criteria
 
-1. Grow and shrink issue no SSH mutation when a target is mounted, configured to mount beneath a protected/reserved path, active as swap, open in device-mapper, or cannot be conclusively inspected.
-2. A safe, unused, non-reserved data LV can still be resized using the existing filesystem-aware commands.
+1. Shrink issues no SSH mutation when a target is mounted, configured to mount beneath a protected/reserved path, active as swap, open in device-mapper, or cannot be conclusively inspected. Grow issues no SSH mutation when a target is active as swap, configured to mount beneath a protected/reserved path, backed by a filesystem the handbook flow does not cover, or cannot be conclusively inspected.
+2. A safe, unused, non-reserved data LV can still be resized using the existing filesystem-aware commands, and an in-service mounted ext or XFS LV can be grown online by the handbook sequence.
 3. A configured non-NFS CSI driver does not block unrelated NFS reclaim.
 4. An unlisted CSI driver, a failed Kubernetes query, or an NFS CSI source with missing/invalid attributes still blocks reclaim.
 5. A valid NFS reclaim with no active Pod consumer can still unexport, unmount, verify identity, and remove the LV through the existing sequence.
+
+## Amendment 2026-10-21: online grow for an in-service logical volume
+
+`control_panel/docs/NFS创建流程.md` section 9 states the grow procedure the panel
+must follow: `lvextend -r` extends the logical volume and its filesystem in one
+operation, `resize2fs` completes it for ext and `xfs_growfs <mount target>`
+completes it for a mounted XFS. Section 7 mounts every volume and exports it over
+NFS while it is in use, so the earlier rule that refused a mounted target for
+grow and shrink alike made grow unusable on every volume the panel serves: the
+only resizable volume was one nothing was using.
+
+The handbook is the authority for this flow, so the resize boundary now reads:
+
+- Grow runs online on a mounted volume. The swap check, the protected and
+  reserved path checks on `/etc/fstab` targets, the pinned LV identity and the
+  probed filesystem type still apply, before the task and again inside the
+  same SSH execution that mutates the volume.
+- The device-mapper open count and the Kubernetes Pod guard gate shrink only.
+  `lvextend` needs no exclusive access to the volume, and the filesystem grow is
+  the kernel's own online operation, so an open, exported or Pod-used volume is
+  not a reason to refuse a grow.
+- Shrink keeps the stricter boundary: it refuses a mounted, open, swap-active or
+  Pod-used volume, and it is ext-only, because XFS cannot shrink and ext cannot
+  shrink while mounted. The refusal names the filesystem rather than reporting a
+  generic unsupported workflow.
+- Grow completes the filesystem inside the guarded command and treats a failed
+  `lvextend` as fatal, so a filesystem-only success is never reported as a
+  finished resize. XFS is no longer refused outright: an XFS volume that cannot
+  be shrunk is still a grow target.
+- The resize flow reads the LV identity through the identity-only operation the
+  deletion flow uses (`inspect_lv`: LVM UUID and kernel `major:minor`, from the
+  ordinary active writable linear volume check). It no longer runs the retired
+  conservative inspection, which additionally demanded mount-propagation proof
+  and refused every resize on a worker whose mounts the analysis cannot prove
+  local (`target/direct-parent propagation not proven local`) before any safety
+  decision was reached. That operation is removed rather than left unreferenced.
+- The protected and reserved path guarantee stays: the resize safety probe's
+  live mount targets are now validated with `ValidateMountPoint` as well as the
+  `/etc/fstab` targets, for grow and shrink alike, so a volume mounted at an
+  operating-system path or a reserved mount point is still refused.
+- What a mounted grow does not do: it does not re-read the volume's size on the
+  NFS clients. A client that cached the share size sees the new capacity after
+  remounting, which is an operational step, not a panel guarantee.

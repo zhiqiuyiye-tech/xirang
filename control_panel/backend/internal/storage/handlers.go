@@ -587,7 +587,11 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 // --- resizeLVHandler ---
 
 // resizeLVHandler extends (action=grow, default) or reduces (action=shrink) an
-// LV by DeltaGB, using -r so the filesystem is resized in the same operation.
+// LV by DeltaGB following the operator handbook. Grow runs online on a mounted
+// share: lvextend -r extends the LV and resizes the filesystem, then the
+// filesystem command completes the resize (resize2fs for ext2/ext3/ext4,
+// xfs_growfs with the mount target for a mounted XFS). Shrink stays offline and
+// ext-only, because ext cannot shrink while mounted and XFS cannot shrink at all.
 type resizeLVHandler struct {
 	runner          ssh.Runner
 	store           *db.Store
@@ -596,87 +600,129 @@ type resizeLVHandler struct {
 	recovery        *NamespaceRecovery
 }
 
+// resizeSafetyPlan is the fresh evidence a resize needs: the pinned LV identity,
+// the probed filesystem type, and - for a mounted XFS grow - the validated mount
+// target that xfs_growfs consumes.
+type resizeSafetyPlan struct {
+	Identity    DeviceIdentity
+	FSType      string
+	MountTarget string
+}
+
 // checkResizeSafety gathers fresh local and cluster evidence for one LV. It
 // never issues a mutating storage command; callers run it both before and
 // immediately before the existing resize sequence.
-func (h *resizeLVHandler) checkResizeSafety(ctx context.Context, w db.WorkerNode, vgName, lvName string) (DeviceIdentity, error) {
-	var identity DeviceIdentity
+func (h *resizeLVHandler) checkResizeSafety(ctx context.Context, w db.WorkerNode, vgName, lvName string, grow bool) (resizeSafetyPlan, error) {
+	var plan resizeSafetyPlan
 	if h.recovery == nil {
-		return identity, fmt.Errorf("logical volume identity inspector is unavailable")
+		return plan, fmt.Errorf("logical volume identity inspector is unavailable")
 	}
 	lvDev := fmt.Sprintf("/dev/%s/%s", vgName, lvName)
 	identity, err := h.recovery.Inspect(ctx, w, lvDev)
 	if err != nil {
-		return DeviceIdentity{}, fmt.Errorf("inspect logical volume identity: %w", err)
+		return resizeSafetyPlan{}, fmt.Errorf("inspect logical volume identity: %w", err)
 	}
 
 	out, stderr, code, runErr := h.runner.Run(ctx, w, buildLVResizeSafetyCommand(lvDev))
 	if runErr != nil || code != 0 {
-		return DeviceIdentity{}, fmt.Errorf("read-only resize safety probe failed (status=%d): %v %s", code, runErr, strings.TrimSpace(stderr))
+		return resizeSafetyPlan{}, fmt.Errorf("read-only resize safety probe failed (status=%d): %v %s", code, runErr, strings.TrimSpace(stderr))
 	}
 	state, err := parseLVResizeSafetyState(out)
 	if err != nil {
-		return DeviceIdentity{}, fmt.Errorf("parse resize safety evidence: %w", err)
-	}
-
-	paths := sortedUnique(append(append([]string{}, state.MountTargets...), state.FstabTargets...))
-	if len(paths) == 0 {
-		paths = []string{""} // whole-worker proof when the LV has no known export binding
-	}
-	var podIssues []string
-	if h.podGuardChecker == nil {
-		podIssues = append(podIssues, "Kubernetes pod usage checker is unavailable for LV target paths")
-	} else {
-		for _, target := range paths {
-			inUse, blockers, guardErr := h.podGuardChecker(ctx, w.Host, target)
-			if guardErr != nil {
-				podIssues = append(podIssues, fmt.Sprintf("Pod usage check for %s failed: %v", target, guardErr))
-			}
-			if inUse {
-				detail := strings.Join(blockers, ", ")
-				if detail == "" {
-					detail = "active consumers reported"
-				}
-				podIssues = append(podIssues, fmt.Sprintf("Pod usage check found consumers for %s: %s", target, detail))
-			}
-		}
-	}
-	if len(podIssues) > 0 {
-		return DeviceIdentity{}, fmt.Errorf("resize Pod safety check failed: %s", strings.Join(podIssues, "; "))
+		return resizeSafetyPlan{}, fmt.Errorf("parse resize safety evidence: %w", err)
 	}
 
 	for _, target := range state.FstabTargets {
 		if err := ValidateMountPoint(target, h.reservedMounts); err != nil {
-			return DeviceIdentity{}, fmt.Errorf("LV fstab target %s is protected: %w", target, err)
+			return resizeSafetyPlan{}, fmt.Errorf("LV fstab target %s is protected: %w", target, err)
 		}
 	}
-	if len(state.MountTargets) > 0 {
-		return DeviceIdentity{}, fmt.Errorf("logical volume is currently mounted at %s", strings.Join(state.MountTargets, ", "))
+	// A live mount under a protected or reserved path is refused for both
+	// actions. This is the guarantee the old namespace inspection also carried:
+	// a volume mounted at such a path (an operating-system path, or a reserved
+	// mount point from RESERVED_MOUNT_POINTS) is not a resize target.
+	for _, target := range state.MountTargets {
+		if err := ValidateMountPoint(target, h.reservedMounts); err != nil {
+			return resizeSafetyPlan{}, fmt.Errorf("LV mount target %s is protected: %w", target, err)
+		}
 	}
 	if state.SwapActive {
-		return DeviceIdentity{}, fmt.Errorf("logical volume is active as swap")
+		return resizeSafetyPlan{}, fmt.Errorf("logical volume is active as swap")
 	}
-	if state.DeviceOpenCount > 0 {
-		return DeviceIdentity{}, fmt.Errorf("logical volume has %d device-mapper opens", state.DeviceOpenCount)
-	}
+
 	fsOut, fsErrOut, fsCode, fsErr := h.runner.Run(ctx, w, resizeFilesystemCommand(lvDev))
 	if fsErr != nil || fsCode != 0 {
-		return DeviceIdentity{}, fmt.Errorf("cannot confirm filesystem for offline resize (status=%d): %v %s", fsCode, fsErr, strings.TrimSpace(fsErrOut))
+		return resizeSafetyPlan{}, fmt.Errorf("cannot confirm filesystem for resize (status=%d): %v %s", fsCode, fsErr, strings.TrimSpace(fsErrOut))
 	}
-	switch strings.TrimSpace(fsOut) {
-	case "ext2", "ext3", "ext4":
-	default:
-		return DeviceIdentity{}, fmt.Errorf("filesystem %q does not support this guarded offline resize workflow", strings.TrimSpace(fsOut))
+	fsType := strings.TrimSpace(fsOut)
+	if !resizeFilesystemSupported(grow, fsType) {
+		if fsType == "xfs" {
+			return resizeSafetyPlan{}, fmt.Errorf("XFS filesystem cannot be shrunk; grow it or recreate it")
+		}
+		return resizeSafetyPlan{}, fmt.Errorf("filesystem %q does not support this resize workflow", fsType)
+	}
+
+	mountTarget := ""
+	if grow {
+		// A grow of a live NFS share is the handbook's own scenario: LVM extend
+		// and ext4/XFS online grow need no exclusive access, so a mounted volume
+		// is not a reason to refuse. Only the XFS completion command needs a
+		// mount target, and it must be unambiguous; its path was already
+		// validated against the protected and reserved paths above.
+		if fsType == "xfs" {
+			switch len(state.MountTargets) {
+			case 0:
+			case 1:
+				mountTarget = state.MountTargets[0]
+			default:
+				return resizeSafetyPlan{}, fmt.Errorf("logical volume has ambiguous mount targets %s", strings.Join(state.MountTargets, ", "))
+			}
+		}
+	} else {
+		if len(state.MountTargets) > 0 {
+			return resizeSafetyPlan{}, fmt.Errorf("logical volume is currently mounted at %s; unmount it (host and holder namespace) before shrinking", strings.Join(state.MountTargets, ", "))
+		}
+		if state.DeviceOpenCount > 0 {
+			return resizeSafetyPlan{}, fmt.Errorf("logical volume has %d device-mapper opens", state.DeviceOpenCount)
+		}
+		paths := sortedUnique(append(append([]string{}, state.MountTargets...), state.FstabTargets...))
+		if len(paths) == 0 {
+			paths = []string{""} // whole-worker proof when the LV has no known export binding
+		}
+		var podIssues []string
+		if h.podGuardChecker == nil {
+			podIssues = append(podIssues, "Kubernetes pod usage checker is unavailable for LV target paths")
+		} else {
+			for _, target := range paths {
+				inUse, blockers, guardErr := h.podGuardChecker(ctx, w.Host, target)
+				if guardErr != nil {
+					podIssues = append(podIssues, fmt.Sprintf("Pod usage check for %s failed: %v", target, guardErr))
+				}
+				if inUse {
+					detail := strings.Join(blockers, ", ")
+					if detail == "" {
+						detail = "active consumers reported"
+					}
+					podIssues = append(podIssues, fmt.Sprintf("Pod usage check found consumers for %s: %s", target, detail))
+				}
+			}
+		}
+		if len(podIssues) > 0 {
+			return resizeSafetyPlan{}, fmt.Errorf("resize Pod safety check failed: %s", strings.Join(podIssues, "; "))
+		}
 	}
 
 	verifiedIdentity, err := h.recovery.Inspect(ctx, w, lvDev)
 	if err != nil {
-		return DeviceIdentity{}, fmt.Errorf("re-inspect logical volume identity after safety checks: %w", err)
+		return resizeSafetyPlan{}, fmt.Errorf("re-inspect logical volume identity after safety checks: %w", err)
 	}
 	if verifiedIdentity != identity {
-		return DeviceIdentity{}, fmt.Errorf("logical volume identity changed during resize safety checks")
+		return resizeSafetyPlan{}, fmt.Errorf("logical volume identity changed during resize safety checks")
 	}
-	return verifiedIdentity, nil
+	plan.Identity = verifiedIdentity
+	plan.FSType = fsType
+	plan.MountTarget = mountTarget
+	return plan, nil
 }
 
 func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Reporter) error {
@@ -720,22 +766,26 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	initialIdentity, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName)
+	initialPlan, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName, grow)
 	if err != nil {
 		preflight.Done("failed", "", "", err.Error())
 		r.Fail(fmt.Sprintf("resize safety preflight failed: %v", err))
 		return err
 	}
-	preflight.Done("succeeded", "", "", "logical volume is unused and unprotected")
+	if grow {
+		preflight.Done("succeeded", "", "", fmt.Sprintf("mounted data volume is safe for online grow (%s)", initialPlan.FSType))
+	} else {
+		preflight.Done("succeeded", "", "", "logical volume is unused and unprotected")
+	}
 
 	recheck, err := r.Step("resize_safety_recheck")
 	if err != nil {
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err
 	}
-	recheckedIdentity, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName)
-	if err == nil && recheckedIdentity != initialIdentity {
-		err = fmt.Errorf("logical volume identity changed before resize")
+	recheckedPlan, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName, grow)
+	if err == nil && recheckedPlan != initialPlan {
+		err = fmt.Errorf("logical volume identity or filesystem state changed before resize")
 	}
 	if err != nil {
 		recheck.Done("failed", "", "", err.Error())
@@ -744,15 +794,16 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 	}
 	recheck.Done("succeeded", "", "", "logical volume identity and safety state are unchanged")
 
-	guardedCmd, err := buildGuardedResizeCommand(
-		ResizeLVReq{VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB},
-		recheckedIdentity, h.reservedMounts,
-	)
+	req := ResizeLVReq{
+		VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB,
+		FSType: recheckedPlan.FSType, MountPoint: recheckedPlan.MountTarget,
+	}
+	guardedCmd, err := buildGuardedResizeCommand(req, recheckedPlan.Identity, h.reservedMounts)
 	if err != nil {
 		r.Fail(err.Error())
 		return err
 	}
-	sh, err := r.Step(ResizeLVSteps(ResizeLVReq{VGName: p.VGName, LVName: p.LVName, Grow: grow, DeltaGB: p.DeltaGB})[0].Name)
+	sh, err := r.Step(ResizeLVSteps(req)[0].Name)
 	if err != nil {
 		r.Fail(fmt.Sprintf("create step: %v", err))
 		return err

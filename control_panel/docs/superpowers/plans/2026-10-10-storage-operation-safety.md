@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- A mounted, swap-active, or open LV cannot be grown or shrunk, including online growth.
+- A mounted, swap-active, or open LV cannot be shrunk. A grow cannot act on a swap-active LV or one configured beneath a protected or reserved path; a mounted, open or Pod-used LV can be grown online, per the 2026-10-21 amendment to the spec.
 - A mounted NFS LV may still be reclaimed only through the existing Pod guard, protected/reserved path checks, unexport/unmount sequence, and LV identity revalidation.
 - `STORAGE_NON_NFS_CSI_DRIVERS` defaults to empty; only exact configured driver names are excluded from NFS correlation.
 - The NFS CSI driver `nfs.csi.k8s.io`, unlisted CSI drivers, malformed NFS source attributes, and failed Kubernetes safety queries remain fail-closed.

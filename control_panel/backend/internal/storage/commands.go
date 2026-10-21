@@ -419,24 +419,57 @@ type ResizeLVReq struct {
 	LVName  string
 	Grow    bool // true=extend, false=reduce
 	DeltaGB int
+	// FSType is the probed filesystem type (ext2/ext3/ext4/xfs). It selects the
+	// filesystem command that completes a grow.
+	FSType string
+	// MountPoint is the probed mount target of a mounted XFS volume. xfs_growfs
+	// resizes by mount point, so it is set for a mounted XFS grow and empty
+	// otherwise.
+	MountPoint string
 }
 
-// ResizeLVSteps builds a single step using -r (--resizefs) so the filesystem
-// is resized in the same operation: resize2fs for ext, xfs_growfs for xfs. For
+// resizeFilesystemSupported reports whether the handbook resize flow covers
+// this filesystem type: ext2/ext3/ext4 grow and shrink, XFS grow only, because
+// XFS cannot shrink.
+func resizeFilesystemSupported(grow bool, fsType string) bool {
+	switch fsType {
+	case "ext2", "ext3", "ext4":
+		return true
+	case "xfs":
+		return grow
+	}
+	return false
+}
+
+// ResizeLVSteps builds the resize mutation step. Grow follows the operator
+// handbook for a live NFS share: lvextend -r extends the LV and resizes the
+// filesystem in the same operation, then the filesystem-specific command makes
+// the filesystem match the enlarged LV (resize2fs for ext2/ext3/ext4, xfs_growfs
+// with the mount target for a mounted XFS). A failed LV extend stops the step so
+// a filesystem-only success cannot be reported as a completed resize. For
 // shrink, -r shrinks the filesystem first and aborts the LV reduce if the fs
 // resize fails (e.g. shrinking below used space, or xfs which cannot shrink),
 // so data is not lost. -y (--yes) bypasses the interactive confirmation prompt
 // required by lvreduce in non-interactive SSH sessions. DeltaGB must be > 0.
 func ResizeLVSteps(r ResizeLVReq) []Step {
 	lvDev := fmt.Sprintf("/dev/%s/%s", r.VGName, r.LVName)
-	if r.Grow {
+	if !r.Grow {
 		return []Step{
-			{Name: "lvextend", Cmd: fmt.Sprintf("lvextend -r -L +%dG %s", r.DeltaGB, lvDev)},
+			{Name: "lvreduce", Cmd: fmt.Sprintf("lvreduce -y -r -L -%dG %s", r.DeltaGB, lvDev)},
 		}
 	}
-	return []Step{
-		{Name: "lvreduce", Cmd: fmt.Sprintf("lvreduce -y -r -L -%dG %s", r.DeltaGB, lvDev)},
+	cmd := fmt.Sprintf("lvextend -r -L +%dG %s", r.DeltaGB, lvDev)
+	switch r.FSType {
+	case "ext2", "ext3", "ext4":
+		cmd += fmt.Sprintf(" || exit 1\nresize2fs %s", lvDev)
+	case "xfs":
+		// An unmounted XFS needs no completion step: -r resizes it through a
+		// temporary mount that fsadm cleans up.
+		if r.MountPoint != "" {
+			cmd += fmt.Sprintf(" || exit 1\nxfs_growfs %s", shellLiteral(r.MountPoint))
+		}
 	}
+	return []Step{{Name: "lvextend", Cmd: cmd}}
 }
 
 // --- LV delete (generalized reclaim for any LV) ---

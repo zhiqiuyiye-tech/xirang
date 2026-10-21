@@ -440,7 +440,9 @@ func (h *storageHandlers) createVG(c *gin.Context) {
 
 // resizeLV: POST /api/v1/storage/lv/resize
 // Body: {worker_id, vg_name, lv_name, action: grow|shrink, delta_gb}. Submits
-// storage_resize_lv (lvextend/lvreduce -r). Responds 202 + {task_id}.
+// storage_resize_lv: grow follows the handbook (lvextend -r, then resize2fs or
+// xfs_growfs) and may run on a mounted share; shrink stays offline and ext-only.
+// Responds 202 + {task_id}.
 func (h *storageHandlers) resizeLV(c *gin.Context) {
 	var req map[string]any
 	if err := c.ShouldBindJSON(&req); err != nil {

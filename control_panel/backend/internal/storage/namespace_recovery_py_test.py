@@ -125,12 +125,12 @@ class ParserTests(unittest.TestCase):
             with self.subTest(parent=parent), self.assertRaises(r.RecoveryError):
                 r.safe_mounts(r.parse_mountinfo(ROOT + TARGET + text), "253:0", [])
 
-    def test_inspect_with_worker_nsfs_evidence(self):
+    def test_identity_read_needs_no_mount_evidence(self):
         import io
 
         identity = {"uuid": "u", "major_minor": "253:0"}
         request = {
-            "operation": "inspect",
+            "operation": "inspect_lv",
             "lv_dev": "/dev/vg/lv",
             "reserved": [],
             "unmount_timeout": 1,
@@ -143,7 +143,9 @@ class ParserTests(unittest.TestCase):
             patch.object(r.sys, "stdin", io.StringIO(json.dumps(request))),
             patch.object(r.sys, "stdout", output),
             patch.object(r, "inspect_device", return_value=identity),
-            patch.object(r, "read_text", return_value=HOST_NSFS + TARGET),
+            # Evidence this operation must not consume: mount tables and
+            # namespace records that the analysis cannot prove local.
+            patch.object(r, "read_text", side_effect=AssertionError("mount evidence")),
         ):
             status = r.main()
         self.assertEqual(status, 0, output.getvalue())
@@ -182,36 +184,50 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(r.RecoveryError):
             r.safe_mounts(r.parse_mountinfo(shared_root + shared_leaf), "253:0", [])
 
-    def test_shared_leaf_classification_preserves_resize_inspection_policy(self):
+    def test_shared_leaf_classification_and_retired_resize_inspection(self):
         import io
 
         text = ROOT + TARGET.replace("rw -", "rw shared:578 -")
         identity = {"uuid": "u", "major_minor": "253:0"}
-        for operation in ("inspect", "delete_inspect"):
-            request = {
-                "operation": operation,
-                "lv_dev": "/dev/vg/lv",
-                "reserved": [],
-                "unmount_timeout": 1,
-                "payload": None,
-            }
-            output = io.StringIO()
-            with (
-                self.subTest(operation=operation),
-                patch.object(r.sys, "platform", "linux"),
-                patch.object(r.os, "geteuid", return_value=0, create=True),
-                patch.object(r.sys, "stdin", io.StringIO(json.dumps(request))),
-                patch.object(r.sys, "stdout", output),
-                patch.object(r, "inspect_device", return_value=identity),
-                patch.object(r, "read_text", return_value=text),
-            ):
-                status = r.main()
-            result = json.loads(output.getvalue())
-            if operation == "inspect":
-                self.assertEqual(status, 1)
-            else:
-                self.assertEqual(status, 0)
-                self.assertFalse(result["result"]["requires_host_authorization"])
+        request = {
+            "operation": "delete_inspect",
+            "lv_dev": "/dev/vg/lv",
+            "reserved": [],
+            "unmount_timeout": 1,
+            "payload": None,
+        }
+        output = io.StringIO()
+        with (
+            patch.object(r.sys, "platform", "linux"),
+            patch.object(r.os, "geteuid", return_value=0, create=True),
+            patch.object(r.sys, "stdin", io.StringIO(json.dumps(request))),
+            patch.object(r.sys, "stdout", output),
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "read_text", return_value=text),
+        ):
+            status = r.main()
+        result = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertFalse(result["result"]["requires_host_authorization"])
+
+        # The retired resize inspection demanded mount-propagation proof and
+        # refused every resize whose mounts it could not prove local. Identity
+        # reads must not return through it, so the operation stays unsupported.
+        request["operation"] = "inspect"
+        output = io.StringIO()
+        with (
+            patch.object(r.sys, "platform", "linux"),
+            patch.object(r.os, "geteuid", return_value=0, create=True),
+            patch.object(r.sys, "stdin", io.StringIO(json.dumps(request))),
+            patch.object(r.sys, "stdout", output),
+            patch.object(r, "inspect_device", return_value=identity),
+            patch.object(r, "read_text", return_value=text),
+        ):
+            status = r.main()
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            json.loads(output.getvalue())["error"], "unsupported recovery operation"
+        )
 
     def test_receive_only_slave_parent_does_not_propagate_leaf_unmount_outward(self):
         # HostToContainer log mounts may be slaves: receive host events, never

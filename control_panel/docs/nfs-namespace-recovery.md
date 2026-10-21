@@ -38,7 +38,7 @@
 
 `SHARED_HOST_MAINTENANCE_ENABLED`、`NAMESPACE_CLEANUP_ALLOWLIST` 与旧 `maintenance_confirmed` 请求字段仅保留旧配置/客户端兼容性，**不再作为删除或 NFS 回收的启用/许可条件**。未传维护字段也采用同一手册流程。
 
-`NAMESPACE_CLEANUP_TIMEOUT` 继续限定删除/回收阶段扫描与命名空间卸载的总预算。`NAMESPACE_UNMOUNT_TIMEOUT` 仍约束保留的 Python 卸载 helper（host unmount 等路径）。resize 的业务使用及保守检查不因删除流程改变而放宽。
+`NAMESPACE_CLEANUP_TIMEOUT` 继续限定删除/回收阶段扫描与命名空间卸载的总预算。`NAMESPACE_UNMOUNT_TIMEOUT` 仍约束保留的 Python 卸载 helper（host unmount 等路径）。删除流程不放宽 resize 的检查；resize 本身按《NFS创建流程》第 9 节执行（扩容在线进行，缩容仍要求卷未被挂载占用），并且只读取 LV 身份（与删除流程使用同一个 `inspect_lv`），不再要求挂载传播证明——那项证据 resize 从不使用，却会以 `target/direct-parent propagation not proven local` 拒绝所有无法证明本地传播的节点的扩容（见 2026-10-21 设计修订）。
 
 ## 执行状态不明
 

@@ -155,3 +155,27 @@ sudo lvremove /dev/vg_data/lv_notebook_500g
 如果你之前为了防止重启失效，把挂载信息写进了 `/etc/fstab` 文件里，**这一步千万不能忘！**
 
 找到带有 `lv_notebook_200g` 和 `lv_notebook_500g` 的那两行，**把它们删掉**。
+
+
+## 9 扩容、缩容lv
+
+使用 lvextend -r 同时扩容逻辑卷和文件系统：
+lvextend -r -L 200G /dev/vg_data1/lv_nb_001
+
+
+这里 200G 是扩容后的总容量，不是增加 200GB。
+
+如果要在原有容量基础上增加 100GB：
+lvextend -r -L +100G /dev/vg_data1/lv_nb_001
+
+
+-r 会尝试自动扩容文件系统，适用于常见的 ext4、XFS 文件系统。
+
+然后根据文件系统类型执行：
+
+ext4：
+resize2fs /dev/vg_data1/lv_nb_001
+
+
+XFS：
+xfs_growfs /实际挂载目录

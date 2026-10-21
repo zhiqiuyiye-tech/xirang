@@ -43,10 +43,16 @@ func TestNamespaceRecoveryInspectStrict(t *testing.T) {
 	if err != nil || id.UUID != "u" {
 		t.Fatalf("%+v %v", id, err)
 	}
-	for _, part := range []string{"cp-storage-namespace-inspect", "python3 -I", "timeout", "env -i"} {
+	// The identity read is the identity-only operation: no mount or namespace
+	// evidence, and never the retired resize inspection that demanded
+	// mount-propagation proof.
+	for _, part := range []string{"cp-storage-namespace-inspect_lv", "python3 -I", "timeout", "env -i"} {
 		if !strings.Contains(r.command, part) {
 			t.Fatalf("missing %s", part)
 		}
+	}
+	if strings.Contains(r.command, "cp-storage-namespace-inspect ") {
+		t.Fatalf("identity read used the retired resize inspection: %s", r.command)
 	}
 	var req map[string]any
 	if json.Unmarshal([]byte(r.input), &req) != nil || req["lv_dev"] != "/dev/vg/lv" {

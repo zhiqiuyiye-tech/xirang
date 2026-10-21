@@ -188,6 +188,11 @@ func TestResizeLVHandlerRejectsUnknownActionBeforeSSH(t *testing.T) {
 	}
 }
 
+// stableIdentityJSON is the identity the identity-only logical-volume read
+// returns: the journal does not care whether the LV is a resize or a delete
+// target, only that the UUID and kernel device are stable.
+const stableIdentityJSON = `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`
+
 type resizeSafetyTaskResult struct {
 	status    string
 	taskError string
@@ -209,8 +214,16 @@ func runResizeSafetyTask(t *testing.T, action string, safetyResults, identityRes
 	}
 	runner.add("cp-storage-resize-filesystem", scriptResult{stdout: fsType})
 	runner.add("device='/dev/vg_data/lv_data'", safetyResults...)
+	// Resize reads the LV identity through the identity-only operation the
+	// handbook deletion uses. The conservative namespace inspection is
+	// registered as a failure, so a regression back to it cannot pass: that
+	// operation demands mount-propagation proof resize never consumes and
+	// refused every resize on workers whose mounts it cannot prove local.
+	runner.add("cp-storage-namespace-inspect", scriptResult{stderr: "target/direct-parent propagation not proven local", exitCode: 1})
 	if identityResults != nil {
-		runner.add("cp-storage-namespace-inspect", identityResults...)
+		runner.add("cp-storage-namespace-inspect_lv", identityResults...)
+	} else {
+		runner.add("cp-storage-namespace-inspect_lv", scriptResult{stdout: stableIdentityJSON})
 	}
 	opts := make([]any, 0, 2)
 	if len(reserved) > 0 {
@@ -256,6 +269,8 @@ func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
 	changedIdentity := scriptResult{stdout: `{"ok":true,"result":{"uuid":"replacement-uuid","major_minor":"253:1"}}`}
 	tests := []struct {
 		name              string
+		allow             []string // actions that must still succeed (the online-grow relaxations)
+		fsType            string   // probed filesystem, "" means the ext4 default
 		safety            []scriptResult
 		identities        []scriptResult
 		reserved          []string
@@ -266,7 +281,40 @@ func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
 	}{
 		{
 			name:    "mounted data LV",
+			allow:   []string{"grow"},
 			safety:  []scriptResult{{stdout: `{"mount_targets":["/data02/live"],"fstab_targets":[],"swap_active":false,"device_open_count":0}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "mounted XFS data LV",
+			allow:   []string{"grow"},
+			fsType:  "xfs",
+			safety:  []scriptResult{{stdout: `{"mount_targets":["/data02/live"],"fstab_targets":[],"swap_active":false,"device_open_count":1}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "XFS volume cannot be shrunk",
+			allow:   []string{"grow"},
+			fsType:  "xfs",
+			safety:  []scriptResult{{stdout: unusedLVResizeState}},
+			podMode: "unused",
+		},
+		{
+			name:    "mounted XFS volume at a reserved target",
+			fsType:  "xfs",
+			safety:  []scriptResult{{stdout: `{"mount_targets":["/data01/share"],"fstab_targets":[],"swap_active":false,"device_open_count":1}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "mounted XFS volume with ambiguous targets",
+			fsType:  "xfs",
+			safety:  []scriptResult{{stdout: `{"mount_targets":["/data02/a","/data02/b"],"fstab_targets":[],"swap_active":false,"device_open_count":1}`}},
+			podMode: "unused",
+		},
+		{
+			name:    "unsupported filesystem",
+			fsType:  "btrfs",
+			safety:  []scriptResult{{stdout: unusedLVResizeState}},
 			podMode: "unused",
 		},
 		{
@@ -286,27 +334,42 @@ func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
 			podMode:  "unused",
 		},
 		{
+			name:    "mounted ext volume at a default reserved target",
+			safety:  []scriptResult{{stdout: `{"mount_targets":["/data01/archive"],"fstab_targets":[],"swap_active":false,"device_open_count":0}`}},
+			podMode: "unused",
+		},
+		{
+			name:     "mounted ext volume under a custom reserved path",
+			safety:   []scriptResult{{stdout: `{"mount_targets":["/custom/protected/archive"],"fstab_targets":[],"swap_active":false,"device_open_count":0}`}},
+			reserved: []string{"/custom/protected"},
+			podMode:  "unused",
+		},
+		{
 			name:    "active swap",
 			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":[],"swap_active":true,"device_open_count":0}`}},
 			podMode: "unused",
 		},
 		{
 			name:    "open device",
+			allow:   []string{"grow"},
 			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":[],"swap_active":false,"device_open_count":1}`}},
 			podMode: "unused",
 		},
 		{
 			name:    "Pod in use",
+			allow:   []string{"grow"},
 			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`}},
 			podMode: "in-use",
 		},
 		{
 			name:    "Pod guard error",
+			allow:   []string{"grow"},
 			safety:  []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`}},
 			podMode: "error",
 		},
 		{
 			name:   "Pod guard unavailable for target path",
+			allow:  []string{"grow"},
 			safety: []scriptResult{{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`}},
 		},
 		{
@@ -341,13 +404,15 @@ func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
 		},
 		{
 			name:           "state becomes mounted during recheck",
+			allow:          []string{"grow"},
 			safety:         []scriptResult{{stdout: unusedLVResizeState}, {stdout: `{"mount_targets":["/data02/new"],"fstab_targets":[],"swap_active":false,"device_open_count":0}`}},
 			identities:     []scriptResult{identity, identity},
 			podMode:        "unused",
 			wantProbeCount: 2,
 		},
 		{
-			name: "Pod becomes in use during recheck",
+			name:  "Pod becomes in use during recheck",
+			allow: []string{"grow"},
 			safety: []scriptResult{
 				{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`},
 				{stdout: `{"mount_targets":[],"fstab_targets":["/data02/share"],"swap_active":false,"device_open_count":0}`},
@@ -379,28 +444,53 @@ func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
 						}
 					}
 				}
-				result := runResizeSafetyTask(t, action, tc.safety, tc.identities, tc.reserved, checker)
-				if result.status != "failed" {
-					t.Fatalf("unsafe resize status=%q, want failed; commands=%v", result.status, result.runner.calls)
+				var fsArgs []string
+				if tc.fsType != "" {
+					fsArgs = []string{tc.fsType}
 				}
-				for _, command := range result.runner.calls {
-					if strings.Contains(command, "lvextend -r -L ") || strings.Contains(command, "lvreduce -y -r -L ") {
-						t.Fatalf("rejected resize issued mutation %q; commands=%v", command, result.runner.calls)
+				result := runResizeSafetyTask(t, action, tc.safety, tc.identities, tc.reserved, checker, fsArgs...)
+				allowed := false
+				for _, entry := range tc.allow {
+					if entry == action {
+						allowed = true
 					}
 				}
-				if tc.wantProbeCount > 0 && result.runner.counts["device='/dev/vg_data/lv_data'"] != tc.wantProbeCount {
+				commands := strings.Join(result.runner.calls, "\n")
+				if allowed {
+					if result.status != "succeeded" {
+						t.Fatalf("relaxed %s refused: status=%q error=%q", tc.name, result.status, result.taskError)
+					}
+					if !strings.Contains(commands, "# cp-storage-safe-resize") {
+						t.Fatalf("relaxed %s did not run the guarded resize: %v", tc.name, result.runner.calls)
+					}
+				} else {
+					if result.status != "failed" {
+						t.Fatalf("unsafe resize status=%q, want failed; commands=%v", result.status, result.runner.calls)
+					}
+					for _, command := range result.runner.calls {
+						if strings.Contains(command, "lvextend -r -L ") || strings.Contains(command, "lvreduce -y -r -L ") {
+							t.Fatalf("rejected resize issued mutation %q; commands=%v", command, result.runner.calls)
+						}
+					}
+				}
+				if tc.wantProbeCount > 0 && !allowed && result.runner.counts["device='/dev/vg_data/lv_data'"] != tc.wantProbeCount {
 					t.Fatalf("safety probe count=%d, want %d", result.runner.counts["device='/dev/vg_data/lv_data'"], tc.wantProbeCount)
 				}
-				if tc.name == "mounted data LV" && (len(podPaths) != 1 || podPaths[0] != "/data02/live") {
-					t.Fatalf("mounted path Pod guard calls=%v, want [/data02/live]", podPaths)
+				if action == "shrink" && tc.name == "mounted data LV" && !strings.Contains(result.taskError, "unmount it") {
+					t.Fatalf("mounted shrink failed for an unexpected reason: %q", result.taskError)
 				}
 				if tc.name == "protected OS fstab target" && (!strings.Contains(result.taskError, "protected system path") || !strings.Contains(result.taskError, `"/etc"`)) {
 					t.Fatalf("protected fstab path failed for an unexpected reason: %q", result.taskError)
 				}
-				if tc.wantIdentityCount > 0 && result.runner.counts["cp-storage-namespace-inspect"] != tc.wantIdentityCount {
-					t.Fatalf("identity inspections=%d, want %d", result.runner.counts["cp-storage-namespace-inspect"], tc.wantIdentityCount)
+				if tc.wantIdentityCount > 0 && result.runner.counts["cp-storage-namespace-inspect_lv"] != tc.wantIdentityCount {
+					t.Fatalf("identity reads=%d, want %d", result.runner.counts["cp-storage-namespace-inspect_lv"], tc.wantIdentityCount)
 				}
-				if tc.wantPodCount > 0 && len(podPaths) != tc.wantPodCount {
+				// Resize must never reach the conservative namespace inspection.
+				if result.runner.counts["cp-storage-namespace-inspect"] != 0 {
+					t.Fatalf("resize issued the namespace inspection: %v", result.runner.calls)
+				}
+				// The Pod guard is only consulted for shrink; grow runs online.
+				if tc.wantPodCount > 0 && action == "shrink" && len(podPaths) != tc.wantPodCount {
 					t.Fatalf("Pod guard calls=%d, want %d (paths=%v)", len(podPaths), tc.wantPodCount, podPaths)
 				}
 			})
@@ -422,14 +512,27 @@ func TestResizeLVHandlerAllowsUnusedLV(t *testing.T) {
 			if action == "shrink" {
 				want = "lvreduce -y -r -L -10G /dev/vg_data/lv_data"
 			}
-			if !strings.Contains(strings.Join(result.runner.calls, "\n"), want) || !strings.Contains(strings.Join(result.runner.calls, "\n"), "# cp-storage-safe-resize") {
+			commandText := strings.Join(result.runner.calls, "\n")
+			if !strings.Contains(commandText, want) || !strings.Contains(commandText, "# cp-storage-safe-resize") {
 				t.Fatalf("safe resize did not run guarded %q; commands=%v", want, result.runner.calls)
+			}
+			// A grow completes the filesystem resize explicitly, as the handbook
+			// requires after lvextend -r.
+			if action == "grow" && !strings.Contains(commandText, "resize2fs /dev/vg_data/lv_data") {
+				t.Fatalf("grow did not complete the filesystem resize; commands=%v", result.runner.calls)
 			}
 			if result.runner.counts["device='/dev/vg_data/lv_data'"] != 3 {
 				t.Fatalf("safe resize probe count=%d, want 3", result.runner.counts["device='/dev/vg_data/lv_data'"])
 			}
-			if result.runner.counts["cp-storage-namespace-inspect"] != 4 {
-				t.Fatalf("safe resize probe identity inspection count=%d, want 4", result.runner.counts["cp-storage-namespace-inspect"])
+			if result.runner.counts["cp-storage-namespace-inspect_lv"] != 4 {
+				t.Fatalf("safe resize identity read count=%d, want 4", result.runner.counts["cp-storage-namespace-inspect_lv"])
+			}
+			// The conservative namespace inspection is never part of a resize:
+			// its mount-propagation proof is not evidence resize consumes, and
+			// requiring it refused resizes on workers whose mounts it cannot
+			// prove local.
+			if result.runner.counts["cp-storage-namespace-inspect"] != 0 {
+				t.Fatalf("safe resize issued the namespace inspection: %v", result.runner.calls)
 			}
 		})
 	}
@@ -509,8 +612,14 @@ func (s *scriptRunner) Run(_ context.Context, _ db.WorkerNode, cmd string) (stri
 	if strings.Contains(cmd, "cp-storage-namespace-verify") {
 		return `{"ok":true,"result":{"released":true,"device":{"uuid":"stable-uuid","major_minor":"253:0"}}}`, "", 0, nil
 	}
+	if strings.Contains(cmd, "cp-storage-namespace-inspect_lv") {
+		return stableIdentityJSON, "", 0, nil
+	}
+	// The retired conservative inspection demanded mount-propagation proof that
+	// no flow consumes any more; a command that still carries it fails here so a
+	// regression cannot pass as a healthy identity read.
 	if strings.Contains(cmd, "cp-storage-namespace-inspect") {
-		return `{"ok":true,"result":{"uuid":"stable-uuid","major_minor":"253:0"}}`, "", 0, nil
+		return "", "retired resize inspection is not part of any flow", 1, nil
 	}
 	if strings.Contains(cmd, "cp-storage-preflight") {
 		return "SAFE\n", "", 0, nil
