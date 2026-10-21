@@ -218,9 +218,26 @@ func TestResizeLVSteps_Grow(t *testing.T) {
 		want string
 	}{
 		{
-			name: "ext4 completes with resize2fs",
+			name: "unmounted ext4 completes with resize2fs",
 			req:  ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: true, DeltaGB: 50, FSType: "ext4"},
 			want: "lvextend -r -L +50G /dev/vg_data/lv_200g || exit 1\nresize2fs /dev/vg_data/lv_200g",
+		},
+		{
+			// The mounted ext grow is completed by lvextend -r itself. The
+			// handbook's resize2fs is the fallback, and the check in front of it
+			// keeps that fallback from racing the kernel's superblock write.
+			name: "mounted ext4 verifies the kernel filesystem size first",
+			req:  ResizeLVReq{VGName: "vg_data", LVName: "lv_200g", Grow: true, DeltaGB: 50, FSType: "ext4", MountPoint: "/data02/nb"},
+			want: `lvextend -r -L +50G /dev/vg_data/lv_200g || exit 1
+mount_target='/data02/nb'
+if fs_blocks=$(stat -f -c '%b' -- "$mount_target" 2>/dev/null) &&
+   fs_unit=$(stat -f -c '%S' -- "$mount_target" 2>/dev/null) &&
+   device_bytes=$(blockdev --getsize64 -- /dev/vg_data/lv_200g 2>/dev/null) &&
+   [ "$((fs_blocks * fs_unit))" -ge "$device_bytes" ]; then
+  echo 'filesystem already covers the enlarged logical volume'
+else
+  resize2fs /dev/vg_data/lv_200g
+fi`,
 		},
 		{
 			name: "mounted xfs completes with xfs_growfs",

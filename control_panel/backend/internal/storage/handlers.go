@@ -663,22 +663,18 @@ func (h *resizeLVHandler) checkResizeSafety(ctx context.Context, w db.WorkerNode
 	}
 
 	mountTarget := ""
-	if grow {
+	if grow && len(state.MountTargets) > 0 {
 		// A grow of a live NFS share is the handbook's own scenario: LVM extend
 		// and ext4/XFS online grow need no exclusive access, so a mounted volume
-		// is not a reason to refuse. Only the XFS completion command needs a
-		// mount target, and it must be unambiguous; its path was already
-		// validated against the protected and reserved paths above.
-		if fsType == "xfs" {
-			switch len(state.MountTargets) {
-			case 0:
-			case 1:
-				mountTarget = state.MountTargets[0]
-			default:
-				return resizeSafetyPlan{}, fmt.Errorf("logical volume has ambiguous mount targets %s", strings.Join(state.MountTargets, ", "))
-			}
+		// is not a reason to refuse. The mount target completes an XFS grow and
+		// anchors the ext completion check; an XFS grow needs it unambiguous, an
+		// ext grow can verify through any mount of the same filesystem. Every
+		// path was validated against the protected and reserved paths above.
+		if fsType == "xfs" && len(state.MountTargets) > 1 {
+			return resizeSafetyPlan{}, fmt.Errorf("logical volume has ambiguous mount targets %s", strings.Join(state.MountTargets, ", "))
 		}
-	} else {
+		mountTarget = state.MountTargets[0]
+	} else if !grow {
 		if len(state.MountTargets) > 0 {
 			return resizeSafetyPlan{}, fmt.Errorf("logical volume is currently mounted at %s; unmount it (host and holder namespace) before shrinking", strings.Join(state.MountTargets, ", "))
 		}
@@ -784,8 +780,13 @@ func (h *resizeLVHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 		return err
 	}
 	recheckedPlan, err := h.checkResizeSafety(ctx, *w, p.VGName, p.LVName, grow)
-	if err == nil && recheckedPlan != initialPlan {
-		err = fmt.Errorf("logical volume identity or filesystem state changed before resize")
+	// The pinned identity and filesystem type must not change under the resize.
+	// A grow's mount target is deliberately excluded: grow is mount-agnostic, so
+	// a volume that is mounted or unmounted between the two probes is not a
+	// reason to refuse, and the recheck's fresh target is the one the guarded
+	// command uses.
+	if err == nil && (recheckedPlan.Identity != initialPlan.Identity || recheckedPlan.FSType != initialPlan.FSType) {
+		err = fmt.Errorf("logical volume identity or filesystem type changed before resize")
 	}
 	if err != nil {
 		recheck.Done("failed", "", "", err.Error())

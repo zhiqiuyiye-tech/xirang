@@ -28,7 +28,10 @@ func buildGuardedResizeCommand(req ResizeLVReq, expected DeviceIdentity, reserve
 		return "", fmt.Errorf("unsupported resize filesystem %q", req.FSType)
 	}
 	if req.MountPoint != "" {
-		if action != "grow" || req.FSType != "xfs" {
+		// A mount target is meaningful only for a grow: XFS completes with
+		// xfs_growfs, and ext checks the kernel's filesystem size against the
+		// enlarged device. Shrink never runs on a mounted volume.
+		if action != "grow" {
 			return "", fmt.Errorf("unexpected resize mount target")
 		}
 		if err := ValidateMountPoint(req.MountPoint, reserved); err != nil {

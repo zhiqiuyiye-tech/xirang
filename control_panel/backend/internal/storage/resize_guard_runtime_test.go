@@ -30,9 +30,16 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 	for _, tc := range []struct {
 		name, mounts, fstab, swaps, opens, fs, identity, mountTarget, pinnedFS string
 		grow, shrink                                                           bool
+		// fsUncovered reports a mounted ext filesystem that still lags the
+		// enlarged device, so the completion command has to run. statUnavailable
+		// simulates the mount disappearing between the safety probe and the
+		// completion step.
+		fsUncovered, statUnavailable bool
 	}{
 		{name: "unused ext4", opens: "0", fs: "ext4", identity: "stable-uuid 253 0", grow: true, shrink: true},
-		{name: "mounted ext4 online grow", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true},
+		{name: "mounted ext4 online grow already covers the device", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live"},
+		{name: "mounted ext4 online grow still short", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live", fsUncovered: true},
+		{name: "mounted ext4 grow whose mount vanished", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live", statUnavailable: true},
 		{name: "mounted xfs online grow", mounts: "/data02/live\n", opens: "1", fs: "xfs", identity: "stable-uuid 253 0", mountTarget: "/data02/live", grow: true},
 		{name: "unmounted xfs grow relies on -r", opens: "0", fs: "xfs", identity: "stable-uuid 253 0", grow: true},
 		{name: "xfs mount target moved before resize", mounts: "/data02/moved\n", opens: "1", fs: "xfs", identity: "stable-uuid 253 0", mountTarget: "/data02/live"},
@@ -92,6 +99,16 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 				if tc.fstab == "" {
 					fstabStatus = 1
 				}
+				// The kernel's statvfs view of a mounted filesystem and the
+				// device size decide whether the ext completion has work to do.
+				fsBlocks, fsUnit, deviceBytes := "1000", "4096", "4096000"
+				if tc.fsUncovered {
+					deviceBytes = "8192000"
+				}
+				statFn := "stat() { case \"$3\" in %b) printf '%s\\n' " + fsBlocks + ";; %S) printf '%s\\n' " + fsUnit + ";; *) return 1;; esac; }\n"
+				if tc.statUnavailable {
+					statFn = "stat() { return 1; }\n"
+				}
 				script := "python3() { " + shellLiteral(filepath.ToSlash(python)) + " \"$@\"; }\n" +
 					"awk() { " + shellLiteral(filepath.ToSlash(awk)) + " \"$@\"; }\n" +
 					"readlink() { last=''; for arg in \"$@\"; do last=$arg; done; case \"$last\" in /dev/vg_data/lv_data|/dev/mapper/target) printf '%s\\n' " + shellLiteral(device) + ";; *) return 1;; esac; }\n" +
@@ -99,6 +116,8 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 					"dmsetup() { printf '%s' " + shellLiteral(tc.opens) + "; }\n" +
 					"blkid() { printf '%s' " + shellLiteral(tc.fs) + "; }\n" +
 					"lvs() { printf '%s' " + shellLiteral(tc.identity) + "; }\n" +
+					statFn +
+					"blockdev() { printf '%s\\n' " + deviceBytes + "; }\n" +
 					"lvextend() { printf '%s\\n' 'MUTATION-RAN'; }; lvreduce() { printf '%s\\n' 'MUTATION-RAN'; }\n" +
 					"resize2fs() { printf '%s\\n' 'FS-MUTATION-RAN'; }; xfs_growfs() { printf '%s\\n' 'FS-MUTATION-RAN'; }\n" + cmd
 				command := exec.Command(shell)
@@ -112,10 +131,20 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 					t.Fatalf("mutation=%v want=%v err=%v output=%s", mutated, wantMutation, runErr, output)
 				}
 				if wantMutation {
-					// Grow completes the filesystem explicitly: resize2fs for ext
-					// and xfs_growfs for a mounted XFS; an unmounted XFS has no
-					// completion command of its own.
-					wantFS := grow && (strings.HasPrefix(tc.fs, "ext") || (tc.fs == "xfs" && tc.mountTarget != ""))
+					// Grow completes the filesystem explicitly only when it has
+					// work left: an unmounted ext volume always runs the handbook
+					// resize2fs, a mounted ext volume runs it only when the kernel's
+					// size still lags the device, and a mounted XFS completes with
+					// xfs_growfs. An unmounted XFS has no completion command.
+					wantFS := false
+					switch {
+					case grow && strings.HasPrefix(tc.fs, "ext") && tc.mountTarget == "":
+						wantFS = true
+					case grow && strings.HasPrefix(tc.fs, "ext"):
+						wantFS = tc.fsUncovered || tc.statUnavailable
+					case grow && tc.fs == "xfs" && tc.mountTarget != "":
+						wantFS = true
+					}
 					if got := strings.Contains(string(output), "FS-MUTATION-RAN"); got != wantFS {
 						t.Fatalf("filesystem completion=%v want=%v output=%s", got, wantFS, output)
 					}

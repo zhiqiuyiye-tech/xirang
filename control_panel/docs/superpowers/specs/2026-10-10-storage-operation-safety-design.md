@@ -99,6 +99,17 @@ The handbook is the authority for this flow, so the resize boundary now reads:
   `lvextend` as fatal, so a filesystem-only success is never reported as a
   finished resize. XFS is no longer refused outright: an XFS volume that cannot
   be shrunk is still a grow target.
+- The handbook's follow-up filesystem command is the fallback, not a second
+  unconditional resize. On a mounted ext volume `lvextend -r` performs the online
+  grow and the kernel writes the enlarged superblock asynchronously, so a
+  `resize2fs` issued immediately afterwards can read that superblock mid-update
+  and refuse to open the filesystem (`Superblock checksum does not match
+  superblock`), failing a task whose volume and filesystem both grew. The step
+  compares the size the kernel reports for the mount (`stat -f`) with the
+  enlarged device (`blockdev --getsize64`) and runs `resize2fs` only when the
+  filesystem still lags, or when the mount can no longer be measured. An
+  unmounted ext volume runs the handbook command directly, and a mounted XFS
+  keeps `xfs_growfs`, which is idempotent.
 - The resize flow reads the LV identity through the identity-only operation the
   deletion flow uses (`inspect_lv`: LVM UUID and kernel `major:minor`, from the
   ordinary active writable linear volume check). It no longer runs the retired
