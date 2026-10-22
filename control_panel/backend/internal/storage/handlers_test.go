@@ -468,7 +468,7 @@ func TestResizeLVHandlerRejectsUnsafeState(t *testing.T) {
 						t.Fatalf("unsafe resize status=%q, want failed; commands=%v", result.status, result.runner.calls)
 					}
 					for _, command := range result.runner.calls {
-						if strings.Contains(command, "lvextend -r -L ") || strings.Contains(command, "lvreduce -y -r -L ") {
+						if strings.Contains(command, "lvextend") || strings.Contains(command, "lvreduce") {
 							t.Fatalf("rejected resize issued mutation %q; commands=%v", command, result.runner.calls)
 						}
 					}
@@ -508,7 +508,7 @@ func TestResizeLVHandlerAllowsUnusedLV(t *testing.T) {
 			if result.status != "succeeded" {
 				t.Fatalf("safe resize status=%q, want succeeded; commands=%v", result.status, result.runner.calls)
 			}
-			want := "lvextend -r -L +10G /dev/vg_data/lv_data"
+			want := "lvextend -L +10G /dev/vg_data/lv_data"
 			if action == "shrink" {
 				want = "lvreduce -y -r -L -10G /dev/vg_data/lv_data"
 			}
@@ -516,10 +516,16 @@ func TestResizeLVHandlerAllowsUnusedLV(t *testing.T) {
 			if !strings.Contains(commandText, want) || !strings.Contains(commandText, "# cp-storage-safe-resize") {
 				t.Fatalf("safe resize did not run guarded %q; commands=%v", want, result.runner.calls)
 			}
-			// A grow completes the filesystem resize explicitly, as the handbook
-			// requires after lvextend -r.
-			if action == "grow" && !strings.Contains(commandText, "resize2fs /dev/vg_data/lv_data") {
-				t.Fatalf("grow did not complete the filesystem resize; commands=%v", result.runner.calls)
+			// A grow completes the filesystem resize as the handbook requires,
+			// and never routes it through fsadm's -r: fsadm reads the superblock
+			// with tune2fs, which fails on some mounted ext volumes.
+			if action == "grow" {
+				if !strings.Contains(commandText, "resize2fs /dev/vg_data/lv_data") {
+					t.Fatalf("grow did not complete the filesystem resize; commands=%v", result.runner.calls)
+				}
+				if strings.Contains(commandText, "lvextend -r -L ") {
+					t.Fatalf("grow handed the filesystem grow to fsadm: %v", result.runner.calls)
+				}
 			}
 			if result.runner.counts["device='/dev/vg_data/lv_data'"] != 3 {
 				t.Fatalf("safe resize probe count=%d, want 3", result.runner.counts["device='/dev/vg_data/lv_data'"])

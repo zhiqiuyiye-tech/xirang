@@ -42,7 +42,7 @@ func TestResizeGrowDoesNotRequireExclusiveUse(t *testing.T) {
 	if result.status != "succeeded" {
 		t.Fatalf("mounted grow status=%q, want succeeded: %s", result.status, result.taskError)
 	}
-	if !strings.Contains(strings.Join(result.runner.calls, "\n"), "lvextend -r -L +10G /dev/vg_data/lv_data") {
+	if !strings.Contains(strings.Join(result.runner.calls, "\n"), "lvextend -L +10G /dev/vg_data/lv_data") {
 		t.Fatalf("mounted grow did not run the guarded resize: %v", result.runner.calls)
 	}
 }
@@ -57,7 +57,7 @@ func TestResizeRejectsUnsupportedFilesystems(t *testing.T) {
 					t.Fatalf("unsupported filesystem %q reached mutation: %s %s", fsType, result.status, result.taskError)
 				}
 				for _, command := range result.runner.calls {
-					if strings.Contains(command, "lvextend -r") || strings.Contains(command, "lvreduce -y") {
+					if strings.Contains(command, "lvextend") || strings.Contains(command, "lvreduce") {
 						t.Fatal("unsupported filesystem reached resize mutation")
 					}
 				}
@@ -75,7 +75,7 @@ func TestResizeGrowSupportsXFSAndShrinkRejectsIt(t *testing.T) {
 		t.Fatalf("mounted XFS grow status=%q, want succeeded: %s", grown.status, grown.taskError)
 	}
 	commands := strings.Join(grown.runner.calls, "\n")
-	if !strings.Contains(commands, "lvextend -r -L +10G /dev/vg_data/lv_data") || !strings.Contains(commands, "xfs_growfs '/data02/share'") {
+	if !strings.Contains(commands, "lvextend -L +10G /dev/vg_data/lv_data") || !strings.Contains(commands, "xfs_growfs '/data02/share'") {
 		t.Fatalf("mounted XFS grow did not run the handbook completion step: %v", grown.runner.calls)
 	}
 

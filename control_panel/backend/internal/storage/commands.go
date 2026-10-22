@@ -424,8 +424,9 @@ type ResizeLVReq struct {
 	FSType string
 	// MountPoint is the probed mount target of a mounted volume. xfs_growfs
 	// resizes by mount point, so a mounted XFS needs it; a mounted ext volume
-	// uses it to check whether the online grow that lvextend -r performed
-	// already covers the enlarged device. It is empty for an unmounted volume.
+	// uses it to check whether the kernel's filesystem size already covers the
+	// enlarged device, so resize2fs only runs when it has work to do. It is
+	// empty for an unmounted volume.
 	MountPoint string
 }
 
@@ -442,23 +443,27 @@ func resizeFilesystemSupported(grow bool, fsType string) bool {
 	return false
 }
 
-// ResizeLVSteps builds the resize mutation step. Grow follows the operator
-// handbook for a live NFS share: lvextend -r extends the LV and resizes the
-// filesystem in the same operation, and a failed extend stops the step so a
-// filesystem-only success cannot be reported as a completed resize.
+// ResizeLVSteps builds the resize mutation step. Grow performs the handbook's
+// two operations - extend the logical volume, then grow its filesystem - as two
+// explicit commands in one guarded step.
 //
-// The handbook's follow-up filesystem command is the fallback for a resize that
-// lvextend -r did not complete, not a second unconditional resize. On a mounted
-// ext volume the kernel performs the online grow in lvextend -r and writes the
-// updated superblock asynchronously, so a resize2fs issued immediately
-// afterwards can read that superblock mid-update and refuse to open the
-// filesystem ("Superblock checksum does not match superblock"), failing a task
-// whose volume and filesystem both grew. The mounted ext path therefore
-// verifies the size the kernel reports and only then runs resize2fs; an
-// unmounted ext volume has no online grow in flight, so it runs the handbook
-// command directly. A mounted XFS completes with xfs_growfs, which is
-// idempotent; an unmounted XFS needs no completion command because -r resizes
-// it through a temporary mount.
+// lvextend -r is deliberately not used for ext or for a mounted XFS. It hands
+// the filesystem work to fsadm, which reads the superblock with tune2fs before
+// growing anything. On a mounted ext4 that read can fail with "Superblock
+// checksum does not match superblock": e2fsprogs below 1.47 reads the superblock
+// through the block-device page cache, and the kernel's asynchronous online
+// resize leaves that cached copy stale. fsadm failing there also hides the fact
+// that the LV extension already succeeded, so the step would report a plain
+// failure on a volume that is now larger than its filesystem. Extending the LV
+// on its own keeps that outcome unambiguous, and every grow command below says
+// what is left to do when it cannot finish.
+//
+// A mounted ext grow verifies the kernel's view first: when statvfs already
+// covers the enlarged device, resize2fs is not run at all. An unmounted ext
+// volume has no online grow in flight and runs resize2fs directly. A mounted
+// XFS completes with xfs_growfs, which is idempotent. An unmounted XFS has no
+// mounted view to verify or grow through, so -r remains its only path, via
+// fsadm's temporary mount.
 //
 // Shrink keeps -r, which shrinks the filesystem first and aborts the LV reduce
 // if the filesystem resize fails (e.g. shrinking below used space, or XFS,
@@ -472,29 +477,32 @@ func ResizeLVSteps(r ResizeLVReq) []Step {
 			{Name: "lvreduce", Cmd: fmt.Sprintf("lvreduce -y -r -L -%dG %s", r.DeltaGB, lvDev)},
 		}
 	}
-	cmd := fmt.Sprintf("lvextend -r -L +%dG %s", r.DeltaGB, lvDev)
+	cmd := fmt.Sprintf("lvextend -L +%dG %s", r.DeltaGB, lvDev)
 	switch r.FSType {
 	case "ext2", "ext3", "ext4":
 		if r.MountPoint != "" {
 			cmd += " || exit 1" + mountedExtGrowCompletion(lvDev, r.MountPoint)
 		} else {
-			cmd += fmt.Sprintf(" || exit 1\nresize2fs %s", lvDev)
+			cmd += " || exit 1" + growWithFailureNote("resize2fs "+lvDev, extGrowFailureNote(lvDev))
 		}
 	case "xfs":
 		if r.MountPoint != "" {
-			cmd += fmt.Sprintf(" || exit 1\nxfs_growfs %s", shellLiteral(r.MountPoint))
+			cmd += " || exit 1" + growWithFailureNote("xfs_growfs "+shellLiteral(r.MountPoint), xfsGrowFailureNote(r.MountPoint))
+		} else {
+			// An unmounted XFS cannot be grown by xfs_growfs; fsadm's temporary
+			// mount inside -r is the only offline path.
+			cmd = fmt.Sprintf("lvextend -r -L +%dG %s", r.DeltaGB, lvDev)
 		}
 	}
 	return []Step{{Name: "lvextend", Cmd: cmd}}
 }
 
-// mountedExtGrowCompletion completes a grow of a mounted ext volume without
-// racing the online resize lvextend -r just performed. The kernel's statvfs view
-// is authoritative for the mounted filesystem; when it already covers the
-// enlarged device there is nothing left to do, and resize2fs would only read a
-// superblock the kernel is still writing. When the size cannot be read (the
-// mount disappeared between the safety probe and this step) or it still lags the
-// device, the handbook's resize2fs runs and its failure fails the step.
+// mountedExtGrowCompletion completes a grow of a mounted ext volume. The kernel's
+// statvfs view is authoritative for a mounted filesystem, so when it already
+// covers the enlarged device there is nothing left to do and resize2fs is not
+// run. When the size cannot be read (the mount disappeared between the safety
+// probe and this step) or still lags the device, resize2fs runs and a failure
+// reports the state to recover from.
 func mountedExtGrowCompletion(lvDev, mountPoint string) string {
 	return fmt.Sprintf(`
 mount_target=%s
@@ -503,9 +511,30 @@ if fs_blocks=$(stat -f -c '%%b' -- "$mount_target" 2>/dev/null) &&
    device_bytes=$(blockdev --getsize64 -- %s 2>/dev/null) &&
    [ "$((fs_blocks * fs_unit))" -ge "$device_bytes" ]; then
   echo 'filesystem already covers the enlarged logical volume'
-else
-  resize2fs %s
-fi`, shellLiteral(mountPoint), lvDev, lvDev)
+elif ! resize2fs %s; then
+  echo '%s' >&2
+  exit 1
+fi`, shellLiteral(mountPoint), lvDev, lvDev, extGrowFailureNote(lvDev))
+}
+
+// growWithFailureNote runs one filesystem grow and, on failure, reports the state
+// the volume is in. The logical volume has already been extended at that point,
+// so a bare exit would leave the operator with an unexplained failure on a
+// volume that is larger than its filesystem.
+func growWithFailureNote(command, note string) string {
+	return fmt.Sprintf(`
+if ! %s; then
+  echo '%s' >&2
+  exit 1
+fi`, command, note)
+}
+
+func extGrowFailureNote(lvDev string) string {
+	return fmt.Sprintf("logical volume extended, but the filesystem was not grown: the volume is now larger than its filesystem. Complete it with resize2fs %s. If a mounted grow reports a superblock checksum error, unmount the volume (host and holder namespaces) and run resize2fs offline.", lvDev)
+}
+
+func xfsGrowFailureNote(mountPoint string) string {
+	return fmt.Sprintf("logical volume extended, but the filesystem was not grown: the volume is now larger than its filesystem. Complete it with xfs_growfs %s.", mountPoint)
 }
 
 // --- LV delete (generalized reclaim for any LV) ---

@@ -99,17 +99,22 @@ The handbook is the authority for this flow, so the resize boundary now reads:
   `lvextend` as fatal, so a filesystem-only success is never reported as a
   finished resize. XFS is no longer refused outright: an XFS volume that cannot
   be shrunk is still a grow target.
-- The handbook's follow-up filesystem command is the fallback, not a second
-  unconditional resize. On a mounted ext volume `lvextend -r` performs the online
-  grow and the kernel writes the enlarged superblock asynchronously, so a
-  `resize2fs` issued immediately afterwards can read that superblock mid-update
-  and refuse to open the filesystem (`Superblock checksum does not match
-  superblock`), failing a task whose volume and filesystem both grew. The step
-  compares the size the kernel reports for the mount (`stat -f`) with the
-  enlarged device (`blockdev --getsize64`) and runs `resize2fs` only when the
-  filesystem still lags, or when the mount can no longer be measured. An
-  unmounted ext volume runs the handbook command directly, and a mounted XFS
-  keeps `xfs_growfs`, which is idempotent.
+- The handbook's follow-up filesystem command is its own command, not hidden
+  inside `lvextend -r`. `-r` hands the filesystem work to fsadm, whose `tune2fs`
+  superblock read fails on some mounted ext volumes with `Superblock checksum
+  does not match superblock` (e2fsprogs below 1.47 reads the superblock through
+  the block-device page cache, which the kernel's asynchronous online-resize
+  update can leave stale). When that happened, the LV extension had already
+  succeeded but the task reported a bare failure, leaving a volume larger than
+  its filesystem. The step now extends the LV on its own and then grows the
+  filesystem, so every failure names that state and the manual command that
+  completes it.
+- A mounted ext grow verifies the kernel's view first: when `statvfs` already
+  covers the enlarged device (`stat -f` against `blockdev --getsize64`),
+  `resize2fs` is not run at all. An unmounted ext volume has no online grow in
+  flight and runs `resize2fs` directly. A mounted XFS completes with
+  `xfs_growfs`. An unmounted XFS keeps `lvextend -r`, because `xfs_growfs`
+  cannot touch an unmounted filesystem.
 - The resize flow reads the LV identity through the identity-only operation the
   deletion flow uses (`inspect_lv`: LVM UUID and kernel `major:minor`, from the
   ordinary active writable linear volume check). It no longer runs the retired

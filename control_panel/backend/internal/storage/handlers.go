@@ -588,10 +588,11 @@ func (h *createVGHandler) Run(ctx context.Context, task *db.Task, r *tasks.Repor
 
 // resizeLVHandler extends (action=grow, default) or reduces (action=shrink) an
 // LV by DeltaGB following the operator handbook. Grow runs online on a mounted
-// share: lvextend -r extends the LV and resizes the filesystem, then the
-// filesystem command completes the resize (resize2fs for ext2/ext3/ext4,
-// xfs_growfs with the mount target for a mounted XFS). Shrink stays offline and
-// ext-only, because ext cannot shrink while mounted and XFS cannot shrink at all.
+// share in two explicit commands: lvextend extends the LV, then the filesystem
+// grow completes or verifies it (resize2fs for ext2/ext3/ext4 when the kernel's
+// size still lags the device, xfs_growfs with the mount target for a mounted
+// XFS). Shrink stays offline and ext-only, because ext cannot shrink while
+// mounted and XFS cannot shrink at all.
 type resizeLVHandler struct {
 	runner          ssh.Runner
 	store           *db.Store

@@ -33,13 +33,15 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 		// fsUncovered reports a mounted ext filesystem that still lags the
 		// enlarged device, so the completion command has to run. statUnavailable
 		// simulates the mount disappearing between the safety probe and the
-		// completion step.
-		fsUncovered, statUnavailable bool
+		// completion step. fsGrowFails makes the filesystem grow fail, which must
+		// report the extended-but-ungrown state instead of a bare exit.
+		fsUncovered, statUnavailable, fsGrowFails bool
 	}{
 		{name: "unused ext4", opens: "0", fs: "ext4", identity: "stable-uuid 253 0", grow: true, shrink: true},
 		{name: "mounted ext4 online grow already covers the device", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live"},
 		{name: "mounted ext4 online grow still short", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live", fsUncovered: true},
 		{name: "mounted ext4 grow whose mount vanished", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live", statUnavailable: true},
+		{name: "mounted ext4 grow whose filesystem grow fails", mounts: "/data02/live\n", opens: "1", fs: "ext4", identity: "stable-uuid 253 0", grow: true, mountTarget: "/data02/live", fsUncovered: true, fsGrowFails: true},
 		{name: "mounted xfs online grow", mounts: "/data02/live\n", opens: "1", fs: "xfs", identity: "stable-uuid 253 0", mountTarget: "/data02/live", grow: true},
 		{name: "unmounted xfs grow relies on -r", opens: "0", fs: "xfs", identity: "stable-uuid 253 0", grow: true},
 		{name: "xfs mount target moved before resize", mounts: "/data02/moved\n", opens: "1", fs: "xfs", identity: "stable-uuid 253 0", mountTarget: "/data02/live"},
@@ -109,6 +111,10 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 				if tc.statUnavailable {
 					statFn = "stat() { return 1; }\n"
 				}
+				resize2fsFn := "resize2fs() { printf '%s\\n' 'FS-MUTATION-RAN'; }; "
+				if tc.fsGrowFails {
+					resize2fsFn = "resize2fs() { printf '%s\\n' 'FS-MUTATION-RAN'; return 1; }; "
+				}
 				script := "python3() { " + shellLiteral(filepath.ToSlash(python)) + " \"$@\"; }\n" +
 					"awk() { " + shellLiteral(filepath.ToSlash(awk)) + " \"$@\"; }\n" +
 					"readlink() { last=''; for arg in \"$@\"; do last=$arg; done; case \"$last\" in /dev/vg_data/lv_data|/dev/mapper/target) printf '%s\\n' " + shellLiteral(device) + ";; *) return 1;; esac; }\n" +
@@ -119,13 +125,24 @@ func TestGuardedResizeRechecksLateWorkerStateBeforeMutation(t *testing.T) {
 					statFn +
 					"blockdev() { printf '%s\\n' " + deviceBytes + "; }\n" +
 					"lvextend() { printf '%s\\n' 'MUTATION-RAN'; }; lvreduce() { printf '%s\\n' 'MUTATION-RAN'; }\n" +
-					"resize2fs() { printf '%s\\n' 'FS-MUTATION-RAN'; }; xfs_growfs() { printf '%s\\n' 'FS-MUTATION-RAN'; }\n" + cmd
+					resize2fsFn + "xfs_growfs() { printf '%s\\n' 'FS-MUTATION-RAN'; }\n" + cmd
 				command := exec.Command(shell)
 				// The generated script is delivered on stdin. Passing it as a -c
 				// argument mangles its quoting on Windows shells, which would test
 				// the transport instead of the script text.
 				command.Stdin = strings.NewReader(script)
 				output, runErr := command.CombinedOutput()
+				if tc.fsGrowFails && grow {
+					// The volume is extended at this point. The step must fail and
+					// say what is left to do rather than exit with a bare error.
+					if runErr == nil {
+						t.Fatalf("failed filesystem grow reported success: %s", output)
+					}
+					if !strings.Contains(string(output), "logical volume extended, but the filesystem was not grown") {
+						t.Fatalf("failed filesystem grow did not name the state to recover: %s", output)
+					}
+					return
+				}
 				mutated := strings.Contains(string(output), "MUTATION-RAN")
 				if mutated != wantMutation || (wantMutation && runErr != nil) || (!wantMutation && runErr == nil) {
 					t.Fatalf("mutation=%v want=%v err=%v output=%s", mutated, wantMutation, runErr, output)
